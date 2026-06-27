@@ -9,7 +9,7 @@ Tailscale tailnet 内での使用を前提とする。
 |---|---|
 | `clipd.ps1` | Windows 側サーバ。クリップボードを HTTP で返す |
 | `clip` | Linux/Mac 側クライアント。`clipd` を叩いて内容を取得する |
-| `tmux.conf.snippet` | tmux キーバインド設定例 (`<prefix> Ctrl-V` で貼り付け) |
+| `tmux.conf.snippet` | tmux キーバインド設定例 |
 
 ## 動作イメージ
 
@@ -21,6 +21,115 @@ Windows (clipd.ps1)          Linux / Mac (clip)
 │  clipd.ps1:9999  │          │  → 内容が標準出力に   │
 └──────────────────┘          └──────────────────────┘
 ```
+
+---
+
+## セットアップ手順
+
+### 1. Windows 側のセットアップ
+
+**1-1. Tailscale をインストール**
+
+まだ入っていなければ [tailscale.com](https://tailscale.com/download/windows) からインストールしてサインイン。
+
+**1-2. ファイルを配置**
+
+```powershell
+# 任意のフォルダに clipd.ps1 を置く (例: C:\tools\clipd\)
+```
+
+**1-3. URL 予約 (初回のみ・管理者 PowerShell で)**
+
+```powershell
+# Tailscale IP を確認
+tailscale ip -4
+# → 例: 100.x.y.z
+
+# URL 予約 (user= は実際のドメイン\ユーザー名 に合わせる)
+netsh http add urlacl url=http://100.x.y.z:9999/ user="DESKTOP-XXXXX\username"
+```
+
+**1-4. トークンを決める**
+
+```powershell
+# 好きな文字列でよい (英数字推奨)
+# 例: "mySecretToken42"
+```
+
+**1-5. 自動起動の設定 (任意)**
+
+スタートアップフォルダ (`shell:startup`) に以下の内容の `.bat` ファイルを置く:
+
+```bat
+@echo off
+set CLIPD_TOKEN=mySecretToken42
+powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\tools\clipd\clipd.ps1
+```
+
+または、PowerShell 単体で試す場合:
+
+```powershell
+$env:CLIPD_TOKEN = "mySecretToken42"
+powershell -ExecutionPolicy Bypass -File C:\tools\clipd\clipd.ps1
+```
+
+---
+
+### 2. Linux 側のセットアップ
+
+**2-1. clip をインストール**
+
+```bash
+mkdir -p ~/bin
+curl -o ~/bin/clip https://raw.githubusercontent.com/cuzic/powershell-clipd/main/clip
+chmod +x ~/bin/clip
+
+# ~/bin が PATH に入っていなければ追加
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+**2-2. 環境変数を設定**
+
+`~/.bashrc` (または `~/.zshrc`) に追記:
+
+```bash
+export CLIPD_HOST=my-windows-hostname   # Tailscale の MagicDNS 名 または 100.x.y.z
+export CLIPD_PORT=9999                  # 変えていなければ省略可
+export CLIPD_TOKEN=mySecretToken42      # Windows 側と同じトークン
+```
+
+```bash
+source ~/.bashrc
+```
+
+**2-3. 動作確認**
+
+```bash
+# health チェック (token 不要)
+curl http://${CLIPD_HOST}:${CLIPD_PORT}/health
+
+# クリップボード取得テスト (Windows 側で何かコピーしてから)
+clip
+```
+
+---
+
+### 3. tmux キーバインドのセットアップ (任意)
+
+```bash
+# リポジトリを clone するか、スニペットだけダウンロード
+curl -o /tmp/tmux.conf.snippet \
+  https://raw.githubusercontent.com/cuzic/powershell-clipd/main/tmux.conf.snippet
+
+# ~/.tmux.conf に追記
+cat /tmp/tmux.conf.snippet >> ~/.tmux.conf
+
+# 現在のセッションに反映
+tmux source ~/.tmux.conf
+```
+
+---
 
 ## Windows 側: clipd.ps1
 
@@ -55,7 +164,7 @@ powershell -ExecutionPolicy Bypass -File clipd.ps1
 
 ### セキュリティ
 
-- token なし & tailnet 公開はデフォルトで拒否される (`-AllowNoToken` で上書き可)
+- token なし & tailnet 公開はデフォルトで拒否 (`-AllowNoToken` で上書き可)
 - 多重起動防止に名前付き Mutex を使用
 - Tailscale IP は `tailscale ip -4` または CGNAT 帯 (`100.64.0.0/10`) で自動検出
 
@@ -67,23 +176,36 @@ powershell -ExecutionPolicy Bypass -File clipd.ps1
 netsh http add urlacl url=http://<tailscale-ip>:9999/ user="DOMAIN\username"
 ```
 
-### API
+### API エンドポイント
 
-| エンドポイント | 説明 |
-|---|---|
-| `GET /` | クリップボード自動判別 |
-| `GET /clip` | 同上 |
-| `GET /file?path=<encoded>` | クリップボードに存在するパスのファイルをストリーム (認証あり) |
-| `GET /health` | 死活確認 (認証不要) |
-
-レスポンスヘッダ `X-Clip-Kind` に種別が入る:
-
-| 値 | Content-Type | 内容 |
+| エンドポイント | 認証 | 説明 |
 |---|---|---|
-| `image` | `image/png` | PNG バイナリ |
-| `files` | `application/json` | Windows パスの配列 |
-| `text` | `text/plain; charset=utf-8` | テキスト |
-| `empty` | `text/plain; charset=utf-8` | 空文字列 |
+| `GET /` | 要 | クリップボード自動判別 |
+| `GET /clip` | 要 | 同上 |
+| `GET /file?path=<encoded>` | 要 | CF_HDROP ファイルの実体 (クリップボード照合あり) |
+| `GET /vfile?i=N` | 要 | 仮想ファイルの実体 (Outlook 添付等、インデックス指定) |
+| `GET /health` | 不要 | 死活確認 |
+
+### クリップボード種別 (X-Clip-Kind)
+
+検出は以下の優先順で行う:
+
+| X-Clip-Kind | Content-Type | 発生ケース | `/clip` の返却内容 |
+|---|---|---|---|
+| `image` | `image/png` | スクリーンショット・ビットマップ | PNG バイナリ |
+| `files` | `application/json` | Explorer でコピーした既存ファイル | Windows パスの配列 |
+| `vfiles` | `application/json` | Outlook 添付・SharePoint 等 (パスなし) | ファイル名の配列 |
+| `audio` | `audio/wav` | CF_WAVE 音声 | WAV バイナリ |
+| `url` | `text/plain` | アドレスバー・リンクのコピー | URL 文字列 |
+| `html` | `text/html` | ブラウザ・Office のリッチコピー | HTML (Windows ヘッダ除去済み) |
+| `rtf` | `text/rtf` | Word・Wordpad | RTF 文字列 |
+| `text` | `text/plain` | 通常のテキスト | テキスト文字列 |
+| `empty` | `text/plain` | 空 | 空文字列 + Windows バルーン通知 |
+
+`/file?path=` はクリップボードの FileDropList に存在するパスのみ許可 (任意パスは 403)。  
+`/vfile?i=N` は仮想ファイルをインデックスで指定して取得する。
+
+---
 
 ## Linux 側: clip
 
@@ -108,27 +230,48 @@ export CLIPD_TOKEN=secret      # clipd を -Token 付きで起動した場合の
 
 ```bash
 clip              # クリップボードの内容を自動判別して出力
-clip -q           # パスや本文だけ (Claude Code などに渡しやすい)
-clip -d ~/pics    # 画像の保存先を指定 (既定: mktemp で /tmp 以下に生成)
+clip -q           # パスやコマンドだけを出力 (Claude Code / シェルへのパイプ向け)
+clip -d ~/pics    # 画像の保存先を指定 (既定: /tmp 以下に mktemp)
 clip -h           # ヘルプ
 ```
+
+### 種別ごとの動作
+
+| 種別 | 通常モード | quiet モード (`-q`) |
+|---|---|---|
+| `image` | `画像を保存しました: /tmp/tmp.XXX.png` | `/tmp/tmp.XXX.png` |
+| `files` | パス + curl コマンドを表示 | curl コマンドのみ |
+| `vfiles` | ファイル名 + curl コマンドを表示 | curl コマンドのみ |
+| `audio` | `音声を保存しました: /tmp/tmp.XXX.wav` | `/tmp/tmp.XXX.wav` |
+| `url` | URL をそのまま出力 | URL をそのまま出力 |
+| `html` | 1KB 以下: HTML をそのまま出力 / 超過: パスを出力 | 同左 |
+| `rtf` | 1KB 以下: RTF をそのまま出力 / 超過: パスを出力 | 同左 |
+| `text` | 1KB 以下: テキストをそのまま出力 / 超過: パスを出力 | 同左 |
+| `empty` | サイレント (Windows 側にバルーン通知) | サイレント |
+
+**1KB 閾値の理由:** Claude Code は入力をそのまま `history.jsonl` に記録するため、
+大容量コンテンツをインラインで貼り付けると履歴が肥大化する。
+1KB 超はファイルに保存してパスだけを渡し、Claude Code が必要に応じて読む。
 
 ### 出力例
 
 ```bash
-# テキストの場合
+# テキスト (1KB 以下)
 $ clip
-コピーしたテキストがここに出る
+コピーしたテキスト
 
-# 画像の場合 (デフォルトは /tmp 以下の一時ファイル)
+# テキスト (1KB 超)
+$ clip
+テキストを保存しました (大容量): /tmp/tmp.aB3xYz.txt
+
+# 画像
 $ clip
 画像を保存しました: /tmp/tmp.aB3xYz.png
 
-# -d で保存先を指定することも可
-$ clip -d ~/pics
-画像を保存しました: /tmp/tmp.aB3xYz.png  # ← -d ~/pics を付けると ~/pics/clip_TIMESTAMP.png
+$ clip -q
+/tmp/tmp.aB3xYz.png
 
-# ファイルリストの場合 → パスと取得コマンドを表示 (実行は Claude Code に委ねる)
+# 実ファイル (Explorer でコピー)
 $ clip
 クリップボード: ファイル 2件
 
@@ -138,44 +281,54 @@ $ clip
   C:\Users\user\Desktop\bar.png
   → curl -fsSL 'http://my-windows:9999/file?path=...' -o 'bar.png'
 
-# quiet モード: curl コマンドだけ出力 (Claude Code やシェルへのパイプ向け)
 $ clip -q
 curl -fsSL 'http://my-windows:9999/file?path=C%3A%5C...' -o 'foo.txt'
 curl -fsSL 'http://my-windows:9999/file?path=...' -o 'bar.png'
 
-# quiet モード (スクリプトや Claude Code へのパイプ向け)
-$ clip -q
-/tmp/tmp.aB3xYz.png
+# 仮想ファイル (Outlook 添付等)
+$ clip
+クリップボード: 仮想ファイル 1件 (Outlook 添付等)
+
+  [0] report.pdf
+  → curl -fsSL 'http://my-windows:9999/vfile?i=0' -o 'report.pdf'
+
+# URL
+$ clip
+https://example.com/
+
+# 空
+$ clip
+(何も出力しない。Windows 側にバルーン通知が表示される)
 ```
+
+---
 
 ## Claude Code / tmux との連携
 
 Claude Code のキーバインドシステムはシェルコマンドを直接実行する機能を持たないため、
 tmux 経由でペインに貼り付けるのが最もシンプルな方法。
 
-### tmux: `<prefix> Ctrl-V` で貼り付け
-
-`tmux.conf.snippet` の内容を `~/.tmux.conf` に追記する:
+### セットアップ
 
 ```bash
 cat tmux.conf.snippet >> ~/.tmux.conf
 tmux source ~/.tmux.conf
 ```
 
-設定内容:
+### キーバインド
 
-```
-bind C-v run-shell "clip -q | tmux load-buffer - " \; paste-buffer -p
-```
+| キー | 動作 |
+|---|---|
+| `<prefix> Ctrl-V` | `clip -q` の出力を現在のペイン (Claude Code 入力欄等) に貼り付け |
+| `<prefix> Alt-V` | ファイル系のみ curl コマンドをその場で bash 実行してダウンロード、それ以外は貼り付け |
 
-これで `<prefix> Ctrl-V` を押すと:
-- **テキスト** → そのまま現在のペイン (Claude Code 入力欄) に流れる
-- **画像** → `/tmp/tmp.XXX.png` のパスが入力欄に入る → そのまま Enter で Claude Code が画像を読む
-- **ファイル一覧** → curl コマンド群が入力欄に入る → Claude Code が必要なものを実行
+**`<prefix> Ctrl-V` の種別ごとの動作:**
+- **テキスト/URL** (1KB 以下) → そのまま入力欄に流れる
+- **テキスト** (1KB 超) / **HTML** / **RTF** / **画像** / **音声** → `/tmp/tmp.XXX.*` のパスが入力欄に入る → Claude Code がパスを読む
+- **実ファイル / 仮想ファイル** → curl コマンド群が入力欄に入る → Claude Code が必要なものを実行
+- **空** → 何も貼り付かない (Windows 側にバルーン通知)
 
-`<prefix> Alt-V` はファイルの場合のみ curl コマンドをその場で bash 実行し、カレントディレクトリにダウンロードします。テキスト・画像は通常の貼り付けにフォールバックします。
-
-**セキュリティ:** `/file?path=` は今クリップボードにあるパスのみ許可します。任意のパスは 403 で拒否されます。
+---
 
 ## ライセンス
 
