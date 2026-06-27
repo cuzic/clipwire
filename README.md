@@ -81,7 +81,7 @@ powershell -ExecutionPolicy Bypass -File C:\tools\clipd\clipd.ps1
 
 ```bash
 mkdir -p ~/bin
-curl -o ~/bin/clip https://raw.githubusercontent.com/cuzic/powershell-clipd/main/clip
+curl -o ~/bin/clip https://raw.githubusercontent.com/cuzic/clipwire/main/clip
 chmod +x ~/bin/clip
 
 # ~/bin が PATH に入っていなければ追加
@@ -120,7 +120,7 @@ clip
 ```bash
 # リポジトリを clone するか、スニペットだけダウンロード
 curl -o /tmp/tmux.conf.snippet \
-  https://raw.githubusercontent.com/cuzic/powershell-clipd/main/tmux.conf.snippet
+  https://raw.githubusercontent.com/cuzic/clipwire/main/tmux.conf.snippet
 
 # ~/.tmux.conf に追記
 cat /tmp/tmux.conf.snippet >> ~/.tmux.conf
@@ -212,7 +212,7 @@ netsh http add urlacl url=http://<tailscale-ip>:9999/ user="DOMAIN\username"
 ### インストール
 
 ```bash
-curl -o ~/bin/clip https://raw.githubusercontent.com/cuzic/powershell-clipd/main/clip
+curl -o ~/bin/clip https://raw.githubusercontent.com/cuzic/clipwire/main/clip
 chmod +x ~/bin/clip
 ```
 
