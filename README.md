@@ -73,6 +73,7 @@ netsh http add urlacl url=http://<tailscale-ip>:9999/ user="DOMAIN\username"
 |---|---|
 | `GET /` | クリップボード自動判別 |
 | `GET /clip` | 同上 |
+| `GET /file?i=N` | FileDropList の N 番目のファイルをストリーム (認証あり) |
 | `GET /health` | 死活確認 (認証不要) |
 
 レスポンスヘッダ `X-Clip-Kind` に種別が入る:
@@ -127,11 +128,15 @@ $ clip
 $ clip -d ~/pics
 画像を保存しました: /tmp/tmp.aB3xYz.png  # ← -d ~/pics を付けると ~/pics/clip_TIMESTAMP.png
 
-# ファイルリストの場合
+# ファイルリストの場合 → そのままダウンロード
 $ clip
-クリップボードのファイル (Windows 側パス):
-["C:\\Users\\user\\Desktop\\foo.txt","C:\\Users\\user\\Desktop\\bar.png"]
-本体転送は Windows 側で trz を使ってください。
+取得: ./foo.txt
+取得: ./bar.png
+
+# -d で保存先ディレクトリを指定
+$ clip -d ~/downloads
+取得: /home/user/downloads/foo.txt
+取得: /home/user/downloads/bar.png
 
 # quiet モード (スクリプトや Claude Code へのパイプ向け)
 $ clip -q

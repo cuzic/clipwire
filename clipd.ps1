@@ -263,8 +263,8 @@ try {
                 continue
             }
 
-            # 既知パス ( / と /clip のみ) 以外は読む前に 404
-            if ($path -ne '/' -and $path -ne '/clip') {
+            # 既知パス以外は 404
+            if ($path -ne '/' -and $path -ne '/clip' -and $path -ne '/file') {
                 Send-Text -Context $context -Text 'not found' -Kind 'error' -Status 404
                 continue
             }
@@ -278,7 +278,46 @@ try {
                 }
             }
 
-            # 自動判別して返す
+            # /file?i=N: クリップボードの FileDropList の N 番目を返す
+            if ($path -eq '/file') {
+                $idxStr = $req.QueryString['i']
+                $idx = 0
+                if (-not [int]::TryParse($idxStr, [ref]$idx) -or $idx -lt 0) {
+                    Send-Text -Context $context -Text 'invalid index' -Kind 'error' -Status 400
+                    continue
+                }
+                $clip = Read-Clipboard
+                if ($clip.Kind -ne 'files') {
+                    Send-Text -Context $context -Text 'no files in clipboard' -Kind 'error' -Status 409
+                    continue
+                }
+                if ($idx -ge $clip.Files.Count) {
+                    Send-Text -Context $context -Text 'index out of range' -Kind 'error' -Status 404
+                    continue
+                }
+                $filePath = $clip.Files[$idx]
+                $fileName = [System.IO.Path]::GetFileName($filePath)
+                $res = $context.Response
+                try {
+                    $res.StatusCode = 200
+                    $res.Headers.Add('X-Clip-Kind', 'file')
+                    $res.Headers.Add('X-Clip-Filename', $fileName)
+                    $res.Headers.Add('Cache-Control', 'no-store')
+                    $res.ContentType = 'application/octet-stream'
+                    $stream = [System.IO.File]::OpenRead($filePath)
+                    try {
+                        $res.ContentLength64 = $stream.Length
+                        $stream.CopyTo($res.OutputStream)
+                    } finally {
+                        $stream.Dispose()
+                    }
+                } finally {
+                    $res.OutputStream.Close()
+                }
+                continue
+            }
+
+            # / or /clip: 自動判別して返す
             $clip = Read-Clipboard
             switch ($clip.Kind) {
                 'image' { Send-Bytes -Context $context -Bytes $clip.Bytes -ContentType 'image/png' -Kind 'image' }

@@ -84,11 +84,28 @@ case "$KIND" in
         [[ "$QUIET" -eq 1 ]] || echo
         ;;
     files)
-        if [[ "$QUIET" -eq 1 ]]; then cat "$TMP_BODY"; echo
+        DEST_DIR="${SAVE_DIR:-.}"
+        mkdir -p "$DEST_DIR"
+
+        if command -v jq &>/dev/null; then
+            COUNT=$(jq 'length' < "$TMP_BODY")
         else
-            echo "クリップボードのファイル (Windows 側パス):"
-            cat "$TMP_BODY"; echo
-            echo "本体転送は Windows 側で trz を使ってください。"
+            COUNT=$(python3 -c "import json,sys; print(len(json.load(sys.stdin)))" < "$TMP_BODY")
+        fi
+
+        if [[ "$COUNT" -eq 0 ]]; then
+            [[ "$QUIET" -eq 1 ]] || echo "クリップボードにファイルがありません。"
+        else
+            _fc=(-fsS --max-time 300)
+            [[ -n "$CLIPD_TOKEN" ]] && _fc+=(-H "Authorization: Bearer $CLIPD_TOKEN")
+            for i in $(seq 0 $((COUNT - 1))); do
+                _tmp=$(mktemp)
+                _fhdrs=$(curl "${_fc[@]}" -D - -o "$_tmp" "$BASE/file?i=$i")
+                _fname=$(printf '%s' "$_fhdrs" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-clip-filename"{print $2}')
+                mv "$_tmp" "$DEST_DIR/$_fname"
+                if [[ "$QUIET" -eq 1 ]]; then printf '%s\n' "$DEST_DIR/$_fname"
+                else echo "取得: $DEST_DIR/$_fname"; fi
+            done
         fi
         ;;
     empty|"")
