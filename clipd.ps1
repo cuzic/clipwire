@@ -297,6 +297,31 @@ function Invoke-InSTA {
     }
 }
 
+# ---- Windows バルーン通知 (fire-and-forget STA スレッド) ----------------------
+function Show-BalloonTip {
+    param([string]$Message, [string]$Title = 'clipd')
+    $rs = [RunspaceFactory]::CreateRunspace()
+    $rs.ApartmentState = 'STA'
+    $rs.ThreadOptions  = 'ReuseThread'
+    $rs.Open()
+    $ps = [PowerShell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript({
+        param($msg, $ttl)
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+        $ni = New-Object System.Windows.Forms.NotifyIcon
+        $ni.Icon    = [System.Drawing.SystemIcons]::Information
+        $ni.Visible = $true
+        $ni.ShowBalloonTip(5000, $ttl, $msg, [System.Windows.Forms.ToolTipIcon]::Info)
+        Start-Sleep -Seconds 6
+        $ni.Dispose()
+    })
+    [void]$ps.AddArgument($Message)
+    [void]$ps.AddArgument($Title)
+    [void]$ps.BeginInvoke()   # 非同期: HTTP レスポンスをブロックしない
+}
+
 # ---- クリップボード読み取り (全種別対応 + retry) ------------------------------
 function Read-Clipboard {
     $script = {
@@ -568,7 +593,10 @@ try {
                 'url'    { Send-Text -Context $context -Text $clip.Text -Kind 'url' }
                 'rtf'    { Send-Text -Context $context -Text $clip.Text -Kind 'rtf' -ContentType 'text/rtf; charset=utf-8' }
                 'text'   { Send-Text -Context $context -Text $clip.Text -Kind 'text' }
-                default  { Send-Text -Context $context -Text '' -Kind 'empty' }
+                default  {
+                    Show-BalloonTip -Message 'クリップボードは空です'
+                    Send-Text -Context $context -Text '' -Kind 'empty'
+                }
             }
         } catch {
             try {
