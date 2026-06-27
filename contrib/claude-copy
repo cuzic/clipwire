@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+claude-copy — Claude Code の会話/タスク内容を stdout に出力する。
+wclip と組み合わせて Windows クリップボードに送る。
+
+使い方:
+  claude-copy            # 最新の Claude レスポンスを出力
+  claude-copy last       # 同上
+  claude-copy tasks      # 最新のタスクリストを出力
+  claude-copy session    # セッションの全テキスト (user/assistant) を出力
+
+パイプ例:
+  claude-copy | wclip
+  claude-copy tasks | wclip
+  claude-copy last | wclip
+
+環境変数:
+  CLAUDE_PROJECT_DIR  -- 明示的にプロジェクトディレクトリを指定 (省略時: CWD から自動検出)
+  CLAUDE_SESSION_ID   -- セッション ID (省略時: 最新ファイルを使用)
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def project_key(cwd: Path) -> str:
+    """CWD を Claude Code のプロジェクトキー形式に変換"""
+    return str(cwd).replace("/", "-")
+
+
+def find_session_file() -> Path:
+    project_dir_env = os.environ.get("CLAUDE_PROJECT_DIR")
+    session_id_env  = os.environ.get("CLAUDE_SESSION_ID")
+
+    if project_dir_env:
+        project_dir = Path(project_dir_env)
+    else:
+        key = project_key(Path.cwd())
+        project_dir = Path.home() / ".claude" / "projects" / key
+
+    if not project_dir.exists():
+        sys.exit(f"error: project dir not found: {project_dir}")
+
+    if session_id_env:
+        f = project_dir / f"{session_id_env}.jsonl"
+        if not f.exists():
+            sys.exit(f"error: session file not found: {f}")
+        return f
+
+    # 最新の .jsonl を使う
+    files = sorted(project_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        sys.exit(f"error: no session files in {project_dir}")
+    return files[0]
+
+
+def parse_entries(session_file: Path):
+    entries = []
+    with open(session_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return entries
+
+
+def text_blocks(content) -> list[str]:
+    """content (str or list) からテキストを抽出"""
+    if isinstance(content, str):
+        return [content] if content.strip() else []
+    if isinstance(content, list):
+        result = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                t = block.get("text", "").strip()
+                if t:
+                    result.append(t)
+        return result
+    return []
+
+
+def task_blocks(content) -> list[dict]:
+    """content から TaskCreate / TaskUpdate の tool_use を抽出"""
+    tasks = []
+    if not isinstance(content, list):
+        return tasks
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            name = block.get("name", "")
+            if "Task" in name:
+                tasks.append({"tool": name, "input": block.get("input", {})})
+    return tasks
+
+
+def cmd_last(entries):
+    """最後の assistant テキストレスポンスを返す"""
+    for entry in reversed(entries):
+        role = entry.get("message", {}).get("role") or entry.get("role")
+        content = entry.get("message", {}).get("content") or entry.get("content", "")
+        if role == "assistant":
+            texts = text_blocks(content)
+            if texts:
+                return "\n\n".join(texts)
+    sys.exit("error: no assistant text response found in session")
+
+
+def cmd_tasks(entries):
+    """最新のタスク状態を返す (TaskCreate/TaskUpdate を追跡)"""
+    tasks: dict[str, dict] = {}
+    for entry in entries:
+        role = entry.get("message", {}).get("role") or entry.get("role")
+        content = entry.get("message", {}).get("content") or entry.get("content", "")
+        if role != "assistant":
+            continue
+        for t in task_blocks(content):
+            inp = t["input"]
+            if t["tool"] == "TaskCreate":
+                tid = inp.get("id") or inp.get("title", "?")
+                tasks[tid] = {
+                    "title":  inp.get("title", tid),
+                    "status": inp.get("status", "pending"),
+                    "notes":  inp.get("notes", ""),
+                }
+            elif t["tool"] == "TaskUpdate":
+                tid = inp.get("id", "?")
+                if tid in tasks:
+                    tasks[tid].update({k: v for k, v in inp.items() if k != "id"})
+
+    if not tasks:
+        return "(このセッションにタスクはありません)"
+
+    lines = ["# タスクリスト\n"]
+    status_icon = {"completed": "✓", "in_progress": "→", "pending": "·"}
+    for tid, t in tasks.items():
+        icon = status_icon.get(t.get("status", ""), "·")
+        lines.append(f"{icon} {t['title']}  [{t.get('status','?')}]")
+        if t.get("notes"):
+            lines.append(f"  {t['notes']}")
+    return "\n".join(lines)
+
+
+def cmd_session(entries):
+    """全 user/assistant テキストをダイアログ形式で返す"""
+    lines = []
+    for entry in entries:
+        role = entry.get("message", {}).get("role") or entry.get("role")
+        content = entry.get("message", {}).get("content") or entry.get("content", "")
+        if role not in ("user", "assistant"):
+            continue
+        texts = text_blocks(content)
+        if not texts:
+            continue
+        label = "You" if role == "user" else "Claude"
+        lines.append(f"### {label}\n")
+        lines.append("\n\n".join(texts))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "last"
+
+    session_file = find_session_file()
+    entries = parse_entries(session_file)
+
+    if cmd == "last":
+        print(cmd_last(entries))
+    elif cmd == "tasks":
+        print(cmd_tasks(entries))
+    elif cmd == "session":
+        print(cmd_session(entries))
+    else:
+        sys.exit(f"error: unknown command '{cmd}'. Use: last | tasks | session")
+
+
+if __name__ == "__main__":
+    main()
