@@ -6,7 +6,8 @@
 #   bash contrib/install.sh            # 全てインストール
 #   bash contrib/install.sh --dry-run  # 何をするか確認だけ
 #   bash contrib/install.sh --skills   # スキルのみ
-#   bash contrib/install.sh --tools    # コマンドのみ (スキルなし)
+#   bash contrib/install.sh --binary   # clipwire バイナリのみ
+#   bash contrib/install.sh --tools    # claude-copy + スキル (バイナリなし)
 
 set -euo pipefail
 
@@ -16,14 +17,16 @@ BIN_DIR="${CLIPWIRE_BIN_DIR:-$HOME/bin}"
 CLAUDE_COMMANDS_DIR="${CLAUDE_COMMANDS_DIR:-$HOME/.claude/commands}"
 
 DRY_RUN=0
+INSTALL_BINARY=1
 INSTALL_TOOLS=1
 INSTALL_SKILLS=1
 
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
-        --tools)   INSTALL_SKILLS=0 ;;
-        --skills)  INSTALL_TOOLS=0 ;;
+        --binary)  INSTALL_TOOLS=0; INSTALL_SKILLS=0 ;;
+        --tools)   INSTALL_BINARY=0; INSTALL_SKILLS=0 ;;
+        --skills)  INSTALL_BINARY=0; INSTALL_TOOLS=0 ;;
     esac
 done
 
@@ -42,13 +45,32 @@ echo "skills:  $CLAUDE_COMMANDS_DIR"
 [[ "$DRY_RUN" -eq 1 ]] && echo "(dry-run mode)"
 echo ""
 
-# ── コマンドラインツール ──────────────────────────────────────────────────────
+# ── clipwire バイナリ ─────────────────────────────────────────────────────────
+
+if [[ "$INSTALL_BINARY" -eq 1 ]]; then
+    echo "--- clipwire binary → $BIN_DIR ---"
+    run mkdir -p "$BIN_DIR"
+
+    binary="$REPO_DIR/target/release/clipwire"
+    if [[ ! -f "$binary" ]]; then
+        echo "  ビルド済みバイナリが見つかりません。先にビルドしてください:"
+        echo "    cargo build --release"
+        echo "  skip"
+    else
+        run cp "$binary" "$BIN_DIR/clipwire"
+        run chmod +x "$BIN_DIR/clipwire"
+        echo "  installed: $BIN_DIR/clipwire"
+    fi
+    echo ""
+fi
+
+# ── その他ツール (claude-copy) ────────────────────────────────────────────────
 
 if [[ "$INSTALL_TOOLS" -eq 1 ]]; then
     echo "--- Tools → $BIN_DIR ---"
     run mkdir -p "$BIN_DIR"
 
-    for tool in clip wclip claude-copy; do
+    for tool in claude-copy; do
         src="$CONTRIB/$tool"
         dst="$BIN_DIR/$tool"
         if [[ ! -f "$src" ]]; then
@@ -84,7 +106,7 @@ fi
 
 # ── PATH チェック ─────────────────────────────────────────────────────────────
 
-if [[ "$INSTALL_TOOLS" -eq 1 && "$DRY_RUN" -eq 0 ]]; then
+if [[ "$DRY_RUN" -eq 0 ]]; then
     if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
         echo "⚠  $BIN_DIR は PATH に含まれていません。"
         echo "   ~/.bashrc または ~/.zshrc に以下を追加してください:"

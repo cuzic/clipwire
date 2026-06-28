@@ -11,7 +11,7 @@ clipwire/
 ├── src/main.rs
 └── contrib/
     ├── clipd.ps1       # 旧 PowerShell 版サーバ (参考用)
-    ├── clip            # Linux/Mac 用 bash クライアント
+    ├── claude-copy     # Claude Code セッション内容を stdout に出力
     └── tmux.conf.snippet
 ```
 
@@ -21,7 +21,7 @@ clipwire/
 Windows (clipwire.exe)        Linux / Mac
 ┌───────────────────┐         ┌──────────────────────┐
 │  クリップボード    │ tailnet │  tssh / ssh でログイン │
-│  ↓ HTTP          │◀────────│  $ clip               │
+│  ↓ HTTP          │◀────────│  $ clipwire get       │
 │  port 9999        │         │  → 内容が標準出力に    │
 └───────────────────┘         └──────────────────────┘
 ```
@@ -82,13 +82,13 @@ $env:CLIPD_TOKEN = "mySecretToken42"
 
 ### 2. Linux 側のセットアップ
 
-**2-1. clip をインストール**
+**2-1. clipwire をビルド・インストール**
 
 ```bash
-mkdir -p ~/bin
-curl -o ~/bin/clip \
-  https://raw.githubusercontent.com/cuzic/clipwire/main/contrib/clip
-chmod +x ~/bin/clip
+git clone https://github.com/cuzic/clipwire.git
+cd clipwire
+cargo build --release
+bash contrib/install.sh --binary   # ~/bin/clipwire にコピー
 
 # ~/bin が PATH に入っていなければ
 echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
@@ -108,6 +108,55 @@ export CLIPD_TOKEN=mySecretToken42      # Windows 側と同じトークン
 ```bash
 source ~/.bashrc
 ```
+
+**2-2b. `CLIPD_HOST` を SSH ログイン時に自動設定する (任意)**
+
+Windows から Tailscale 経由で SSH するたびに `CLIPD_HOST` を手動設定するのは手間なので、自動化できる。
+
+---
+
+**方法 A: `SSH_CONNECTION` を使う (sshd_config 変更不要・推奨)**
+
+`sshd` は接続元 IP を `$SSH_CONNECTION` に自動セットするので、`~/.bashrc` に以下を追記するだけ:
+
+```bash
+# Tailscale 経由 SSH のとき CLIPD_HOST を自動セット
+# SSH_CONNECTION の形式: <client_ip> <client_port> <server_ip> <server_port>
+if [[ -n "$SSH_CONNECTION" ]]; then
+    _ip=$(awk '{print $1}' <<< "$SSH_CONNECTION")
+    [[ "$_ip" == 100.* ]] && export CLIPD_HOST="$_ip"
+    unset _ip
+fi
+```
+
+`tailscale ssh <hostname>` でログインすると `$SSH_CONNECTION` の先頭フィールドが接続元の Tailscale IP になるため、`CLIPD_HOST` が自動でセットされる。(`SSH_CLIENT` も同様の変数だが、環境によって unset のことがあるため `SSH_CONNECTION` を推奨。)
+
+---
+
+**方法 B: `SetEnv` + `AcceptEnv` を使う**
+
+Windows 側の `.ssh/config` (`%USERPROFILE%\.ssh\config`) で接続先ごとにホスト名を明示できる。
+
+```
+Host dev
+    HostName 100.100.45.36
+    User cuzic
+    SetEnv CLIPD_HOST=dragonflyg4
+```
+
+Linux 側の `/etc/ssh/sshd_config` に以下を追記して `sshd` を再起動:
+
+```
+AcceptEnv CLIPD_HOST CLIPD_PORT CLIPD_TOKEN
+```
+
+```bash
+sudo systemctl restart sshd
+```
+
+方法 A より明示的で、複数の Windows マシンから接続先ごとに別のホスト名を指定したい場合に向く。
+
+---
 
 **2-3. 動作確認**
 
@@ -180,15 +229,16 @@ netsh http add urlacl url=http://<tailscale-ip>:9999/ user="DOMAIN\username"
 
 ---
 
-## Linux 側: clip
+## Linux / Mac 側: clipwire get / put
 
 ### 使い方
 
 ```bash
-clip              # クリップボードの内容を自動判別して出力
-clip -q           # パスやコマンドだけを出力 (Claude Code / シェルへのパイプ向け)
-clip -d ~/pics    # 画像の保存先を指定 (既定: /tmp 以下に mktemp)
-clip -h           # ヘルプ
+clipwire get              # クリップボードの内容を自動判別して出力
+clipwire get -q           # パスやコマンドだけを出力 (Claude Code / シェルへのパイプ向け)
+clipwire get -d ~/pics    # 画像の保存先を指定 (既定: /tmp 以下)
+
+echo "hello" | clipwire put   # stdin を Windows クリップボードに書き込む
 ```
 
 ### 種別ごとの動作
@@ -209,13 +259,38 @@ clip -h           # ヘルプ
 
 ---
 
+## Wayland クリップボードとの連携
+
+### 必要パッケージ
+
+```bash
+sudo apt install wl-clipboard   # wl-copy / wl-paste を提供
+```
+
+### Windows ↔ Wayland
+
+`clipwire get/put` は stdin/stdout ベースなので、`wl-copy`/`wl-paste` とパイプするだけで動く。
+
+```bash
+# Windows → Wayland
+clipwire get -q | wl-copy
+
+# Wayland → Windows
+wl-paste | clipwire put
+wl-paste --type image/png | clipwire put   # 画像の場合
+```
+
+tmux キーバインドとして登録しておくと便利（`contrib/tmux.conf.snippet` 参照）。
+
+---
+
 ## Claude Code / tmux との連携
 
 ### キーバインド
 
 | キー | 動作 |
 |---|---|
-| `<prefix> Ctrl-V` | `clip -q` の出力を現在のペインに貼り付け |
+| `<prefix> Ctrl-V` | `clipwire get -q` の出力を現在のペインに貼り付け |
 | `<prefix> Alt-V` | ファイル系は curl コマンドをその場で bash 実行、それ以外は貼り付け |
 
 **`<prefix> Ctrl-V` の種別ごとの動作:**

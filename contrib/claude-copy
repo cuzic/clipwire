@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 claude-copy — Claude Code の会話/タスク内容を stdout に出力する。
-wclip と組み合わせて Windows クリップボードに送る。
+clipwire put と組み合わせて Windows クリップボードに送る。
 
 使い方:
   claude-copy            # 最新の Claude レスポンスを出力
@@ -10,9 +10,9 @@ wclip と組み合わせて Windows クリップボードに送る。
   claude-copy session    # セッションの全テキスト (user/assistant) を出力
 
 パイプ例:
-  claude-copy | wclip
-  claude-copy tasks | wclip
-  claude-copy last | wclip
+  claude-copy | clipwire put
+  claude-copy tasks | clipwire put
+  claude-copy last | clipwire put
 
 環境変数:
   CLAUDE_PROJECT_DIR  -- 明示的にプロジェクトディレクトリを指定 (省略時: CWD から自動検出)

@@ -3,14 +3,13 @@ description: Windows クリップボードに Claude の出力・タスクリス
 keywords:
   - clipboard
   - windows
-  - wclip
+  - clipwire
   - クリップボード
   - コピー
   - タスク
 triggers:
   - windows クリップボードに送る
   - クリップボードにコピー
-  - wclip
   - windows にコピー
   - タスクをクリップボードに
 ---
@@ -36,13 +35,13 @@ Claude の出力内容を Windows クリップボードに送る。
 ### 2. コマンド実行
 
 ```bash
-claude-copy $ARGUMENTS | wclip
+claude-copy $ARGUMENTS | clipwire put
 ```
 
-`claude-copy` や `wclip` が PATH に入っていない場合は `~/bin/` を補完する:
+`claude-copy` や `clipwire` が PATH に入っていない場合は `~/bin/` を補完する:
 
 ```bash
-python3 ~/bin/claude-copy $ARGUMENTS | ~/bin/wclip
+python3 ~/bin/claude-copy $ARGUMENTS | ~/bin/clipwire put
 ```
 
 ### 3. 結果報告
