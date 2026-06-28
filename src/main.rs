@@ -979,79 +979,15 @@ mod win_clip {
     const CLIPWIRE_AUMID: &str = "cuzic.clipwire";
 
     /// サーバー起動時に一度だけ呼ぶ。
-    /// スタートメニューの clipwire.lnk に System.AppUserModel.ID を設定することで
-    /// CreateToastNotifierWithId が使えるようになる。
+    /// プロセスに AUMID を設定することで CreateToastNotifierWithId が使えるようになる。
     pub fn ensure_aumid_registered() {
-        if let Err(e) = ensure_aumid_impl() {
-            eprintln!("[clipwire] AUMID shortcut registration failed: {e}");
-        }
-    }
-
-    fn ensure_aumid_impl() -> windows::core::Result<()> {
-        use windows::{
-            core::{Interface, GUID, PCWSTR, PWSTR},
-            Win32::{
-                System::{
-                    Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER},
-                    Ole::{PROPVARIANT, VT_LPWSTR},
-                },
-                UI::Shell::{
-                    IShellLinkW, ShellLink, SHGetKnownFolderPath,
-                    FOLDERID_Programs, KF_FLAG_DEFAULT,
-                    PropertiesSystem::{IPropertyStore, PROPERTYKEY},
-                },
-            },
-        };
-
         unsafe {
-            let programs = SHGetKnownFolderPath(&FOLDERID_Programs, KF_FLAG_DEFAULT, None)?;
-            let programs_str = programs.to_string()?;
-            let lnk_path = format!("{programs_str}\\clipwire.lnk");
-
-            if std::path::Path::new(&lnk_path).exists() {
-                return Ok(());
+            if let Err(e) = windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
+                windows::core::w!("cuzic.clipwire"),
+            ) {
+                eprintln!("[clipwire] SetCurrentProcessExplicitAppUserModelID failed: {e}");
             }
-
-            let exe_path = std::env::current_exe()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            let shell_link: IShellLinkW =
-                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
-
-            let exe_wide: Vec<u16> = exe_path.encode_utf16().chain([0u16]).collect();
-            shell_link.SetPath(PCWSTR(exe_wide.as_ptr()))?;
-
-            // PKEY_AppUserModel_ID = {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, pid=5
-            let pkey = PROPERTYKEY {
-                fmtid: GUID {
-                    data1: 0x9F4C2855u32,
-                    data2: 0x9F79u16,
-                    data3: 0x4B39u16,
-                    data4: [0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3],
-                },
-                pid: 5,
-            };
-
-            let prop_store: IPropertyStore = shell_link.cast()?;
-
-            let aumid_wide: Vec<u16> =
-                CLIPWIRE_AUMID.encode_utf16().chain([0u16]).collect();
-            let mut pv = PROPVARIANT::default();
-            pv.Anonymous.Anonymous.vt = VT_LPWSTR.0 as u16;
-            pv.Anonymous.Anonymous.Anonymous.pwszVal =
-                PWSTR(aumid_wide.as_ptr() as *mut u16);
-
-            prop_store.SetValue(&pkey, &pv)?;
-            prop_store.Commit()?;
-
-            let persist: IPersistFile = shell_link.cast()?;
-            let lnk_wide: Vec<u16> = lnk_path.encode_utf16().chain([0u16]).collect();
-            persist.Save(PCWSTR(lnk_wide.as_ptr()), true)?;
-
-            eprintln!("[clipwire] AUMID shortcut created: {lnk_path}");
         }
-        Ok(())
     }
 
     pub unsafe fn acquire_mutex() -> windows::Win32::Foundation::HANDLE {
