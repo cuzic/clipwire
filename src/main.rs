@@ -890,7 +890,7 @@ mod win_clip {
         reapproval: bool,
     ) -> Result<()> {
         use windows::{
-            core::HSTRING,
+            core::{Interface, HSTRING},
             Data::Xml::Dom::XmlDocument,
             Foundation::TypedEventHandler,
             UI::Notifications::{
