@@ -896,6 +896,10 @@ mod win_clip {
         config_dir: std::path::PathBuf,
         reapproval: bool,
     ) -> Result<()> {
+        // 実行確認用: 関数が呼ばれたら必ずログに記録する
+        let log_path = config_dir.join("toast.log");
+        let _ = std::fs::write(&log_path, format!("[clipwire] show_register_toast_impl called for '{}'\n", name));
+
         use windows::{
             core::{Interface, HSTRING},
             Data::Xml::Dom::XmlDocument,
@@ -948,7 +952,9 @@ mod win_clip {
 
         // 未パッケージアプリは AUMID 不要のデフォルト notifier を使う
         let notifier = ToastNotificationManager::CreateToastNotifier()?;
+        let _ = std::fs::write(&log_path, format!("[clipwire] calling notifier.Show() for '{}'\n", name));
         notifier.Show(&toast)?;
+        let _ = std::fs::write(&log_path, format!("[clipwire] notifier.Show() succeeded for '{}'\n", name));
 
         // ユーザー操作を最大 10 分待機
         if rx.recv_timeout(std::time::Duration::from_secs(600)).unwrap_or(false) {
