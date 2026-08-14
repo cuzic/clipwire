@@ -225,6 +225,21 @@ fn load_target_map(path: &Path) -> Result<TargetMap> {
     Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
 }
 
+/// `load_target_map` を呼び、失敗（ファイルは存在するが読めない/壊れている）
+/// 場合は空マップにフォールバックしつつ**必ず警告ログを残す**。
+/// 黙って空マップ扱いにすると、破損に気づかないまま
+/// 「登録した全ターゲットが消えた」ように見えてしまう
+/// （サーバー側呼び出し元専用。`unwrap_or_default()` を直接使わないこと）。
+fn load_target_map_or_warn(path: &Path) -> TargetMap {
+    match load_target_map(path) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("{} の読み込みに失敗しました（空として扱います）: {e:#}", path.display());
+            TargetMap::default()
+        }
+    }
+}
+
 fn save_target_map(path: &Path, map: &TargetMap) -> Result<()> {
     std::fs::create_dir_all(path.parent().unwrap())?;
     std::fs::write(path, toml::to_string(map)?)?;
@@ -635,10 +650,18 @@ mod win_clip {
         RegisterClipboardFormatW(name)
     }
 
+    /// `GlobalLock` が失敗（null 返却）した場合、null ポインタから
+    /// `from_raw_parts` するのは未定義動作（Rust の panic にはならず、
+    /// catch_unwind でも panic hook でも捕まえられない segfault 相当の
+    /// クラッシュになりうる）。ここで明示的に弾く。
     unsafe fn hglobal_bytes(h: HANDLE) -> Vec<u8> {
         let hg   = HGLOBAL(h.0);
         let size = GlobalSize(hg);
         let ptr  = GlobalLock(hg);
+        if ptr.is_null() {
+            tracing::warn!("hglobal_bytes: GlobalLock が null を返しました (size={size})");
+            return Vec::new();
+        }
         let data = std::slice::from_raw_parts(ptr as *const u8, size).to_vec();
         let _    = GlobalUnlock(hg);
         data
@@ -765,6 +788,10 @@ mod win_clip {
         let hg   = stgm.u.hGlobal;
         let size = GlobalSize(hg);
         let ptr  = GlobalLock(hg);
+        if ptr.is_null() {
+            ReleaseStgMedium(&mut stgm);
+            bail!("get_vfile_contents: GlobalLock が null を返しました (size={size})");
+        }
         let data = std::slice::from_raw_parts(ptr as *const u8, size).to_vec();
         let _    = GlobalUnlock(hg);
         ReleaseStgMedium(&mut stgm);
@@ -851,7 +878,11 @@ mod win_clip {
 
     pub fn show_balloon(msg: &str) {
         let msg = msg.to_string();
-        std::thread::spawn(move || { let _ = show_simple_toast(&msg); });
+        std::thread::spawn(move || {
+            if let Err(e) = show_simple_toast(&msg) {
+                tracing::warn!("show_balloon: バルーン通知の表示に失敗しました: {e}");
+            }
+        });
     }
 
     #[allow(unused_variables)]
@@ -968,8 +999,8 @@ mod win_clip {
         if rx.recv_timeout(std::time::Duration::from_secs(600)).unwrap_or(false) {
             let registered_path = config_dir.join("registered.toml");
             let pending_path    = config_dir.join("pending.toml");
-            let mut registered = super::load_target_map(&registered_path).unwrap_or_default();
-            let mut pending    = super::load_target_map(&pending_path).unwrap_or_default();
+            let mut registered = super::load_target_map_or_warn(&registered_path);
+            let mut pending    = super::load_target_map_or_warn(&pending_path);
             registered.insert(name.clone(), entry);
             pending.remove(&name);
             super::save_target_map(&registered_path, &registered)?;
@@ -996,19 +1027,33 @@ mod win_clip {
         }
     }
 
+    /// `-WindowStyle Hidden` では eprintln! はどこにも表示されないため、直接
+    /// ログファイルへ書く。`tracing::error!` は非同期（non-blocking writer）
+    /// で実際の書き込みはバックグラウンドスレッドが行うため、直後の
+    /// `std::process::exit`（デストラクタを一切走らせない）と組み合わせると
+    /// メッセージが失われうる——ここでは同期的にファイルへ書いてから終了する。
+    fn log_and_exit(msg: &str) -> ! {
+        eprintln!("{msg}");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(super::log_file_path())
+        {
+            use std::io::Write as _;
+            let _ = writeln!(f, "{msg}");
+        }
+        std::process::exit(1);
+    }
+
     pub unsafe fn acquire_mutex() -> windows::Win32::Foundation::HANDLE {
         match CreateMutexW(None, true, w!("Global\\clipwire_singleton")) {
             Ok(h) => {
                 if GetLastError() == WIN32_ERROR(183) {
-                    eprintln!("clipwire serve は既に起動中です。");
-                    std::process::exit(1);
+                    log_and_exit("clipwire serve は既に起動中です。");
                 }
                 h
             }
-            Err(e) => {
-                eprintln!("CreateMutexW failed: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => log_and_exit(&format!("CreateMutexW failed: {e}")),
         }
     }
 
@@ -1029,6 +1074,46 @@ mod win_clip {
     }
 }
 
+// ── Logging / panic visibility (serve) ────────────────────────────────────────
+
+/// ログファイルのパス（`clipwire_config_dir()/clipd.log`）。
+fn log_file_path() -> PathBuf {
+    clipwire_config_dir().join("clipd.log")
+}
+
+/// panic 発生時にメッセージをログファイルへ直接追記する panic hook を設定する。
+/// tokio ランタイム起動前、`main()` の一番最初で一度だけ呼ぶこと
+/// （STA クリップボードスレッド等、tracing の非同期書き込みタスクとは別の
+/// スレッドで起きた panic も、tracing の初期化タイミングに関係なく捕まえる
+/// ため、tracing_subscriber::fmt().init() より前に独立して動く必要がある）。
+///
+/// これは Rust の catch_unwind 可能な panic のみを捕まえる。`GlobalLock` の
+/// null ポインタ参照のような未定義動作（segfault 相当）はそもそも Rust の
+/// panic ではないため、この hook でも捕まえられない
+/// （`win_clip::hglobal_bytes` 側で null チェックして防ぐ必要がある）。
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let thread = std::thread::current();
+        let msg = format!(
+            "[{ts}] PANIC on thread '{}': {info}\n",
+            thread.name().unwrap_or("<unnamed>")
+        );
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file_path())
+        {
+            let _ = f.write_all(msg.as_bytes());
+        }
+        default_hook(info);
+    }));
+}
+
 // ── Network helpers (serve) ───────────────────────────────────────────────────
 
 fn find_tailscale_ip() -> Option<Ipv4Addr> {
@@ -1037,7 +1122,15 @@ fn find_tailscale_ip() -> Option<Ipv4Addr> {
             if let Ok(ip) = String::from_utf8_lossy(&out.stdout).trim().parse::<Ipv4Addr>() {
                 return Some(ip);
             }
+        } else {
+            warn!(
+                "tailscale ip -4 failed: status={:?} stderr={}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
+    } else {
+        warn!("tailscale コマンドを実行できませんでした（PATH に無い可能性）");
     }
     if let Ok(out) = std::process::Command::new("ipconfig").output() {
         let s = String::from_utf8_lossy(&out.stdout);
@@ -1147,7 +1240,7 @@ async fn handle_register(State(s): State<AppState>, headers: HeaderMap, body: ax
     let entry           = req.target;
     let pending_path    = s.config_dir.join("pending.toml");
     let registered_path = s.config_dir.join("registered.toml");
-    let mut registered  = load_target_map(&registered_path).unwrap_or_default();
+    let mut registered  = load_target_map_or_warn(&registered_path);
 
     if s.auto_approve {
         registered.insert(req.name.clone(), entry);
@@ -1159,7 +1252,7 @@ async fn handle_register(State(s): State<AppState>, headers: HeaderMap, body: ax
 
     // 通常フロー: pending に追加、既承認分は取り消し
     let reapproval = registered.remove(&req.name).is_some();
-    let mut pending = load_target_map(&pending_path).unwrap_or_default();
+    let mut pending = load_target_map_or_warn(&pending_path);
     #[cfg(windows)]
     let entry_for_toast = entry.clone();
     pending.insert(req.name.clone(), entry);
@@ -1194,11 +1287,11 @@ async fn handle_exec(State(s): State<AppState>, headers: HeaderMap, body: axum::
         Err(e) => return (StatusCode::BAD_REQUEST, format!("JSON parse error: {e}\n")).into_response(),
     };
 
-    let registered = load_target_map(&s.config_dir.join("registered.toml")).unwrap_or_default();
+    let registered = load_target_map_or_warn(&s.config_dir.join("registered.toml"));
     let stored = match registered.get(&req.name) {
         Some(t) => t.clone(),
         None => {
-            let pending = load_target_map(&s.config_dir.join("pending.toml")).unwrap_or_default();
+            let pending = load_target_map_or_warn(&s.config_dir.join("pending.toml"));
             if pending.contains_key(&req.name) {
                 return (StatusCode::CONFLICT, format!("'{}' は承認待ちです。Windows で clipwire approve {} を実行してください\n", req.name, req.name)).into_response();
             }
@@ -1302,7 +1395,16 @@ fn exec_rhai(script: &str, dir: Option<&str>) -> Result<(Vec<u8>, i32)> {
                     g.extend_from_slice(&o.stderr); g.extend_from_slice(&o.stdout);
                     o.status.success()
                 }
-                Err(_) => false,
+                Err(e) => {
+                    // run_ok は失敗を無視して続行する設計だが、起動すらできな
+                    // かった理由（プログラムが見つからない等）まで無音にする
+                    // と原因調査が不可能になるため、出力に残す。
+                    let mut g = out.lock().unwrap();
+                    g.extend_from_slice(
+                        format!("run_ok: {} の起動に失敗しました: {e}\n", args[0]).as_bytes(),
+                    );
+                    false
+                }
             }
         });
     }
@@ -1417,12 +1519,31 @@ fn mime_for_ext(ext: &str) -> &'static str {
 // ── serve entry point ─────────────────────────────────────────────────────────
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
+    // `-WindowStyle Hidden` で起動すると標準出力/標準エラーがどこにも残らず、
+    // tracing のログも panic メッセージも消える（「ログが何もない」の直接の
+    // 原因）。ログファイルへ明示的に書く。`_guard` は非同期書き込みスレッドを
+    // 生かし続けるためにこの関数のスタックで保持する（`serve_forever` が
+    // 正常時は無限ループのため、事実上プロセス終了までドロップされない）。
+    let log_path = log_file_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file_appender = tracing_appender::rolling::never(
+        log_path.parent().unwrap_or_else(|| Path::new(".")),
+        log_path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("clipd.log")),
+    );
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "clipwire=info".into()),
         )
+        .with_writer(non_blocking)
+        .with_ansi(false)
         .init();
+    info!("clipd starting (pid={}), log file: {}", std::process::id(), log_path.display());
 
     if !args.bind_localhost_only && args.token.is_none() && !args.allow_no_token {
         bail!(
@@ -1522,10 +1643,25 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Serve(args) => {
-            tokio::runtime::Builder::new_multi_thread()
+            install_panic_hook();
+            let result = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(run_serve(args))
+                .block_on(run_serve(args));
+            if let Err(e) = &result {
+                // tracing はここでは既に flush/shutdown 済みの可能性があるため、
+                // 直接ファイルへも書く（run_serve が返るのは異常終了のときのみ
+                // ——serve_forever は正常時は無限ループするため）。
+                let msg = format!("clipd exiting with error: {e:#}\n");
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(log_file_path())
+                {
+                    let _ = f.write_all(msg.as_bytes());
+                }
+            }
+            result
         }
         Cmd::Get(args) => {
             let cfg = ClientConfig::from_env()?;

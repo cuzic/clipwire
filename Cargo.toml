@@ -16,6 +16,7 @@ dirs-next   = "2"
 image       = { version = "0.25", default-features = false, features = ["png", "bmp"] }
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender   = "0.2"
 rhai               = "1"
 shlex              = "1"
 
