@@ -1466,30 +1466,54 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     let localhost = SocketAddr::from(([127, 0, 0, 1], args.port));
 
     if args.bind_localhost_only {
-        info!("Listening on http://{localhost}");
-        axum::serve(tokio::net::TcpListener::bind(localhost).await?, app).await?;
+        serve_forever(localhost, app, "localhost").await;
     } else {
         match find_tailscale_ip() {
             Some(ts_ip) => {
                 let ts_addr = SocketAddr::from((ts_ip, args.port));
-                info!("Listening on http://{localhost}");
-                info!("Listening on http://{ts_addr}  (Tailscale)");
                 let app2 = app.clone();
-                tokio::spawn(async move {
-                    if let Ok(l) = tokio::net::TcpListener::bind(localhost).await {
-                        axum::serve(l, app2).await.ok();
-                    }
-                });
-                axum::serve(tokio::net::TcpListener::bind(ts_addr).await?, app).await?;
+                tokio::spawn(serve_forever(localhost, app2, "localhost"));
+                serve_forever(ts_addr, app, "tailscale").await;
             }
             None => {
                 warn!("Tailscale IP not found; falling back to localhost-only");
-                info!("Listening on http://{localhost}");
-                axum::serve(tokio::net::TcpListener::bind(localhost).await?, app).await?;
+                serve_forever(localhost, app, "localhost").await;
             }
         }
     }
     Ok(())
+}
+
+/// `addr` へ bind して `app` を serve し続ける。エラーが起きても**プロセスを
+/// 道連れにせず**、ログを出して5秒後に再試行する（bind 自体の失敗、serve
+/// ループ中の異常終了のいずれも同様）。
+///
+/// # 修正の背景（2026-08-15）
+///
+/// 旧実装は Tailscale 向けリスナーだけ `axum::serve(..).await?` で
+/// `run_serve` → `main()` までエラーを伝播させ、**プロセスごと終了**していた
+/// （localhost 向けリスナーは対称的に `.ok()` で握り潰していたのに、
+/// こちらだけ非対称だった）。Tailscale の接続は relay⇔direct の切替や
+/// 一時的な `offline` 状態を伴うことがあり、そのタイミングで
+/// `TcpListener::bind`/`axum::serve` がエラーを返すと、そのままサーバー
+/// プロセス全体が落ちていた（実機で「何度再起動しても落ちる」として再現）。
+/// この関数に一本化し、どのリスナーも「失敗したら再試行し続ける」対称な
+/// 挙動にした。
+async fn serve_forever(addr: SocketAddr, app: Router, label: &str) {
+    loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                info!("Listening on http://{addr} ({label})");
+                if let Err(e) = axum::serve(listener, app.clone()).await {
+                    warn!("{label} リスナー ({addr}) が停止しました: {e}。5秒後に再試行します");
+                }
+            }
+            Err(e) => {
+                warn!("{label} ({addr}) への bind に失敗しました: {e}。5秒後に再試行します");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
