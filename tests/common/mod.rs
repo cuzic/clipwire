@@ -10,6 +10,8 @@ use std::{
 
 use tempfile::TempDir;
 
+pub const TEST_TOKEN: &str = "integration-test-token";
+
 static STARTUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub struct TestServer {
@@ -40,6 +42,7 @@ impl TestServer {
                 &port.to_string(),
             ])
             .env("CLIPWIRE_CONFIG_DIR", config_dir.path())
+            .env("CLIPD_TOKEN", TEST_TOKEN)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

@@ -189,6 +189,19 @@ pub(crate) fn resolve_serve_token(
 
 pub(crate) const CLI_TOKEN_DEPRECATION_WARNING: &str =
     "--token はプロセス一覧に露出するため非推奨です。--token-file を使用してください";
+pub(crate) const AUTO_APPROVE_WARNING: &str =
+    "serve-start auto_approve=true: トークン保有者は Windows ユーザー権限でコードを実行できます";
+
+pub(crate) fn validate_serve_security(auto_approve: bool, token: &Option<String>) -> Result<()> {
+    if auto_approve && token.is_none() {
+        bail!("--auto-approve にはトークンが必要です。--token-file <path> を指定してください。");
+    }
+    Ok(())
+}
+
+pub(crate) fn warn_auto_approve() {
+    warn!("{}", AUTO_APPROVE_WARNING);
+}
 
 // ── serve entry point ─────────────────────────────────────────────────────────
 
@@ -230,6 +243,10 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     );
     if used_cli_token {
         warn!("{}", CLI_TOKEN_DEPRECATION_WARNING);
+    }
+    validate_serve_security(args.auto_approve, &token)?;
+    if args.auto_approve {
+        warn_auto_approve();
     }
 
     if !args.bind_localhost_only && token.is_none() && !args.allow_no_token {

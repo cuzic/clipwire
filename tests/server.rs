@@ -1,8 +1,23 @@
 mod common;
 
-use std::thread;
+use std::{process::Command, thread};
 
 use common::TestServer;
+
+#[test]
+fn ac_t2_2_2_auto_approve_without_token_fails_before_listening() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_clipwire"))
+        .args(["serve", "--bind-localhost-only", "--auto-approve"])
+        .env_remove("CLIPD_TOKEN")
+        .env("CLIPWIRE_CONFIG_DIR", config_dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--auto-approve"));
+    assert!(stderr.contains("--token-file"));
+}
 
 #[test]
 fn ac_t0_3_1_health_returns_ok() {
@@ -21,6 +36,7 @@ fn ac_t0_3_2_register_writes_pending_to_the_overridden_config_dir() {
     };
     let response = ureq::post(&server.url("/register"))
         .set("Content-Type", "application/json")
+        .set("Authorization", &format!("Bearer {}", common::TEST_TOKEN))
         .send_string(
             &serde_json::json!({
                 "name": "integration-target",

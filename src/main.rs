@@ -283,6 +283,22 @@ mod tests {
         }
     }
 
+    fn clipboard_test_state(config_dir: PathBuf) -> AppState {
+        let (clip_tx, clip_rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            if let Ok(ClipRequest::GetClip { reply }) = clip_rx.recv() {
+                let _ = reply.send(ClipKind::Text("stub".into()));
+            }
+        });
+        AppState {
+            clip_tx,
+            token: None,
+            last_clip: Arc::new(Mutex::new(LastClip::default())),
+            config_dir,
+            auto_approve: false,
+        }
+    }
+
     #[test]
     fn ac_t2_1_1_every_route_has_an_explicit_classification() {
         let actual: Vec<_> = ROUTES
@@ -335,6 +351,86 @@ mod tests {
             let response = app.clone().oneshot(request).await.unwrap();
             assert_eq!(response.status(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn ac_t2_2_1_protected_routes_require_a_configured_token() {
+        let dir = tempdir().unwrap();
+        let app = build_router(clipboard_test_state(dir.path().to_path_buf()));
+
+        for path in ["/exec", "/register"] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("--token-file"));
+        }
+
+        let request = axum::http::Request::builder()
+            .uri("/clip")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ac_t2_2_3_correct_token_allows_protected_routes_and_wrong_token_is_401() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), true);
+        state.token = Some("secret".into());
+        let app = build_router(state);
+
+        let request = |path: &str, token: &str, body: &'static str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        for path in ["/exec", "/register"] {
+            let response = app
+                .clone()
+                .oneshot(request(path, "wrong", "{}"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let register = request(
+            "/register",
+            "secret",
+            r#"{"name":"token-test","script":"()"}"#,
+        );
+        assert_eq!(
+            app.clone().oneshot(register).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let exec = request("/exec", "secret", r#"{"name":"token-test"}"#);
+        assert_eq!(app.oneshot(exec).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn ac_t2_2_4_auto_approve_emits_one_warning_without_the_token() {
+        let token = Some("secret-value-must-not-appear".to_string());
+        validate_serve_security(true, &token).unwrap();
+        let logs = capture_logs(warn_auto_approve);
+        assert_eq!(logs.matches("serve-start auto_approve=true").count(), 1);
+        assert!(logs.contains("WARN"));
+        assert!(!logs.contains(token.as_deref().unwrap()));
     }
 
     fn script_target(script: &str) -> StoredTarget {
