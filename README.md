@@ -67,8 +67,8 @@ netsh http add urlacl url=http://100.x.y.z:9999/ user="DESKTOP-XXXXX\username"
 
 ```bat
 @echo off
-set CLIPD_TOKEN=mySecretToken42
-start "" /B "C:\path\to\clipwire.exe" --token %CLIPD_TOKEN%
+rem トークンは %USERPROFILE%\.clipwire-token に 1 行で保存しておく
+start "" /B "C:\path\to\clipwire.exe" --token-file "%USERPROFILE%\.clipwire-token"
 ```
 
 手動で試す場合:
@@ -185,13 +185,17 @@ tmux source ~/.tmux.conf
 | オプション | 既定 | 説明 |
 |---|---|---|
 | `--port` | `9999` | 待ち受けポート |
-| `--token` | `$CLIPD_TOKEN` | Bearer トークン |
+| `--token-file` | — | トークンを書いたファイル (前後の空白・BOM は除去、空ファイルはエラー)。優先順位: `--token` > `--token-file` > `$CLIPD_TOKEN` |
+| `--token` | `$CLIPD_TOKEN` | Bearer トークン (コマンドラインでの指定は非推奨。プロセス一覧に残るため `--token-file` か環境変数を推奨) |
 | `--bind-localhost-only` | off | localhost のみバインド |
 | `--allow-no-token` | off | token なし tailnet 公開を明示許可 |
 
 ### セキュリティ
 
 - token なし & tailnet 公開はデフォルトで拒否 (`--allow-no-token` で上書き可)
+- ターゲット名は `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` のみ許可 (register/exec)
+- `get` が出力する curl 行はトークンを展開せず `$CLIPD_TOKEN` を参照する (会話ログにトークンを残さない)
+- toast 通知は WinRT のみ (PowerShell 経由の通知は廃止)
 - 多重起動防止に名前付き Mutex を使用
 - Tailscale IP は `tailscale ip -4` または CGNAT 帯 (`100.64.0.0/10`) で自動検出
 
