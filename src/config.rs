@@ -71,10 +71,28 @@ impl StoredTarget {
 
 pub(crate) type TargetMap = std::collections::HashMap<String, StoredTarget>;
 
+pub(crate) const CONFIG_DIR_ENV: &str = "CLIPWIRE_CONFIG_DIR";
+
 pub(crate) fn clipwire_config_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os(CONFIG_DIR_ENV) {
+        return PathBuf::from(path);
+    }
     dirs_next::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
         .join("clipwire")
+}
+
+/// Keep test/dev servers using different stores from contending with the
+/// production singleton. FNV-1a is used only to make a compact, stable name;
+/// this is not a security boundary.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn singleton_mutex_name(config_dir: &Path) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in config_dir.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("Global\\clipwire_singleton_{hash:016x}")
 }
 
 pub(crate) fn load_target_map(path: &Path) -> Result<TargetMap> {

@@ -316,6 +316,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn singleton_mutex_name_is_stable_and_scoped_to_config_dir() {
+        let first = singleton_mutex_name(Path::new("/tmp/clipwire-a"));
+        assert_eq!(first, singleton_mutex_name(Path::new("/tmp/clipwire-a")));
+        assert_ne!(first, singleton_mutex_name(Path::new("/tmp/clipwire-b")));
+        assert!(first.starts_with("Global\\clipwire_singleton_"));
+    }
+
     #[tokio::test]
     async fn invalid_register_names_return_400_without_changing_stores() {
         let dir = tempdir().unwrap();

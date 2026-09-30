@@ -235,8 +235,10 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         );
     }
 
+    let config_dir = clipwire_config_dir();
+
     #[cfg(windows)]
-    let _mutex = unsafe { win_clip::acquire_mutex() };
+    let _mutex = unsafe { win_clip::acquire_mutex(&config_dir) };
     #[cfg(windows)]
     win_clip::ensure_aumid_registered();
 
@@ -252,7 +254,6 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
             }
         })?;
 
-    let config_dir = clipwire_config_dir();
     warn_invalid_stored_target_names(&config_dir);
 
     let state = AppState {
