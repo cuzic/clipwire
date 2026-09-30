@@ -48,7 +48,10 @@ fn ac_t0_2_1_cli_help_matches_pre_split_fixtures() {
             .unwrap_or_else(|error| panic!("failed to run {name} help: {error}"));
         assert!(output.status.success(), "{name} help failed");
         assert_eq!(
-            String::from_utf8(output.stdout).unwrap(),
+            // Windows では Usage の実行ファイル名が clipwire.exe になる。
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .replace("clipwire.exe", "clipwire"),
             *expected,
             "{name}"
         );
