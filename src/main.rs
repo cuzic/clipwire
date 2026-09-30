@@ -27,6 +27,7 @@ use axum::{
     body::Body,
     extract::{Query, State},
     http::{header, HeaderMap, StatusCode},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
@@ -231,6 +232,7 @@ mod tests {
     use quick_xml::{events::Event, Reader};
     use std::collections::HashMap;
     use tempfile::tempdir;
+    use tower::ServiceExt;
     use tracing_subscriber::prelude::*;
 
     #[derive(Clone, Default)]
@@ -278,6 +280,60 @@ mod tests {
             last_clip: Arc::new(Mutex::new(LastClip::default())),
             config_dir,
             auto_approve,
+        }
+    }
+
+    #[test]
+    fn ac_t2_1_1_every_route_has_an_explicit_classification() {
+        let actual: Vec<_> = ROUTES
+            .iter()
+            .map(|route| (route.id, route.path, route.class))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                (RouteId::Health, "/health", RouteClass::Common),
+                (RouteId::Root, "/", RouteClass::Clipboard),
+                (RouteId::Clip, "/clip", RouteClass::Clipboard),
+                (RouteId::File, "/file", RouteClass::Clipboard),
+                (RouteId::VFile, "/vfile", RouteClass::Clipboard),
+                (RouteId::Open, "/open", RouteClass::Clipboard),
+                (RouteId::Exec, "/exec", RouteClass::Protected),
+                (RouteId::Register, "/register", RouteClass::Protected),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t2_1_2_middleware_order_and_statuses_are_fixed() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.token = Some("secret".into());
+        let app = build_router(state);
+
+        let request = |host: bool, origin: bool, content_type: Option<&str>| {
+            let mut builder = axum::http::Request::builder().method("POST").uri("/exec");
+            if host {
+                builder = builder.header(header::HOST, "localhost");
+            }
+            if origin {
+                builder = builder.header(header::ORIGIN, "http://evil.example");
+            }
+            if let Some(content_type) = content_type {
+                builder = builder.header(header::CONTENT_TYPE, content_type);
+            }
+            builder.body(Body::from("{}")).unwrap()
+        };
+
+        let cases = [
+            (request(false, true, Some("text/plain")), 421),
+            (request(true, true, Some("text/plain")), 403),
+            (request(true, false, Some("text/plain")), 415),
+            (request(true, false, Some("application/json")), 401),
+        ];
+        for (request, expected) in cases {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected);
         }
     }
 

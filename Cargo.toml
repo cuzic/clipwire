@@ -51,3 +51,4 @@ strip     = true
 proptest = "1.11.0"
 quick-xml = "0.41.0"
 tempfile = "3.27.0"
+tower = { version = "0.5", features = ["util"] }

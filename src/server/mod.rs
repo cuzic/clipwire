@@ -2,10 +2,14 @@ use super::*;
 
 mod clip;
 mod exec;
+mod http_surface;
 mod register;
 
 use clip::*;
 pub(crate) use exec::handle_exec;
+pub(crate) use http_surface::build_router;
+#[cfg(test)]
+pub(crate) use http_surface::{RouteClass, RouteId, ROUTES};
 pub(crate) use register::handle_register;
 
 #[derive(Debug)]
@@ -264,16 +268,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         auto_approve: args.auto_approve,
     };
 
-    let app = Router::new()
-        .route("/health", get(handle_health))
-        .route("/", get(handle_clip))
-        .route("/clip", get(handle_clip).post(handle_clip_post))
-        .route("/file", get(handle_file))
-        .route("/vfile", get(handle_vfile))
-        .route("/open", get(handle_open))
-        .route("/exec", post(handle_exec))
-        .route("/register", post(handle_register))
-        .with_state(state.clone());
+    let app = build_router(state.clone());
 
     let localhost = SocketAddr::from(([127, 0, 0, 1], args.port));
 
