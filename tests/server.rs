@@ -17,6 +17,18 @@ fn ac_t2_2_2_auto_approve_without_token_fails_before_listening() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--auto-approve"));
     assert!(stderr.contains("--token-file"));
+    assert!(stderr.contains("--allow-no-token"));
+}
+
+#[test]
+fn ac_t2_2_2_auto_approve_with_allow_no_token_starts() {
+    let Some(server) = TestServer::start_auto_approve_no_token() else {
+        return;
+    };
+    assert_eq!(
+        ureq::get(&server.url("/health")).call().unwrap().status(),
+        200
+    );
 }
 
 #[test]

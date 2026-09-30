@@ -100,7 +100,7 @@ struct ServeArgs {
     #[arg(long)]
     bind_localhost_only: bool,
 
-    /// トークンなしで tailnet に公開することを明示許可
+    /// 保護ルートを含め、トークンなしでの利用を明示許可
     #[arg(long)]
     allow_no_token: bool,
 
@@ -285,6 +285,7 @@ mod tests {
         AppState {
             clip_tx,
             token: None,
+            allow_no_token: false,
             last_clip: Arc::new(Mutex::new(LastClip::default())),
             config_dir,
             auto_approve,
@@ -302,6 +303,7 @@ mod tests {
         AppState {
             clip_tx,
             token: None,
+            allow_no_token: false,
             last_clip: Arc::new(Mutex::new(LastClip::default())),
             config_dir,
             auto_approve: false,
@@ -569,6 +571,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(String::from_utf8_lossy(&body).contains("--token-file"));
+            assert!(String::from_utf8_lossy(&body).contains("--allow-no-token"));
         }
 
         let request = axum::http::Request::builder()
@@ -577,6 +580,72 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ac_t2_2_1b_allow_no_token_accepts_protected_routes_with_browser_guards() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), true);
+        state.allow_no_token = true;
+        state.host_policy = host_policy(HostCheckMode::Enforce, &["localhost"]);
+        let app = build_router(state);
+
+        let request = |path: &'static str, body: &'static str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "/register",
+                    r#"{"name":"no-token-test","script":"()"}"#,
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request("/exec", r#"{"name":"no-token-test"}"#))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let origin = axum::http::Request::builder()
+            .method("POST")
+            .uri("/exec")
+            .header(header::HOST, "localhost")
+            .header(header::ORIGIN, "http://evil.example")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(origin).await.unwrap().status(), 403);
+
+        let non_json = axum::http::Request::builder()
+            .method("POST")
+            .uri("/exec")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(non_json).await.unwrap().status(), 415);
+
+        let bad_host = axum::http::Request::builder()
+            .method("POST")
+            .uri("/exec")
+            .header(header::HOST, "evil.example")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(app.oneshot(bad_host).await.unwrap().status(), 421);
     }
 
     #[tokio::test]
@@ -623,11 +692,31 @@ mod tests {
     #[test]
     fn ac_t2_2_4_auto_approve_emits_one_warning_without_the_token() {
         let token = Some("secret-value-must-not-appear".to_string());
-        validate_serve_security(true, &token).unwrap();
-        let logs = capture_logs(warn_auto_approve);
+        validate_serve_security(true, &token, false).unwrap();
+        let logs = capture_logs(|| warn_auto_approve(true));
         assert_eq!(logs.matches("serve-start auto_approve=true").count(), 1);
+        assert!(logs.contains("auth=token"));
         assert!(logs.contains("WARN"));
         assert!(!logs.contains(token.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn ac_t2_2_2_and_2_4_auto_approve_allows_explicit_no_token_and_warns_strongly() {
+        let no_token = None;
+        let error = validate_serve_security(true, &no_token, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--token-file"));
+        assert!(error.contains("--allow-no-token"));
+
+        validate_serve_security(true, &no_token, true).unwrap();
+        let logs = capture_logs(|| warn_auto_approve(false));
+        assert_eq!(logs.matches("serve-start auto_approve=true").count(), 1);
+        assert!(logs.contains("auth=none"));
+        assert!(logs.contains("到達できるすべての者"));
+        assert!(logs.contains("任意のコード"));
+        assert!(logs.contains("承認なし"));
+        assert!(logs.contains("WARN"));
     }
 
     fn script_target(script: &str) -> StoredTarget {

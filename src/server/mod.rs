@@ -81,6 +81,7 @@ pub(crate) struct LastClip {
 pub(crate) struct AppState {
     pub(crate) clip_tx: mpsc::SyncSender<ClipRequest>,
     pub(crate) token: Option<String>,
+    pub(crate) allow_no_token: bool,
     pub(crate) last_clip: Arc<Mutex<LastClip>>,
     pub(crate) config_dir: PathBuf,
     pub(crate) auto_approve: bool,
@@ -321,18 +322,31 @@ pub(crate) fn resolve_serve_token(
 
 pub(crate) const CLI_TOKEN_DEPRECATION_WARNING: &str =
     "--token はプロセス一覧に露出するため非推奨です。--token-file を使用してください";
-pub(crate) const AUTO_APPROVE_WARNING: &str =
-    "serve-start auto_approve=true: トークン保有者は Windows ユーザー権限でコードを実行できます";
+pub(crate) const AUTO_APPROVE_TOKEN_WARNING: &str =
+    "serve-start auto_approve=true auth=token: トークン保有者は Windows ユーザー権限で任意のコードを承認なしで登録・実行できます";
+pub(crate) const AUTO_APPROVE_NO_TOKEN_WARNING: &str =
+    "DANGER serve-start auto_approve=true auth=none: 到達できるすべての者が Windows ユーザー権限で任意のコードを承認なしで登録・実行できます。Tailscale ACL で接続元を制限してください";
 
-pub(crate) fn validate_serve_security(auto_approve: bool, token: &Option<String>) -> Result<()> {
-    if auto_approve && token.is_none() {
-        bail!("--auto-approve にはトークンが必要です。--token-file <path> を指定してください。");
+pub(crate) fn validate_serve_security(
+    auto_approve: bool,
+    token: &Option<String>,
+    allow_no_token: bool,
+) -> Result<()> {
+    if auto_approve && token.is_none() && !allow_no_token {
+        bail!("--auto-approve には --token-file <path> または --allow-no-token が必要です。");
     }
     Ok(())
 }
 
-pub(crate) fn warn_auto_approve() {
-    warn!("{}", AUTO_APPROVE_WARNING);
+pub(crate) fn warn_auto_approve(has_token: bool) {
+    warn!(
+        "{}",
+        if has_token {
+            AUTO_APPROVE_TOKEN_WARNING
+        } else {
+            AUTO_APPROVE_NO_TOKEN_WARNING
+        }
+    );
 }
 
 // ── serve entry point ─────────────────────────────────────────────────────────
@@ -376,9 +390,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     if used_cli_token {
         warn!("{}", CLI_TOKEN_DEPRECATION_WARNING);
     }
-    validate_serve_security(args.auto_approve, &token)?;
+    validate_serve_security(args.auto_approve, &token, args.allow_no_token)?;
     if args.auto_approve {
-        warn_auto_approve();
+        warn_auto_approve(token.is_some());
     }
 
     if !args.bind_localhost_only && token.is_none() && !args.allow_no_token {
@@ -412,6 +426,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let state = AppState {
         clip_tx,
         token,
+        allow_no_token: args.allow_no_token,
         last_clip: Arc::new(Mutex::new(LastClip::default())),
         config_dir,
         auto_approve: args.auto_approve,

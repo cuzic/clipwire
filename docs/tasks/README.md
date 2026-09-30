@@ -15,7 +15,7 @@
 | T0.2 | L 完了 / W 未検証 | AC-T0.2.1〜T0.2.3 完了。AC-T0.2.4(Windows 実機)は未検証 |
 | T0.3 | L 完了 | AC-T0.3.1〜T0.3.3 完了 |
 | T2.1 | L 完了 | AC-T2.1.1〜T2.1.2 完了。W/X AC なし |
-| T2.2 | L 完了 / X 未検証 | AC-T2.2.1〜T2.2.4 完了。AC-T2.2.5(実機の再起動ターゲット)は未検証 |
+| T2.2 | L 完了 / X 未検証 | AC-T2.2.1 / 2.2.1b / 2.2.2 / 2.2.3 / 2.2.4 完了。AC-T2.2.5(実機の再起動ターゲット)は未検証 |
 | T2.3 | L 完了 / X 未検証 | AC-T2.3.1〜T2.3.4・T2.3.7 完了。AC-T2.3.5・T2.3.6・T2.3.8(Windows/Tailscale/実運用)は未検証 |
 | T1.6 | 未着手 | Windows での入れ替えが必要 |
 | T0.5 | 完了 (C) | `.github/workflows/ci.yml`(ubuntu: `scripts/check.sh` / windows-latest: gnu ターゲットで clippy + `cargo test`)。公開リポジトリなので課金なし。AC-T0.5.1〜T0.5.3 緑。`tests/windows_ci.rs` に AC-T0.5.2。Job Object・ミューテックス用の足場(`IsProcessInJob` 確認等)は該当タスク(T4.4/T4.7)で追加 |

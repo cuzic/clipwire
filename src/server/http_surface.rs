@@ -182,9 +182,12 @@ async fn require_json_content_type(request: Request, next: Next) -> Response {
 
 async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
     if state.token.is_none() {
+        if state.allow_no_token {
+            return next.run(request).await;
+        }
         return (
             StatusCode::FORBIDDEN,
-            "Protected routes require a token; restart with --token-file <path>\n",
+            "Protected routes require authentication; restart with --token-file <path> or explicitly opt in with --allow-no-token\n",
         )
             .into_response();
     }

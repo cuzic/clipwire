@@ -22,6 +22,14 @@ pub struct TestServer {
 
 impl TestServer {
     pub fn start() -> Option<Self> {
+        Self::start_with_security(&[], Some(TEST_TOKEN))
+    }
+
+    pub fn start_auto_approve_no_token() -> Option<Self> {
+        Self::start_with_security(&["--auto-approve", "--allow-no-token"], None)
+    }
+
+    fn start_with_security(extra_args: &[&str], token: Option<&str>) -> Option<Self> {
         // Hold the allocation lock until the child has bound its port. This
         // closes the usual bind(0)-then-spawn race between parallel tests.
         let _startup = startup_lock();
@@ -34,25 +42,25 @@ impl TestServer {
             Err(error) => panic!("allocate test server port: {error}"),
         };
         let config_dir = tempfile::tempdir().expect("create test config directory");
-        let child = Command::new(env!("CARGO_BIN_EXE_clipwire"))
-            .args([
-                "serve",
-                "--bind-localhost-only",
-                "--port",
-                &port.to_string(),
-            ])
+        let port = port.to_string();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_clipwire"));
+        command
+            .args(["serve", "--bind-localhost-only", "--port", &port])
+            .args(extra_args)
             .env("CLIPWIRE_CONFIG_DIR", config_dir.path())
-            .env("CLIPD_TOKEN", TEST_TOKEN)
+            .env_remove("CLIPD_TOKEN")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn clipwire test server");
+            .stderr(Stdio::null());
+        if let Some(token) = token {
+            command.env("CLIPD_TOKEN", token);
+        }
+        let child = command.spawn().expect("spawn clipwire test server");
 
         let mut server = Self {
             child,
             config_dir,
-            port,
+            port: port.parse().unwrap(),
         };
         server.wait_until_ready();
         Some(server)

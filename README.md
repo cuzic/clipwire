@@ -188,13 +188,14 @@ tmux source ~/.tmux.conf
 | `--token-file` | — | トークンを書いたファイル (前後の空白・BOM は除去、空ファイルはエラー)。優先順位: `--token` > `--token-file` > `$CLIPD_TOKEN` |
 | `--token` | `$CLIPD_TOKEN` | Bearer トークン (コマンドラインでの指定は非推奨。プロセス一覧に残るため `--token-file` か環境変数を推奨) |
 | `--bind-localhost-only` | off | localhost のみバインド |
-| `--allow-no-token` | off | token なし tailnet 公開を明示許可 |
+| `--allow-no-token` | off | 保護ルートを含め、token なしで到達可能な範囲への公開を明示許可 |
 | `--host-check` | `log` | Host 許可リスト不一致時の動作 (`log` は警告のみ、`enforce` は 421) |
 | `--allow-host HOST` | — | Host 許可リストへ名前を追加 (複数指定可) |
 
 ### セキュリティ
 
-- token なし & tailnet 公開はデフォルトで拒否 (`--allow-no-token` で上書き可)
+- token なしでは `/exec`・`/register` は 403。`--token-file` を設定するか、`--allow-no-token` で認証なしの利用を明示許可する (`--bind-localhost-only` だけでは許可されない)
+- `--auto-approve` には token または `--allow-no-token` が必要。後者は、到達できる者すべてに承認なしの任意コード実行を許すため、Tailscale ACL で接続元を制限する
 - `Origin` ヘッダ付きリクエストは拒否。Host は初回出荷では不一致をログへ記録し、`--host-check=enforce` で厳格拒否
 - `/exec` と `/register` の POST は `Content-Type: application/json` が必須
 - ターゲット名は `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` のみ許可 (register/exec)
