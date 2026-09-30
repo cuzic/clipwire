@@ -107,21 +107,53 @@ pub(crate) fn build_router(state: AppState) -> Router {
     common
         .merge(clipboard)
         .merge(protected)
-        .with_state(state)
+        .with_state(state.clone())
         .layer(middleware::from_fn(reject_origin))
-        .layer(middleware::from_fn(require_host))
+        .layer(middleware::from_fn_with_state(state.clone(), require_host))
 }
 
-async fn require_host(request: Request, next: Next) -> Response {
-    let valid = request
-        .headers()
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| !value.trim().is_empty());
-    if !valid {
-        return (StatusCode::MISDIRECTED_REQUEST, "Host header is required\n").into_response();
+async fn require_host(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    if let Err(message) = check_host_header(&state.host_policy, request.headers()) {
+        if state.host_policy.mode == HostCheckMode::Enforce {
+            return (StatusCode::MISDIRECTED_REQUEST, message).into_response();
+        }
     }
     next.run(request).await
+}
+
+pub(crate) fn check_host_header(policy: &HostPolicy, headers: &HeaderMap) -> Result<(), String> {
+    let raw = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+    let normalized = raw.and_then(|value| {
+        value
+            .parse::<axum::http::uri::Authority>()
+            .ok()
+            .and_then(|authority| normalize_host(authority.host()))
+    });
+    if normalized
+        .as_ref()
+        .is_some_and(|host| policy.allowed.contains(host))
+    {
+        return Ok(());
+    }
+
+    let shown = raw.unwrap_or("<missing>");
+    warn!(host = %shown, "Host header is not in the allowlist");
+    Err(format!(
+        "Host is not allowed. Allowed hosts: {}. Add a name with --allow-host <host>.\n",
+        policy
+            .allowed
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+fn normalize_host(host: &str) -> Option<String> {
+    let host = host.trim().trim_end_matches('.');
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 async fn reject_origin(request: Request, next: Next) -> Response {

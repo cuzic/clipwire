@@ -107,6 +107,14 @@ struct ServeArgs {
     /// register リクエストを自動承認する (approve 不要)
     #[arg(long)]
     auto_approve: bool,
+
+    /// Host ヘッダ不一致時の動作 (初回出荷はログのみ)
+    #[arg(long, value_enum, default_value_t = HostCheckMode::Log)]
+    host_check: HostCheckMode,
+
+    /// Host ヘッダで追加許可する名前 (複数指定可)
+    #[arg(long, value_name = "HOST", action = clap::ArgAction::Append)]
+    allow_host: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -280,6 +288,7 @@ mod tests {
             last_clip: Arc::new(Mutex::new(LastClip::default())),
             config_dir,
             auto_approve,
+            host_policy: HostPolicy::default(),
         }
     }
 
@@ -296,6 +305,7 @@ mod tests {
             last_clip: Arc::new(Mutex::new(LastClip::default())),
             config_dir,
             auto_approve: false,
+            host_policy: HostPolicy::default(),
         }
     }
 
@@ -325,6 +335,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut state = test_state(dir.path().to_path_buf(), false);
         state.token = Some("secret".into());
+        state.host_policy.mode = HostCheckMode::Enforce;
         let app = build_router(state);
 
         let request = |host: bool, origin: bool, content_type: Option<&str>| {
@@ -351,6 +362,192 @@ mod tests {
             let response = app.clone().oneshot(request).await.unwrap();
             assert_eq!(response.status(), expected);
         }
+    }
+
+    fn host_policy(mode: HostCheckMode, hosts: &[&str]) -> HostPolicy {
+        HostPolicy {
+            mode,
+            allowed: Arc::new(hosts.iter().map(|host| host.to_string()).collect()),
+        }
+    }
+
+    #[test]
+    fn ac_t2_3_2_tailscale_names_include_fqdn_first_label_and_host_name() {
+        let names = tailscale_names_from_status(
+            br#"{"Self":{"DNSName":"magic-name.tail.example.","HostName":"machine-name"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            names,
+            ["magic-name.tail.example.", "magic-name", "machine-name"]
+        );
+    }
+
+    #[test]
+    fn ac_t2_3_4_cli_defaults_to_log_and_accepts_multiple_allow_hosts() {
+        let cli = Cli::try_parse_from([
+            "clipwire",
+            "serve",
+            "--allow-host",
+            "foo",
+            "--allow-host",
+            "BAR",
+        ])
+        .unwrap();
+        let Cmd::Serve(args) = cli.cmd else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.host_check, HostCheckMode::Log);
+        assert_eq!(args.allow_host, ["foo", "BAR"]);
+    }
+
+    #[tokio::test]
+    async fn ac_t2_3_1_origin_is_rejected_on_every_route() {
+        let dir = tempdir().unwrap();
+        let app = build_router(test_state(dir.path().to_path_buf(), false));
+
+        for route in ROUTES {
+            let method = match route.id {
+                RouteId::Exec | RouteId::Register => "POST",
+                _ => "GET",
+            };
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(route.path)
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://evil.example")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::FORBIDDEN,
+                "route={}",
+                route.path
+            );
+        }
+
+        let request = axum::http::Request::builder()
+            .uri("/health")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ac_t2_3_2_host_allowlist_ignores_port_and_ascii_case() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.host_policy = host_policy(
+            HostCheckMode::Enforce,
+            &["127.0.0.1", "localhost", "allowed-name"],
+        );
+        let app = build_router(state);
+
+        for host in ["127.0.0.1:9999", "LOCALHOST", "Allowed-Name:9999"] {
+            let request = axum::http::Request::builder()
+                .uri("/health")
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(app.clone().oneshot(request).await.unwrap().status(), 200);
+        }
+        for host in [Some("evil.example"), None] {
+            let mut request = axum::http::Request::builder().uri("/health");
+            if let Some(host) = host {
+                request = request.header(header::HOST, host);
+            }
+            assert_eq!(
+                app.clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::MISDIRECTED_REQUEST
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_t2_3_3_protected_posts_require_json_content_type() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.token = Some("secret".into());
+        let app = build_router(state);
+
+        for (content_type, expected) in [
+            ("text/plain", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            ("application/json; charset=utf-8", StatusCode::UNAUTHORIZED),
+        ] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/exec")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from("{}"))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_t2_3_4_allow_host_adds_an_accepted_name() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.host_policy = host_policy(HostCheckMode::Enforce, &["foo"]);
+        let request = axum::http::Request::builder()
+            .uri("/health")
+            .header(header::HOST, "foo")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            build_router(state).oneshot(request).await.unwrap().status(),
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t2_3_7_log_mode_allows_mismatch_and_enforce_returns_421() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.host_policy = host_policy(HostCheckMode::Log, &["localhost"]);
+        let request = || {
+            axum::http::Request::builder()
+                .uri("/health")
+                .header(header::HOST, "evil.example")
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            build_router(state.clone())
+                .oneshot(request())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "evil.example".parse().unwrap());
+        let logs = capture_logs(|| {
+            assert!(check_host_header(&state.host_policy, &headers).is_err());
+        });
+        assert!(logs.contains("WARN"));
+        assert!(logs.contains("evil.example"));
+
+        state.host_policy.mode = HostCheckMode::Enforce;
+        assert_eq!(
+            build_router(state)
+                .oneshot(request())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::MISDIRECTED_REQUEST
+        );
     }
 
     #[tokio::test]

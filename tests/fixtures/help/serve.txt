@@ -3,10 +3,12 @@ Windows クリップボード HTTP サーバーを起動 (Windows 推奨)
 Usage: clipwire serve [OPTIONS]
 
 Options:
-      --port <PORT>          待ち受けポート [default: 9999]
-      --token <TOKEN>        Bearer トークン (コマンドラインへの指定は非推奨)
-      --token-file <PATH>    Bearer トークンを読み込むファイル
-      --bind-localhost-only  localhost のみにバインド (Tailscale IP をスキップ)
-      --allow-no-token       トークンなしで tailnet に公開することを明示許可
-      --auto-approve         register リクエストを自動承認する (approve 不要)
-  -h, --help                 Print help
+      --port <PORT>              待ち受けポート [default: 9999]
+      --token <TOKEN>            Bearer トークン (コマンドラインへの指定は非推奨)
+      --token-file <PATH>        Bearer トークンを読み込むファイル
+      --bind-localhost-only      localhost のみにバインド (Tailscale IP をスキップ)
+      --allow-no-token           トークンなしで tailnet に公開することを明示許可
+      --auto-approve             register リクエストを自動承認する (approve 不要)
+      --host-check <HOST_CHECK>  Host ヘッダ不一致時の動作 (初回出荷はログのみ) [default: log] [possible values: log, enforce]
+      --allow-host <HOST>        Host ヘッダで追加許可する名前 (複数指定可)
+  -h, --help                     Print help

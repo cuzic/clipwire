@@ -189,10 +189,14 @@ tmux source ~/.tmux.conf
 | `--token` | `$CLIPD_TOKEN` | Bearer トークン (コマンドラインでの指定は非推奨。プロセス一覧に残るため `--token-file` か環境変数を推奨) |
 | `--bind-localhost-only` | off | localhost のみバインド |
 | `--allow-no-token` | off | token なし tailnet 公開を明示許可 |
+| `--host-check` | `log` | Host 許可リスト不一致時の動作 (`log` は警告のみ、`enforce` は 421) |
+| `--allow-host HOST` | — | Host 許可リストへ名前を追加 (複数指定可) |
 
 ### セキュリティ
 
 - token なし & tailnet 公開はデフォルトで拒否 (`--allow-no-token` で上書き可)
+- `Origin` ヘッダ付きリクエストは拒否。Host は初回出荷では不一致をログへ記録し、`--host-check=enforce` で厳格拒否
+- `/exec` と `/register` の POST は `Content-Type: application/json` が必須
 - ターゲット名は `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` のみ許可 (register/exec)
 - `get` が出力する curl 行はトークンを展開せず `$CLIPD_TOKEN` を参照する (会話ログにトークンを残さない)
 - toast 通知は WinRT のみ (PowerShell 経由の通知は廃止)

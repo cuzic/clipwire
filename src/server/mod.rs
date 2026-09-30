@@ -9,8 +9,34 @@ use clip::*;
 pub(crate) use exec::handle_exec;
 pub(crate) use http_surface::build_router;
 #[cfg(test)]
-pub(crate) use http_surface::{RouteClass, RouteId, ROUTES};
+pub(crate) use http_surface::{check_host_header, RouteClass, RouteId, ROUTES};
 pub(crate) use register::handle_register;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+pub(crate) enum HostCheckMode {
+    #[default]
+    Log,
+    Enforce,
+}
+
+#[derive(Clone)]
+pub(crate) struct HostPolicy {
+    pub(crate) mode: HostCheckMode,
+    pub(crate) allowed: Arc<std::collections::BTreeSet<String>>,
+}
+
+impl Default for HostPolicy {
+    fn default() -> Self {
+        Self {
+            mode: HostCheckMode::Log,
+            allowed: Arc::new(
+                ["127.0.0.1".to_string(), "localhost".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
+        }
+    }
+}
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -58,6 +84,7 @@ pub(crate) struct AppState {
     pub(crate) last_clip: Arc<Mutex<LastClip>>,
     pub(crate) config_dir: PathBuf,
     pub(crate) auto_approve: bool,
+    pub(crate) host_policy: HostPolicy,
 }
 
 // ── Logging / panic visibility (serve) ────────────────────────────────────────
@@ -135,6 +162,111 @@ pub(crate) fn find_tailscale_ip() -> Option<Ipv4Addr> {
 pub(crate) fn is_cgnat(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     o[0] == 100 && (o[1] & 0xC0) == 0x40
+}
+
+fn normalize_allowed_host(host: &str) -> Option<String> {
+    let host = host.trim().trim_end_matches('.');
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+#[cfg(windows)]
+fn local_hostname() -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
+
+    let mut size = 0;
+    unsafe {
+        let _ = GetComputerNameExW(ComputerNameDnsHostname, PWSTR::null(), &mut size);
+    }
+    if size == 0 {
+        return None;
+    }
+    let mut buffer = vec![0_u16; size as usize];
+    unsafe {
+        GetComputerNameExW(
+            ComputerNameDnsHostname,
+            PWSTR::from_raw(buffer.as_mut_ptr()),
+            &mut size,
+        )
+        .ok()
+        .map(|()| String::from_utf16_lossy(&buffer[..size as usize]))
+    }
+}
+
+#[cfg(not(windows))]
+fn local_hostname() -> Option<String> {
+    let mut buffer = [0_u8; 256];
+    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if result != 0 {
+        return None;
+    }
+    let len = buffer.iter().position(|byte| *byte == 0)?;
+    std::str::from_utf8(&buffer[..len]).ok().map(str::to_owned)
+}
+
+fn tailscale_self_names() -> Vec<String> {
+    let Ok(output) = std::process::Command::new("tailscale")
+        .args(["status", "--json"])
+        .output()
+    else {
+        warn!("tailscale status --json を実行できませんでした");
+        return Vec::new();
+    };
+    if !output.status.success() {
+        warn!(
+            "tailscale status --json failed: status={:?} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Vec::new();
+    }
+    let Ok(names) = tailscale_names_from_status(&output.stdout) else {
+        warn!("tailscale status --json の解析に失敗しました");
+        return Vec::new();
+    };
+    names
+}
+
+pub(crate) fn tailscale_names_from_status(json: &[u8]) -> serde_json::Result<Vec<String>> {
+    let value = serde_json::from_slice::<serde_json::Value>(json)?;
+    let Some(self_node) = value.get("Self") else {
+        return Ok(Vec::new());
+    };
+    let mut names = Vec::new();
+    if let Some(dns_name) = self_node.get("DNSName").and_then(|value| value.as_str()) {
+        names.push(dns_name.to_string());
+        if let Some(first_label) = dns_name.trim_end_matches('.').split('.').next() {
+            names.push(first_label.to_string());
+        }
+    }
+    if let Some(host_name) = self_node.get("HostName").and_then(|value| value.as_str()) {
+        names.push(host_name.to_string());
+    }
+    Ok(names)
+}
+
+pub(crate) fn build_host_policy(
+    mode: HostCheckMode,
+    additional: impl IntoIterator<Item = String>,
+) -> HostPolicy {
+    let mut allowed =
+        std::collections::BTreeSet::from(["127.0.0.1".to_string(), "localhost".to_string()]);
+    if let Some(ip) = find_tailscale_ip() {
+        allowed.insert(ip.to_string());
+    }
+    for host in local_hostname()
+        .into_iter()
+        .chain(tailscale_self_names())
+        .chain(additional)
+    {
+        if let Some(host) = normalize_allowed_host(&host) {
+            allowed.insert(host);
+        }
+    }
+    HostPolicy {
+        mode,
+        allowed: Arc::new(allowed),
+    }
 }
 
 // ── Auth (serve) ──────────────────────────────────────────────────────────────
@@ -283,6 +415,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         last_clip: Arc::new(Mutex::new(LastClip::default())),
         config_dir,
         auto_approve: args.auto_approve,
+        host_policy: build_host_policy(args.host_check, args.allow_host),
     };
 
     let app = build_router(state.clone());
