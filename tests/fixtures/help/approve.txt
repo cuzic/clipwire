@@ -1,0 +1,10 @@
+承認待ちターゲットを承認して registered.toml に保存 (Windows ローカルで実行)
+
+Usage: clipwire approve [OPTIONS] [TARGET]
+
+Arguments:
+  [TARGET]  承認するターゲット名 (省略時は pending 一覧を表示)
+
+Options:
+  -d, --dir <DIR>  実行ディレクトリ (Windows パス)
+  -h, --help       Print help

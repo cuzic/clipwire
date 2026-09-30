@@ -1,0 +1,9 @@
+登録済みターゲットを Windows で実行して結果を取得
+
+Usage: clipwire exec <TARGET>
+
+Arguments:
+  <TARGET>  実行するターゲット名 (~/.config/clipwire/targets.toml で定義)
+
+Options:
+  -h, --help  Print help

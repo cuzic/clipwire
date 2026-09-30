@@ -1,0 +1,16 @@
+Tailscale 越しに Windows クリップボードを操作する
+
+Usage: clipwire <COMMAND>
+
+Commands:
+  serve     Windows クリップボード HTTP サーバーを起動 (Windows 推奨)
+  get       Windows クリップボードの内容を取得して出力
+  put       stdin の内容を Windows クリップボードに書き込む
+  open      Windows のデフォルトブラウザで Web サービスを開く
+  exec      登録済みターゲットを Windows で実行して結果を取得
+  register  ターゲットの定義を Windows に送って承認待ちに追加
+  approve   承認待ちターゲットを承認して registered.toml に保存 (Windows ローカルで実行)
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help

@@ -1,0 +1,6 @@
+stdin の内容を Windows クリップボードに書き込む
+
+Usage: clipwire put
+
+Options:
+  -h, --help  Print help
