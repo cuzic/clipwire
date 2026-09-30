@@ -958,6 +958,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // 生成物は POSIX シェル用。/bin/sh で検証する
     fn shell_expands_download_command_token_header() {
         let dir = tempdir().unwrap();
         let mock_curl = dir.path().join("curl");
@@ -990,6 +991,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // 生成物は POSIX シェル用。/bin/sh で検証する
     fn download_command_quotes_untrusted_names_and_stays_in_directory() {
         let dir = tempdir().unwrap();
         let mock_curl = dir.path().join("curl");
