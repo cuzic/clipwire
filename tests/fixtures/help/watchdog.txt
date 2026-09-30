@@ -1,0 +1,14 @@
+/health を監視し、連続失敗時に動作確認済みの serve で復旧する (Windows)
+
+Usage: clipwire watchdog [OPTIONS] --good <PATH> [-- <SERVE_ARGS>...]
+
+Arguments:
+  [SERVE_ARGS]...  good に渡す serve の引数 (`--` の後ろ。例: -- --auto-approve --token-file T)
+
+Options:
+      --good <PATH>              復旧に使う動作確認済みバイナリのパス (bin\good 以下に置く)
+      --port <PORT>              監視する serve のポート [default: 9999]
+      --interval <INTERVAL>      確認間隔 (秒) [default: 30]
+      --maintenance-file <PATH>  保守ファイル。有効期限(UNIX 秒)が未来の間は復旧しない (既定: <設定ディレクトリ>/maintenance)
+      --once                     1 回だけ判断して終了する (動作確認用)
+  -h, --help                     Print help

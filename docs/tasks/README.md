@@ -19,7 +19,8 @@
 | T2.3 | L 完了 / X 未検証 | AC-T2.3.1〜T2.3.4・T2.3.7 完了。AC-T2.3.5・T2.3.6・T2.3.8(Windows/Tailscale/実運用)は未検証 |
 | T1.6 | 未着手 | Windows での入れ替えが必要 |
 | T0.5 | 完了 (C) | `.github/workflows/ci.yml`(ubuntu: `scripts/check.sh` / windows-latest: gnu ターゲットで clippy + `cargo test`)。公開リポジトリなので課金なし。AC-T0.5.1〜T0.5.3 緑。`tests/windows_ci.rs` に AC-T0.5.2。Job Object・ミューテックス用の足場(`IsProcessInJob` 確認等)は該当タスク(T4.4/T4.7)で追加 |
-| T0.4, T0.6, T2.4 以降 | 未着手 | |
+| T0.4 | L・C 完了 / W 未検証 | `clipwire watchdog` と `dev-loop.md` を追加。判断ロジックは単体テスト、実プロセスの復旧・保守ファイル・good 起動失敗は `tests/watchdog.rs`(Linux/Windows CI。AC-T0.4.1・0.4.2・0.4.4 の C 版)。実機の AC-T0.4.1〜0.4.4・0.4.6〜0.4.8(24 時間生存・Tailscale ACL など)と、`clipwire-stage` ターゲット、good.exe 配置、タスクスケジューラ登録は未実施 |
+| T0.6, T2.4 以降 | 未着手 | T2.4 (b) は PID ファイル書き出しも未実装 |
 
 ## 運用の実態(計画の前提)
 

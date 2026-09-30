@@ -564,14 +564,24 @@ pub(crate) mod win_clip {
     pub unsafe fn acquire_mutex(
         config_dir: &std::path::Path,
     ) -> windows::Win32::Foundation::HANDLE {
-        let name = super::singleton_mutex_name(config_dir)
+        acquire_named_mutex(
+            &super::singleton_mutex_name(config_dir),
+            "clipwire serve は既に起動中です。",
+        )
+    }
+
+    pub unsafe fn acquire_named_mutex(
+        name: &str,
+        already_running: &str,
+    ) -> windows::Win32::Foundation::HANDLE {
+        let name = name
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect::<Vec<_>>();
         match CreateMutexW(None, true, windows::core::PCWSTR(name.as_ptr())) {
             Ok(h) => {
                 if GetLastError() == WIN32_ERROR(183) {
-                    log_and_exit("clipwire serve は既に起動中です。");
+                    log_and_exit(already_running);
                 }
                 h
             }

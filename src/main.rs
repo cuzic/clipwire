@@ -65,6 +65,8 @@ enum Cmd {
     Register(RegisterArgs),
     /// 承認待ちターゲットを承認して registered.toml に保存 (Windows ローカルで実行)
     Approve(ApproveArgs),
+    /// /health を監視し、連続失敗時に動作確認済みの serve で復旧する (Windows)
+    Watchdog(watchdog::WatchdogArgs),
 }
 
 #[derive(Args, Debug)]
@@ -175,6 +177,7 @@ mod client;
 mod config;
 mod exec_rhai;
 mod server;
+mod watchdog;
 #[cfg(windows)]
 mod win;
 
@@ -229,6 +232,7 @@ fn main() -> Result<()> {
             cmd_register(&cfg, &args)
         }
         Cmd::Approve(args) => cmd_approve(&args),
+        Cmd::Watchdog(args) => watchdog::run_watchdog(args),
     }
 }
 
