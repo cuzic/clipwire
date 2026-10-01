@@ -161,11 +161,16 @@ fn ac_t0_4_4_watchdog_survives_an_unstartable_good() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_secs(7));
+    // 失敗確認 1 回の所要は環境で違う(Windows は数秒)ので、固定時間でなく
+    // 「復旧を試みて失敗した」ログが出るまで待つ。
+    let log_path = dir.path().join("watchdog.log");
+    let logged = wait_until(Duration::from_secs(60), || {
+        fs::read_to_string(&log_path).is_ok_and(|l| l.contains("good の起動に失敗"))
+    });
     let alive = child.try_wait().unwrap().is_none();
     let _ = child.kill();
     let _ = child.wait();
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(logged, "no failed-spawn log; log: {log}");
     assert!(alive, "watchdog must keep running when good cannot start");
-    let log = fs::read_to_string(dir.path().join("watchdog.log")).unwrap_or_default();
-    assert!(log.contains("good の起動に失敗"), "log: {log}");
 }

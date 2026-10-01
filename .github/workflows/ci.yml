@@ -16,6 +16,9 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: x86_64-pc-windows-gnu
+      # ring の build.rs が windows-gnu 向けに C コンパイラを要る。
+      # rust-cache が効いている間は隠れるが、キャッシュなしのブランチでは必須。
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - uses: Swatinem/rust-cache@v2
       - run: scripts/check.sh
 
