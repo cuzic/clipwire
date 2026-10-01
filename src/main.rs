@@ -1009,14 +1009,13 @@ mod tests {
 
     #[tokio::test]
     async fn ac_t5_1_4_rhai_loop_sleep_and_run_time_out() {
-        for (index, script) in [
-            "loop {}",
-            "sleep(10000);",
-            r#"run(["sh", "-c", "sleep 10"]);"#,
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        // run の子ツリー kill は Unix の Runner でのみ実装済み(Windows は T4.4 まで
+        // スタブで、sh もない)ため、run の経路は Unix でだけ検証する。
+        let mut scripts = vec!["loop {}", "sleep(10000);"];
+        if cfg!(unix) {
+            scripts.push(r#"run(["sh", "-c", "sleep 10"]);"#);
+        }
+        for (index, script) in scripts.into_iter().enumerate() {
             let dir = tempdir().unwrap();
             let state = test_state(dir.path().to_path_buf(), true);
             let mut target = script_target(script);
