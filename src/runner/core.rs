@@ -1,6 +1,10 @@
 //! Side-effect-free runner policy. OS handles, clocks, and I/O stay in the shell.
 
-use std::{ffi::OsString, time::Duration};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -23,6 +27,14 @@ pub(crate) fn resolve_timeout(
 
 pub(crate) fn valid_timeout(value: Duration) -> bool {
     !value.is_zero()
+}
+
+pub(super) fn resolve_command(command: &Path, cwd: Option<&Path>) -> PathBuf {
+    if command.is_absolute() {
+        command.to_path_buf()
+    } else {
+        cwd.map_or_else(|| command.to_path_buf(), |cwd| cwd.join(command))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -248,5 +260,22 @@ mod tests {
             Err(TimeoutPolicyError::RequestExceedsDefinition)
         );
         assert!(!valid_timeout(Duration::ZERO));
+    }
+
+    #[test]
+    fn detached_relative_paths_are_resolved_from_cwd() {
+        let cwd = Path::new("work");
+        assert_eq!(
+            resolve_command(Path::new("bin/tool"), Some(cwd)),
+            cwd.join("bin/tool")
+        );
+        assert_eq!(
+            resolve_command(Path::new("tool"), Some(cwd)),
+            cwd.join("tool")
+        );
+        assert_eq!(
+            resolve_command(Path::new("/bin/tool"), Some(cwd)),
+            PathBuf::from("/bin/tool")
+        );
     }
 }

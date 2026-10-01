@@ -9,6 +9,21 @@ use std::fs;
 
 use super::ProcessGroup;
 
+pub(super) fn start_detached(command: &mut Command) -> io::Result<u32> {
+    // A separate session keeps this process outside the job process group, so
+    // Runner's killpg cannot terminate it. Standard handles are set to null by
+    // the common shell before this OS-specific boundary.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn().map(|child| child.id())
+}
+
 pub(super) struct OsProcessGroup {
     pgid: Option<libc::pid_t>,
 }

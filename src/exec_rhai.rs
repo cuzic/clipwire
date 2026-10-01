@@ -15,6 +15,8 @@ const MAX_STRING_SIZE: usize = 1_048_576;
 const MAX_ARRAY_SIZE: usize = 100_000;
 const MAX_MAP_SIZE: usize = 10_000;
 const MAX_CALL_LEVELS: usize = 64;
+const MAX_SLEEP_MS: i64 = 60_000;
+const SLEEP_SLICE_MS: u64 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RhaiLimits {
@@ -240,19 +242,43 @@ fn exec_rhai_with_output(
         engine.register_fn(
             "sleep",
             move |milliseconds: i64| -> Result<(), Box<rhai::EvalAltResult>> {
-                if !(0..=60_000).contains(&milliseconds) {
-                    return Err("sleep は 0..=60000 ms で指定してください".into());
-                }
-                let mut remaining = std::time::Duration::from_millis(milliseconds as u64);
-                while !remaining.is_zero() && !cancelled.load(Ordering::Relaxed) {
-                    let slice = remaining.min(std::time::Duration::from_millis(100));
+                let slices = sleep_slices(milliseconds).map_err(|error| error.to_string())?;
+                for slice in slices {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Err("execution cancelled".into());
+                    }
                     std::thread::sleep(slice);
-                    remaining = remaining.saturating_sub(slice);
+                }
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err("execution cancelled".into());
                 }
                 Ok(())
             },
         );
     }
+    {
+        let runner = Arc::clone(&runner);
+        let dir = dir.clone();
+        engine.register_fn(
+            "start_detached",
+            move |args: rhai::Array| -> Result<i64, Box<rhai::EvalAltResult>> {
+                let args = string_args(args);
+                if args.is_empty() {
+                    return Err("start_detached requires a command".into());
+                }
+                let mut spec = JobSpec::new(&args[0], "rhai-detached");
+                spec.args = args[1..].iter().map(Into::into).collect();
+                spec.cwd = dir.clone();
+                runner
+                    .start_detached(spec)
+                    .map(i64::from)
+                    .map_err(|error| error.to_string().into())
+            },
+        );
+    }
+    engine.register_fn("notify", move |message: &str| {
+        notify(message);
+    });
     {
         let dir = dir.clone();
         engine.register_fn("rm", move |path: &str| -> bool {
@@ -278,6 +304,28 @@ fn exec_rhai_with_output(
     Ok((bytes, code))
 }
 
+fn sleep_slices(milliseconds: i64) -> std::result::Result<Vec<std::time::Duration>, &'static str> {
+    if !(0..=MAX_SLEEP_MS).contains(&milliseconds) {
+        return Err("sleep は 0..=60000 ms で指定してください");
+    }
+    let mut remaining = milliseconds as u64;
+    let mut slices = Vec::new();
+    while remaining != 0 {
+        let slice = remaining.min(SLEEP_SLICE_MS);
+        slices.push(std::time::Duration::from_millis(slice));
+        remaining -= slice;
+    }
+    Ok(slices)
+}
+
+#[cfg(windows)]
+fn notify(message: &str) {
+    crate::win_clip::show_balloon(message);
+}
+
+#[cfg(not(windows))]
+fn notify(_message: &str) {}
+
 fn string_args(args: rhai::Array) -> Vec<String> {
     args.into_iter()
         .map(|arg| {
@@ -296,6 +344,11 @@ fn resolve_path(dir: Option<&std::path::Path>, path: &str) -> std::path::PathBuf
 mod tests {
     use super::*;
 
+    fn text(script: &str) -> (String, i32) {
+        let (bytes, code) = exec_rhai(script, None).unwrap();
+        (String::from_utf8(bytes).unwrap(), code)
+    }
+
     #[test]
     fn resource_limit_configuration_is_stable() {
         assert_eq!(
@@ -308,6 +361,109 @@ mod tests {
                 call_levels: 64,
             }
         );
+    }
+
+    #[test]
+    fn sleep_policy_splits_at_100_ms_and_rejects_over_limit() {
+        assert!(sleep_slices(0).unwrap().is_empty());
+        assert_eq!(
+            sleep_slices(250).unwrap(),
+            [
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(50),
+            ]
+        );
+        assert!(sleep_slices(60_001).is_err());
+        assert!(sleep_slices(-1).is_err());
+    }
+
+    #[test]
+    fn ac_t7_4_1_sleep_waits_and_enforces_the_limit() {
+        let started = std::time::Instant::now();
+        let (output, code) = text("sleep(200);");
+        let elapsed = started.elapsed();
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "{elapsed:?}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+
+        let (output, code) = text("sleep(61000);");
+        assert_eq!(code, 1);
+        assert!(output.contains("0..=60000"), "{output:?}");
+    }
+
+    #[test]
+    fn ac_t7_4_2_sleep_cancellation_returns_within_200_ms() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker = std::thread::spawn(move || {
+            exec_rhai_cancelable("sleep(30000);", None, worker_cancelled)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let started = std::time::Instant::now();
+        cancelled.store(true, Ordering::Relaxed);
+        let (output, code) = worker.join().unwrap().unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert_eq!(code, 1);
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("execution cancelled"));
+    }
+
+    #[test]
+    fn notify_xml_escaping_is_stable() {
+        assert_eq!(crate::xml_escape("a<b&c"), "a&lt;b&amp;c");
+    }
+
+    #[test]
+    fn ac_t7_4_4_rejected_apis_are_not_registered() {
+        for script in [
+            r#"env("X");"#,
+            "retry(1, 1);",
+            "wait_port(1, 1);",
+            r#"read_text("x");"#,
+            r#"http_get("https://example.invalid");"#,
+        ] {
+            let (output, code) = text(script);
+            assert_eq!(code, 1, "{script}: {output}");
+            assert!(output.contains("Function not found"), "{script}: {output}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ac_t7_4_3_detached_child_survives_job_kill_and_returns_pid() {
+        struct DetachedCleanup(libc::pid_t);
+        impl Drop for DetachedCleanup {
+            fn drop(&mut self) {
+                // SAFETY: the PID is the detached session/process-group leader.
+                unsafe {
+                    libc::killpg(self.0, libc::SIGKILL);
+                }
+            }
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker = std::thread::spawn(move || {
+            exec_rhai_cancelable(
+                r#"let pid = start_detached(["sh", "-c", "sleep 30"]); print(pid); run(["sh", "-c", "sleep 30"]);"#,
+                None,
+                worker_cancelled,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        cancelled.store(true, Ordering::Relaxed);
+        let (output, code) = worker.join().unwrap().unwrap();
+        assert_eq!(code, 1);
+        let output = String::from_utf8(output).unwrap();
+        let pid: libc::pid_t = output.lines().next().unwrap().parse().unwrap();
+        let _cleanup = DetachedCleanup(pid);
+        // The regular run was killed with killpg; the detached session remains.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
     }
 
     #[cfg(windows)]

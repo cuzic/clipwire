@@ -5,6 +5,17 @@ use std::{
 
 use super::ProcessGroup;
 
+pub(super) fn start_detached(_command: &mut Command) -> io::Result<u32> {
+    // The real implementation belongs to T4.4 and must use
+    // CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP.
+    // See ADR-0009 sections 1 and 2; silently spawning inside the Job would
+    // violate start_detached's lifetime contract.
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "start_detached is not implemented on Windows yet (waiting for T4.4 Job Object support)",
+    ))
+}
+
 pub(super) struct OsProcessGroup;
 
 impl OsProcessGroup {

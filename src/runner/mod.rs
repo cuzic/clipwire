@@ -29,6 +29,11 @@ use unix::OsProcessGroup;
 #[cfg(windows)]
 use windows::OsProcessGroup;
 
+#[cfg(not(windows))]
+use unix::start_detached as os_start_detached;
+#[cfg(windows)]
+use windows::start_detached as os_start_detached;
+
 static NEXT_LOG_ID: AtomicU64 = AtomicU64::new(0);
 const LOG_SOFT_LIMIT: usize = 10 * 1024 * 1024;
 const LOG_LIMIT_MARKER: &[u8] = b"[output > 10 MiB: further output discarded]\n";
@@ -156,6 +161,22 @@ impl Runner {
                 })
             }
         }
+    }
+
+    pub(crate) fn start_detached(&self, spec: JobSpec) -> io::Result<u32> {
+        let command_path = core::resolve_command(&spec.command, spec.cwd.as_deref());
+        let mut command = Command::new(command_path);
+        command
+            .args(&spec.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env_clear()
+            .envs(core::child_environment(std::env::vars_os(), &spec.env));
+        if let Some(cwd) = &spec.cwd {
+            command.current_dir(cwd);
+        }
+        os_start_detached(&mut command)
     }
 
     fn next_log_path(&self) -> PathBuf {
@@ -373,6 +394,21 @@ fn pipe() -> io::Result<(File, File)> {
     // transferred exactly once into an owning File.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
         return Err(io::Error::last_os_error());
+    }
+    for fd in fds {
+        // Detached children must not inherit unrelated job relay descriptors.
+        // Command's Stdio duplication deliberately clears this flag for the
+        // descriptors explicitly assigned to ordinary children.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            let error = io::Error::last_os_error();
+            // SAFETY: both descriptors were created above and ownership has
+            // not yet been transferred into File.
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(error);
+        }
     }
     Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
 }
