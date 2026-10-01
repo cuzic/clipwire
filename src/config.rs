@@ -50,6 +50,8 @@ pub(crate) struct StoredTarget {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub(crate) env: std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) timeout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) approved_at: Option<u64>,
@@ -67,6 +69,8 @@ struct CanonicalTarget<'a> {
     steps: Option<&'a StepsDef>,
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     env: &'a std::collections::BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout: Option<&'a str>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -77,6 +81,7 @@ pub(crate) fn canonical_json(target: &StoredTarget) -> Vec<u8> {
         script: target.script.as_deref(),
         steps: target.steps.as_ref(),
         env: &target.env,
+        timeout: target.timeout.as_deref(),
     })
     .expect("canonical target serialization cannot fail")
 }
@@ -168,6 +173,9 @@ pub(crate) fn validate_definition(target: &StoredTarget) -> Result<(), Definitio
     for (key, value) in &target.env {
         validate_definition_string(format!("env key {key:?}"), key)?;
         validate_definition_string(format!("env[{key:?}]"), value)?;
+    }
+    if let Some(timeout) = &target.timeout {
+        validate_definition_string("timeout".into(), timeout)?;
     }
     Ok(())
 }

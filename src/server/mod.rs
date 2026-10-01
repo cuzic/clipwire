@@ -337,7 +337,7 @@ pub(crate) fn unauthorized() -> Response {
 // ── HTTP handlers (serve) ─────────────────────────────────────────────────────
 
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
-pub(crate) const PROTOCOL_FEATURES: &[&str] = &["hash"];
+pub(crate) const PROTOCOL_FEATURES: &[&str] = &["hash", "timeout"];
 
 pub(crate) async fn handle_health(headers: HeaderMap) -> Response {
     let wants_json = headers

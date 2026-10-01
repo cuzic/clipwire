@@ -193,6 +193,9 @@ impl OpenTarget {
 struct ExecArgs {
     /// 実行するターゲット名 (~/.config/clipwire/targets.toml で定義)
     target: String,
+    /// ターゲット定義の上限より短い実行期限
+    #[arg(long, value_name = "DURATION")]
+    timeout: Option<String>,
 }
 
 mod client;
@@ -891,6 +894,118 @@ mod tests {
     }
 
     #[test]
+    fn ac_t5_1_2_timeout_is_hashed_only_when_explicit() {
+        let unset = script_target("echo stable");
+        let mut explicit = unset.clone();
+        explicit.timeout = Some("30m".into());
+        assert!(!String::from_utf8(canonical_json(&unset))
+            .unwrap()
+            .contains("timeout"));
+        assert_ne!(canonical_json(&unset), canonical_json(&explicit));
+        assert_ne!(
+            definition_hash(&canonical_json(&unset)),
+            definition_hash(&canonical_json(&explicit))
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t5_1_3_exec_timeout_can_only_shorten_definition() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        let mut target = script_target("let answer = 42;");
+        target.timeout = Some("10m".into());
+        state
+            .store
+            .register("limited".into(), target, true)
+            .await
+            .unwrap();
+
+        let response = handle_exec(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"limited","timeout":"1h"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("10m"));
+
+        let response = handle_exec(
+            State(state),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"limited","timeout":"5s"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ac_t5_1_4_rhai_loop_sleep_and_run_time_out() {
+        for (index, script) in [
+            "loop {}",
+            "sleep(10000);",
+            r#"run(["sh", "-c", "sleep 10"]);"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempdir().unwrap();
+            let state = test_state(dir.path().to_path_buf(), true);
+            let mut target = script_target(script);
+            target.timeout = Some("100ms".into());
+            let name = format!("rhai-timeout-{index}");
+            state
+                .store
+                .register(name.clone(), target, true)
+                .await
+                .unwrap();
+            let started = std::time::Instant::now();
+            let response = handle_exec(
+                State(state),
+                HeaderMap::new(),
+                serde_json::to_vec(&serde_json::json!({"name":name}))
+                    .unwrap()
+                    .into(),
+            )
+            .await;
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "script={script}"
+            );
+            assert_eq!(response.headers()["X-Exit-Code"], "124");
+            assert_eq!(response.headers()["X-Job-State"], "timeout");
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_t5_1_5_register_rejects_invalid_and_zero_timeouts() {
+        let dir = tempdir().unwrap();
+        for timeout in ["abc", "-1s", "0s"] {
+            let response = handle_register(
+                State(test_state(dir.path().to_path_buf(), true)),
+                HeaderMap::new(),
+                serde_json::to_vec(&serde_json::json!({
+                    "name": format!("bad-{timeout}"), "script": "()", "timeout": timeout
+                }))
+                .unwrap()
+                .into(),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "timeout={timeout}"
+            );
+        }
+    }
+
+    #[test]
     fn ac_t3_1_4_unset_future_field_does_not_change_bytes() {
         #[derive(serde::Serialize)]
         struct FutureCanonical<'a> {
@@ -1163,6 +1278,7 @@ mod tests {
             &cfg,
             &ExecArgs {
                 target: "../bad".into(),
+                timeout: None,
             },
         )
         .unwrap_err()
@@ -1434,6 +1550,7 @@ mod tests {
                 &cfg,
                 &ExecArgs {
                     target: "valid".into(),
+                    timeout: None,
                 },
             )
             .unwrap_err()
@@ -1597,7 +1714,7 @@ mod tests {
             .unwrap();
         let value = response_json(app.oneshot(json).await.unwrap()).await;
         assert_eq!(value["proto"], 2);
-        assert_eq!(value["features"], serde_json::json!(["hash"]));
+        assert_eq!(value["features"], serde_json::json!(["hash", "timeout"]));
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
     }
 

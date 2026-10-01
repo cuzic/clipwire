@@ -260,13 +260,20 @@ pub(crate) fn cmd_put(cfg: &ClientConfig) -> Result<()> {
 pub(crate) fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
     validate_target_name(&args.target)?;
     let capabilities = discover_capabilities(cfg);
-    require_features(&capabilities, &[])?;
-    let body = serde_json::json!({ "name": args.target }).to_string();
+    require_features(
+        &capabilities,
+        if args.timeout.is_some() {
+            &["timeout"]
+        } else {
+            &[]
+        },
+    )?;
+    let body = serde_json::json!({ "name": args.target, "timeout": args.timeout }).to_string();
     let url = format!("{}/exec", cfg.base_url());
     let req = cfg.set_auth(
         ureq::post(&url)
             .set("Content-Type", "application/json")
-            .timeout(Duration::from_secs(600)),
+            .timeout(Duration::from_secs(24 * 60 * 60)),
     );
     let resp = match req.send_string(&body) {
         Ok(r) => r,
@@ -277,6 +284,13 @@ pub(crate) fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
         ),
         Err(ureq::Error::Status(409, r)) => bail!("{}", r.into_string().unwrap_or_default().trim()),
         Err(ureq::Error::Status(503, r)) => bail!("{}", r.into_string().unwrap_or_default().trim()),
+        Err(ureq::Error::Status(code, r)) => {
+            bail!(
+                "HTTP {}: {}",
+                code,
+                r.into_string().unwrap_or_default().trim()
+            )
+        }
         Err(e) => bail!("{} に接続できません: {}", cfg.base_url(), e),
     };
     let exit_code: i32 = resp
@@ -297,7 +311,14 @@ pub(crate) fn cmd_register(cfg: &ClientConfig, args: &RegisterArgs) -> Result<()
     validate_target_name(&args.target)?;
     let target = load_exec_target(&args.target)?;
     let capabilities = discover_capabilities(cfg);
-    require_features(&capabilities, &[])?;
+    require_features(
+        &capabilities,
+        if target.timeout.is_some() {
+            &["timeout"]
+        } else {
+            &[]
+        },
+    )?;
     let body = register_body(&capabilities, &args.target, &target);
     let url = format!("{}/register", cfg.base_url());
     let req = cfg.set_auth(

@@ -35,14 +35,34 @@ const fn rhai_limits() -> RhaiLimits {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn exec_rhai(script: &str, dir: Option<&str>) -> Result<(Vec<u8>, i32)> {
-    exec_rhai_cancelable(script, dir, Arc::new(AtomicBool::new(false)))
+    exec_rhai_inner(script, dir, Arc::new(AtomicBool::new(false)), true, false)
 }
 
+#[allow(dead_code)]
 pub(crate) fn exec_rhai_cancelable(
     script: &str,
     dir: Option<&str>,
     cancelled: Arc<AtomicBool>,
+) -> Result<(Vec<u8>, i32)> {
+    exec_rhai_inner(script, dir, cancelled, true, false)
+}
+
+pub(crate) fn exec_rhai_with_deadline(
+    script: &str,
+    dir: Option<&str>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(Vec<u8>, i32)> {
+    exec_rhai_inner(script, dir, cancelled, false, true)
+}
+
+fn exec_rhai_inner(
+    script: &str,
+    dir: Option<&str>,
+    cancelled: Arc<AtomicBool>,
+    operation_limit: bool,
+    timeout_exit: bool,
 ) -> Result<(Vec<u8>, i32)> {
     let (output, relay) = OrderedOutput::new()?;
     let runner = Arc::new(Runner::with_output(
@@ -52,8 +72,10 @@ pub(crate) fn exec_rhai_cancelable(
     let dir = dir.map(std::path::PathBuf::from);
     let mut engine = rhai::Engine::new();
     let limits = rhai_limits();
+    if operation_limit {
+        engine.set_max_operations(limits.operations);
+    }
     engine
-        .set_max_operations(limits.operations)
         .set_max_string_size(limits.string_size)
         .set_max_array_size(limits.array_size)
         .set_max_map_size(limits.map_size)
@@ -153,6 +175,24 @@ pub(crate) fn exec_rhai_cancelable(
         });
     }
     {
+        let cancelled = Arc::clone(&cancelled);
+        engine.register_fn(
+            "sleep",
+            move |milliseconds: i64| -> Result<(), Box<rhai::EvalAltResult>> {
+                if !(0..=60_000).contains(&milliseconds) {
+                    return Err("sleep は 0..=60000 ms で指定してください".into());
+                }
+                let mut remaining = std::time::Duration::from_millis(milliseconds as u64);
+                while !remaining.is_zero() && !cancelled.load(Ordering::Relaxed) {
+                    let slice = remaining.min(std::time::Duration::from_millis(100));
+                    std::thread::sleep(slice);
+                    remaining = remaining.saturating_sub(slice);
+                }
+                Ok(())
+            },
+        );
+    }
+    {
         let dir = dir.clone();
         engine.register_fn("rm", move |path: &str| -> bool {
             std::fs::remove_file(resolve_path(dir.as_deref(), path)).is_ok()
@@ -165,6 +205,11 @@ pub(crate) fn exec_rhai_cancelable(
             output.write_all(format!("script error: {error}\n").as_bytes());
             1
         }
+    };
+    let code = if timeout_exit && cancelled.load(Ordering::Relaxed) {
+        124
+    } else {
+        code
     };
     drop(engine);
     drop(runner);

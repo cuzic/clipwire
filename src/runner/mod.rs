@@ -18,6 +18,7 @@ use std::{
 use std::time::Instant;
 
 mod core;
+pub(crate) use core::{resolve_timeout, valid_timeout};
 #[cfg(not(windows))]
 mod unix;
 #[cfg(windows)]
@@ -62,6 +63,7 @@ pub(crate) enum JobState {
     Succeeded,
     Failed,
     SpawnFailed,
+    Timeout,
 }
 
 pub(crate) trait ProcessGroup: Send {
@@ -136,11 +138,11 @@ impl Runner {
                 spec,
             }),
             Err(error) => {
-                // Command が書き込み側ハンドルを保持したままだとリレーは EOF にならない。
-                // Unix では無通信 2 秒で抜けるが、Windows では永久に待つ。
+                // Command の書き込み側を先に閉じ、起動失敗をリレーの終了待ちで
+                // 遅らせない。リレーは EOF (Unix では idle fallback も) で終わる。
                 drop(command);
                 if let Some(relay) = relay {
-                    relay.finish()?;
+                    relay.cancel();
                 }
                 Ok(JobHandle {
                     child: None,
@@ -185,6 +187,13 @@ impl LogRelay {
         self.thread
             .join()
             .map_err(|_| io::Error::other("log relay panicked"))?
+    }
+
+    fn cancel(self) {
+        self.main_finished.store(true, Ordering::Release);
+        // The failed Command has already released the pipe writers. Do not
+        // make spawn failure wait for relay scheduling or its idle fallback.
+        drop(self.thread);
     }
 }
 
@@ -398,7 +407,10 @@ impl JobHandle {
             }
             if cancelled.load(Ordering::Relaxed) {
                 self.terminate()?;
-                return self.wait();
+                self.wait()?;
+                self.state = JobState::Timeout;
+                self.exit_code = Some(124);
+                return Ok(self.state);
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -551,6 +563,22 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn ac_t5_1_1_timeout_kills_process_tree_and_returns_124() {
+        let (_temp, runner) = runner();
+        let mut job = runner.spawn(shell_job("sleep 100 & sleep 100")).unwrap();
+        let cancelled = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(100));
+                cancelled.store(true, Ordering::Relaxed);
+            });
+            assert_eq!(job.wait_cancelable(&cancelled).unwrap(), JobState::Timeout);
+        });
+        assert_eq!(job.exit_code(), Some(124));
+        assert!(job.members().unwrap().is_empty());
     }
 
     #[test]

@@ -2,6 +2,29 @@
 
 use std::{ffi::OsString, time::Duration};
 
+pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimeoutPolicyError {
+    RequestExceedsDefinition,
+}
+
+pub(crate) fn resolve_timeout(
+    definition: Option<Duration>,
+    requested: Option<Duration>,
+) -> Result<Duration, TimeoutPolicyError> {
+    let limit = definition.unwrap_or(DEFAULT_TIMEOUT);
+    match requested {
+        Some(requested) if requested > limit => Err(TimeoutPolicyError::RequestExceedsDefinition),
+        Some(requested) => Ok(requested),
+        None => Ok(limit),
+    }
+}
+
+pub(crate) fn valid_timeout(value: Duration) -> bool {
+    !value.is_zero()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct LogChunk {
     pub(super) keep: usize,
@@ -207,5 +230,23 @@ mod tests {
             lingering_process_warning(&[42, 7]).as_deref(),
             Some("[warn] 2 processes still running (pids: 42, 7)")
         );
+    }
+
+    #[test]
+    fn timeout_policy_defaults_and_only_allows_shortening() {
+        assert_eq!(resolve_timeout(None, None), Ok(DEFAULT_TIMEOUT));
+        assert_eq!(
+            resolve_timeout(Some(Duration::from_secs(10)), None),
+            Ok(Duration::from_secs(10))
+        );
+        assert_eq!(
+            resolve_timeout(Some(Duration::from_secs(10)), Some(Duration::from_secs(5))),
+            Ok(Duration::from_secs(5))
+        );
+        assert_eq!(
+            resolve_timeout(Some(Duration::from_secs(10)), Some(Duration::from_secs(11))),
+            Err(TimeoutPolicyError::RequestExceedsDefinition)
+        );
+        assert!(!valid_timeout(Duration::ZERO));
     }
 }

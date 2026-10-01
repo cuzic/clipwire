@@ -8,6 +8,7 @@ struct TargetDefinition {
     steps: Option<StepsDef>,
     #[serde(default)]
     env: std::collections::BTreeMap<String, String>,
+    timeout: Option<String>,
 }
 
 impl From<TargetDefinition> for StoredTarget {
@@ -17,6 +18,7 @@ impl From<TargetDefinition> for StoredTarget {
             script: value.script,
             steps: value.steps,
             env: value.env,
+            timeout: value.timeout,
             ..Self::default()
         }
     }
@@ -38,6 +40,7 @@ struct FlatRegisterRequest {
     steps: Option<StepsDef>,
     #[serde(default)]
     env: std::collections::BTreeMap<String, String>,
+    timeout: Option<String>,
 }
 
 fn parse_register_request(body: &[u8]) -> Result<(String, StoredTarget), String> {
@@ -51,6 +54,7 @@ fn parse_register_request(body: &[u8]) -> Result<(String, StoredTarget), String>
                     script: request.script,
                     steps: request.steps,
                     env: request.env,
+                    timeout: request.timeout,
                 }
                 .into(),
             )),
@@ -83,6 +87,16 @@ pub(crate) async fn handle_register(
 
     if let Err(e) = validate_definition(&target) {
         return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response();
+    }
+    if let Some(value) = &target.timeout {
+        let valid = humantime::parse_duration(value).is_ok_and(crate::runner::valid_timeout);
+        if !valid {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("timeout が不正です: {value:?}\n"),
+            )
+                .into_response();
+        }
     }
 
     #[cfg(windows)]
