@@ -107,10 +107,11 @@ impl Stream for ReceiverStream {
 
 pub(super) fn follow_response(state: AppState, id: String, offset: usize) -> Response {
     let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    tokio::spawn(follow(state, id, offset, sender));
+    tokio::spawn(follow(state, id.clone(), offset, sender));
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, NDJSON)
+        .header("X-Job-Id", &id)
         .body(Body::from_stream(ReceiverStream { receiver }))
         .unwrap()
 }

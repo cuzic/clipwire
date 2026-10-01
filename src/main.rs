@@ -211,6 +211,9 @@ struct ExecArgs {
     /// ターゲット定義の上限より短い実行期限
     #[arg(long, value_name = "DURATION")]
     timeout: Option<String>,
+    /// ストリーミングせず、完了後に出力をまとめて取得
+    #[arg(long)]
+    no_stream: bool,
     /// ジョブ ID を即座に返し、バックグラウンドで実行
     #[arg(long)]
     detach: bool,
@@ -1387,6 +1390,7 @@ mod tests {
             &ExecArgs {
                 target: "../bad".into(),
                 timeout: None,
+                no_stream: false,
                 detach: false,
             },
         )
@@ -1660,6 +1664,7 @@ mod tests {
                 &ExecArgs {
                     target: "valid".into(),
                     timeout: None,
+                    no_stream: false,
                     detach: false,
                 },
             )

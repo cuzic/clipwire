@@ -257,7 +257,112 @@ pub(crate) fn cmd_put(cfg: &ClientConfig) -> Result<()> {
 
 // ── Client: exec ──────────────────────────────────────────────────────────────
 
+const EXEC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const EXEC_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
+const EXEC_BUFFERED_READ_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+
+#[derive(Clone, Copy)]
+struct ExecClientTimeouts {
+    connect: Duration,
+    stream_read: Duration,
+    buffered_read: Duration,
+}
+
+impl Default for ExecClientTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: EXEC_CONNECT_TIMEOUT,
+            stream_read: EXEC_STREAM_READ_TIMEOUT,
+            buffered_read: EXEC_BUFFERED_READ_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExecResponseMode {
+    Stream,
+    Buffered,
+}
+
+fn exec_response_mode(content_type: Option<&str>, requested_stream: bool) -> ExecResponseMode {
+    if requested_stream
+        && content_type.is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/x-ndjson"))
+        })
+    {
+        ExecResponseMode::Stream
+    } else {
+        ExecResponseMode::Buffered
+    }
+}
+
+fn should_request_exec_stream(
+    capabilities: &ServerCapabilities,
+    no_stream: bool,
+    detach: bool,
+) -> bool {
+    !no_stream
+        && !detach
+        && capabilities
+            .features
+            .iter()
+            .any(|feature| feature == "stream")
+}
+
+#[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "t")]
+enum ExecStreamEvent {
+    #[serde(rename = "out")]
+    Out { d: String },
+    #[serde(rename = "ping")]
+    Ping,
+    #[serde(rename = "exit")]
+    Exit { code: i32 },
+    #[serde(rename = "err")]
+    Err { msg: String },
+}
+
+fn parse_exec_event(line: &str) -> Result<ExecStreamEvent> {
+    serde_json::from_str(line).context("不正な NDJSON イベントです")
+}
+
+fn disconnected_job_message(job_id: Option<&str>) -> String {
+    match job_id {
+        Some(id) => format!(
+            "ストリームが exit イベントなしで切断されました (ジョブ ID: {id})。clipwire logs {id} でログを確認してください"
+        ),
+        None => "ストリームが exit イベントなしで切断されました (ジョブ ID を取得できませんでした)".into(),
+    }
+}
+
+fn stream_exit_result(exit_code: Option<i32>, job_id: Option<&str>) -> Result<()> {
+    match exit_code {
+        Some(0) => Ok(()),
+        Some(code) => bail!("exit code {code}"),
+        None => bail!("{}", disconnected_job_message(job_id)),
+    }
+}
+
 pub(crate) fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
+    cmd_exec_with_io(
+        cfg,
+        args,
+        ExecClientTimeouts::default(),
+        &mut io::stdout(),
+        &mut io::stderr(),
+    )
+}
+
+fn cmd_exec_with_io(
+    cfg: &ClientConfig,
+    args: &ExecArgs,
+    timeouts: ExecClientTimeouts,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<()> {
     validate_target_name(&args.target)?;
     let capabilities = discover_capabilities(cfg);
     let mut required = Vec::new();
@@ -268,15 +373,25 @@ pub(crate) fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
         required.push("jobs");
     }
     require_features(&capabilities, &required)?;
+    let requested_stream = should_request_exec_stream(&capabilities, args.no_stream, args.detach);
     let body =
         serde_json::json!({ "name": args.target, "timeout": args.timeout, "detach": args.detach })
             .to_string();
     let url = format!("{}/exec", cfg.base_url());
-    let req = cfg.set_auth(
-        ureq::post(&url)
-            .set("Content-Type", "application/json")
-            .timeout(Duration::from_secs(24 * 60 * 60)),
-    );
+    let read_timeout = if requested_stream {
+        timeouts.stream_read
+    } else {
+        timeouts.buffered_read
+    };
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(timeouts.connect)
+        .timeout_read(read_timeout)
+        .build();
+    let mut req = agent.post(&url).set("Content-Type", "application/json");
+    if requested_stream {
+        req = req.set("Accept", "application/x-ndjson");
+    }
+    let req = cfg.set_auth(req);
     let resp = match req.send_string(&body) {
         Ok(r) => r,
         Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
@@ -297,24 +412,255 @@ pub(crate) fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
     };
     if args.detach {
         let value: serde_json::Value = serde_json::from_reader(resp.into_reader())?;
-        println!(
+        writeln!(
+            stdout,
             "{}",
             value["id"]
                 .as_str()
                 .context("応答にジョブ ID がありません")?
-        );
+        )?;
         return Ok(());
     }
-    let exit_code: i32 = resp
-        .header("X-Exit-Code")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let output = resp.into_string()?;
-    print!("{output}");
-    if exit_code != 0 {
-        bail!("exit code {exit_code}");
+    if exec_response_mode(resp.header("Content-Type"), requested_stream)
+        == ExecResponseMode::Buffered
+    {
+        let exit_code = resp
+            .header("X-Exit-Code")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        io::copy(&mut resp.into_reader(), stdout)?;
+        if exit_code != 0 {
+            bail!("exit code {exit_code}");
+        }
+        return Ok(());
     }
-    Ok(())
+
+    let job_id = resp.header("X-Job-Id").map(str::to_owned);
+    let mut exit_code = None;
+    let reader = io::BufReader::new(resp.into_reader());
+    for line in std::io::BufRead::lines(reader) {
+        let Ok(line) = line else {
+            break;
+        };
+        match parse_exec_event(&line)? {
+            ExecStreamEvent::Out { d } => {
+                stdout.write_all(d.as_bytes())?;
+                stdout.flush()?;
+            }
+            ExecStreamEvent::Ping => {}
+            ExecStreamEvent::Exit { code } => {
+                exit_code = Some(code);
+                break;
+            }
+            ExecStreamEvent::Err { msg } => writeln!(stderr, "server error: {msg}")?,
+        }
+    }
+    if exit_code.is_none() {
+        writeln!(stderr, "{}", disconnected_job_message(job_id.as_deref()))?;
+    }
+    stream_exit_result(exit_code, job_id.as_deref())
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod exec_tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !bytes.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            bytes.push(byte[0]);
+        }
+        let headers = String::from_utf8(bytes).unwrap();
+        let length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).unwrap();
+        headers
+    }
+
+    fn mock_server<F>(exec: F) -> Option<(ClientConfig, thread::JoinHandle<()>)>
+    where
+        F: FnOnce(TcpStream, String) + Send + 'static,
+    {
+        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("mock server bind failed: {error}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut health, _) = listener.accept().unwrap();
+            let _ = read_request(&mut health);
+            health
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 50\r\nConnection: close\r\n\r\n{\"proto\":2,\"features\":[\"timeout\",\"jobs\",\"stream\"]}",
+                )
+                .unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            exec(stream, request);
+        });
+        Some((
+            ClientConfig {
+                host: Ipv4Addr::LOCALHOST.to_string(),
+                port,
+                token: None,
+            },
+            handle,
+        ))
+    }
+
+    fn args(no_stream: bool) -> ExecArgs {
+        ExecArgs {
+            target: "test".into(),
+            timeout: None,
+            no_stream,
+            detach: false,
+        }
+    }
+
+    fn short_timeouts() -> ExecClientTimeouts {
+        ExecClientTimeouts {
+            connect: Duration::from_secs(1),
+            stream_read: Duration::from_millis(500),
+            buffered_read: Duration::from_secs(3),
+        }
+    }
+
+    #[test]
+    fn ac_t6_4_1_stream_has_no_overall_timeout() {
+        let _guard = test_lock();
+        let Some((cfg, server)) = mock_server(|mut stream, request| {
+            assert!(request.contains("Accept: application/x-ndjson"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nX-Job-Id: long-job\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            for _ in 0..25 {
+                thread::sleep(Duration::from_millis(25));
+                stream.write_all(b"{\"t\":\"ping\"}\n").unwrap();
+                stream.flush().unwrap();
+            }
+            stream.write_all(b"{\"t\":\"exit\",\"code\":0}\n").unwrap();
+        }) else {
+            return;
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        cmd_exec_with_io(&cfg, &args(false), short_timeouts(), &mut out, &mut err).unwrap();
+        server.join().unwrap();
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn ac_t6_4_2_no_stream_uses_buffered_timeout() {
+        let _guard = test_lock();
+        let Some((cfg, server)) = mock_server(|mut stream, request| {
+            assert!(!request.contains("Accept: application/x-ndjson"));
+            thread::sleep(Duration::from_millis(700));
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Exit-Code: 0\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone").unwrap();
+        }) else {
+            return;
+        };
+        let mut out = Vec::new();
+        cmd_exec_with_io(
+            &cfg,
+            &args(true),
+            short_timeouts(),
+            &mut out,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(out, b"done");
+    }
+
+    #[test]
+    fn ac_t6_4_3_text_plain_response_falls_back_to_buffered() {
+        let _guard = test_lock();
+        let Some((cfg, server)) = mock_server(|mut stream, request| {
+            assert!(request.contains("Accept: application/x-ndjson"));
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nX-Exit-Code: 0\r\nContent-Length: 6\r\nConnection: close\r\n\r\nlegacy").unwrap();
+        }) else {
+            return;
+        };
+        let mut out = Vec::new();
+        cmd_exec_with_io(
+            &cfg,
+            &args(false),
+            short_timeouts(),
+            &mut out,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(out, b"legacy");
+        assert!(!should_request_exec_stream(
+            &ServerCapabilities::default(),
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn ac_t6_4_4_missing_exit_reports_job_id() {
+        let _guard = test_lock();
+        let Some((cfg, server)) = mock_server(|mut stream, _| {
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nX-Job-Id: recover-me\r\nConnection: close\r\n\r\n{\"t\":\"out\",\"d\":\"partial\"}\n").unwrap();
+        }) else {
+            return;
+        };
+        let mut err = Vec::new();
+        let result = cmd_exec_with_io(
+            &cfg,
+            &args(false),
+            short_timeouts(),
+            &mut Vec::new(),
+            &mut err,
+        );
+        server.join().unwrap();
+        assert!(result.is_err());
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("recover-me"));
+        assert!(err.contains("clipwire logs recover-me"));
+    }
+
+    #[test]
+    fn ac_t6_4_5_buffered_output_exceeds_ten_mib() {
+        let _guard = test_lock();
+        const SIZE: usize = 10 * 1024 * 1024 + 1;
+        let Some((cfg, server)) = mock_server(|mut stream, _| {
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Exit-Code: 0\r\nContent-Length: {SIZE}\r\nConnection: close\r\n\r\n").unwrap();
+            stream.write_all(&vec![b'x'; SIZE]).unwrap();
+        }) else {
+            return;
+        };
+        let mut out = Vec::new();
+        cmd_exec_with_io(
+            &cfg,
+            &args(true),
+            short_timeouts(),
+            &mut out,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(out.len(), SIZE);
+    }
 }
 
 fn jobs_request(cfg: &ClientConfig, path: &str) -> Result<ureq::Response> {
