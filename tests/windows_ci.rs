@@ -4,10 +4,74 @@
 use std::{
     fs,
     io::{BufRead, BufReader},
-    process::{Command, Stdio},
+    net::TcpListener,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
+
+struct Server(Child);
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn start_server(config_dir: &Path, port: u16, auto_approve: bool) -> Server {
+    let mut args = vec![
+        "serve",
+        "--bind-localhost-only",
+        "--allow-no-token",
+        "--port",
+    ];
+    let port_text = port.to_string();
+    args.push(&port_text);
+    if auto_approve {
+        args.push("--auto-approve");
+    }
+    let child = Command::new(env!("CARGO_BIN_EXE_clipwire"))
+        .args(args)
+        .env("CLIPWIRE_CONFIG_DIR", config_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if ureq::get(&format!("http://127.0.0.1:{port}/health"))
+            .call()
+            .is_ok()
+        {
+            return Server(child);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("server on port {port} did not start");
+}
+
+fn register_range(port: u16, prefix: &str) {
+    for index in 0..100 {
+        let body = serde_json::json!({
+            "name": format!("{prefix}-{index}"),
+            "script": format!("echo {prefix}-{index}")
+        });
+        ureq::post(&format!("http://127.0.0.1:{port}/register"))
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string())
+            .unwrap();
+    }
+}
 
 /// AC-T0.5.2: ファイルを開いたままの別プロセスがあると remove_dir_all は失敗し、
 /// 閉じると成功する。
@@ -56,4 +120,39 @@ fn ac_t0_5_2_remove_dir_all_fails_while_another_process_holds_a_file() {
         }
     }
     assert!(!root.exists());
+}
+
+/// AC-T3.3.5 (C): a server and local CLI processes share the named mutex;
+/// their read-modify-write cycles retain the union of both writers.
+#[test]
+fn ac_t3_3_5_server_and_cli_processes_preserve_the_union() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pending = String::new();
+    for index in 0..100 {
+        pending.push_str(&format!("[cli-{index}]\nscript = \"echo cli-{index}\"\n"));
+    }
+    fs::write(dir.path().join("pending.toml"), pending).unwrap();
+
+    let port = free_port();
+    let _server = start_server(dir.path(), port, true);
+    let server_writes = thread::spawn(move || register_range(port, "server"));
+    let config_dir = dir.path().to_owned();
+    let cli_writes = thread::spawn(move || {
+        for index in 0..100 {
+            let status = Command::new(env!("CARGO_BIN_EXE_clipwire"))
+                .args(["approve", &format!("cli-{index}")])
+                .env("CLIPWIRE_CONFIG_DIR", &config_dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+    });
+    server_writes.join().unwrap();
+    cli_writes.join().unwrap();
+
+    let path: PathBuf = dir.path().join("registered.toml");
+    let parsed: toml::Value = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(parsed.as_table().unwrap().len(), 200);
 }

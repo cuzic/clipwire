@@ -74,6 +74,37 @@ fn ac_t0_3_2_register_writes_pending_to_the_overridden_config_dir() {
 }
 
 #[test]
+fn ac_t3_3_2_corrupt_pending_returns_500_without_replacing_it_with_an_empty_map() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let pending = server.config_dir().join("pending.toml");
+    std::fs::write(&pending, "broken = [toml").unwrap();
+    let error = ureq::post(&server.url("/register"))
+        .set("Content-Type", "application/json")
+        .set("Authorization", &format!("Bearer {}", common::TEST_TOKEN))
+        .send_string(
+            &serde_json::json!({"name": "must-not-appear", "script": "echo no"}).to_string(),
+        )
+        .unwrap_err();
+    assert!(matches!(error, ureq::Error::Status(500, _)));
+    assert!(!pending.exists());
+    let corrupt = std::fs::read_dir(server.config_dir())
+        .unwrap()
+        .flatten()
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("pending.toml.corrupt.")
+        })
+        .expect("corrupt file must be quarantined");
+    let contents = std::fs::read_to_string(corrupt.path()).unwrap();
+    assert_eq!(contents, "broken = [toml");
+    assert!(!contents.contains("must-not-appear"));
+}
+
+#[test]
 fn ac_t0_3_3_parallel_servers_use_distinct_ports_and_directories() {
     let first = thread::spawn(TestServer::start);
     let second = thread::spawn(TestServer::start);

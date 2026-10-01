@@ -300,11 +300,9 @@ pub(crate) fn cmd_approve(args: &ApproveArgs) -> Result<()> {
         println!("steps:\n{}", lines);
     }
 
-    let registered_path = config_dir.join("registered.toml");
-    let mut registered = load_target_map(&registered_path).unwrap_or_default();
-    registered.insert(name.clone(), entry);
-    save_target_map(&registered_path, &registered)?;
-    save_target_map(&pending_path, &pending)?;
+    drop(entry);
+    drop(pending);
+    Store::new(config_dir).approve(name, args.dir.as_deref())?;
     println!("承認しました");
     Ok(())
 }

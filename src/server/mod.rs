@@ -84,6 +84,7 @@ pub(crate) struct AppState {
     pub(crate) allow_no_token: bool,
     pub(crate) last_clip: Arc<Mutex<LastClip>>,
     pub(crate) config_dir: PathBuf,
+    pub(crate) store: Store,
     pub(crate) auto_approve: bool,
     pub(crate) host_policy: HostPolicy,
 }
@@ -472,6 +473,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         token,
         allow_no_token: args.allow_no_token,
         last_clip: Arc::new(Mutex::new(LastClip::default())),
+        store: Store::new(config_dir.clone()),
         config_dir,
         auto_approve: args.auto_approve,
         host_policy: build_host_policy(args.host_check, args.allow_host),

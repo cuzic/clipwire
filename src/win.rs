@@ -511,14 +511,10 @@ pub(crate) mod win_clip {
             .recv_timeout(std::time::Duration::from_secs(600))
             .unwrap_or(false)
         {
-            let registered_path = config_dir.join("registered.toml");
-            let pending_path = config_dir.join("pending.toml");
-            let mut registered = super::load_target_map_or_warn(&registered_path);
-            let mut pending = super::load_target_map_or_warn(&pending_path);
-            registered.insert(name.clone(), entry);
-            pending.remove(&name);
-            super::save_target_map(&registered_path, &registered)?;
-            super::save_target_map(&pending_path, &pending)?;
+            // The toast never holds the store lock while waiting for user input.
+            // Re-open and mutate the current pending entry only after activation.
+            drop(entry);
+            super::Store::new(config_dir).approve(&name, None)?;
             eprintln!("[clipwire] '{}' 承認 → registered.toml", name);
             show_balloon(&format!("'{}' を承認しました", name));
         }

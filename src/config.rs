@@ -237,6 +237,7 @@ pub(crate) fn load_target_map_or_warn(path: &Path) -> TargetMap {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn save_target_map(path: &Path, map: &TargetMap) -> Result<()> {
     std::fs::create_dir_all(path.parent().unwrap())?;
     std::fs::write(path, toml::to_string(map)?)?;

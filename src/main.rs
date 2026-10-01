@@ -34,6 +34,7 @@ use axum::{
 };
 use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
+use store::Store;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
@@ -177,6 +178,7 @@ mod client;
 mod config;
 mod exec_rhai;
 mod server;
+mod store;
 mod watchdog;
 #[cfg(windows)]
 mod win;
@@ -286,12 +288,14 @@ mod tests {
 
     fn test_state(config_dir: PathBuf, auto_approve: bool) -> AppState {
         let (clip_tx, _clip_rx) = mpsc::sync_channel(1);
+        let store = Store::new(config_dir.clone());
         AppState {
             clip_tx,
             token: None,
             allow_no_token: false,
             last_clip: Arc::new(Mutex::new(LastClip::default())),
             config_dir,
+            store,
             auto_approve,
             host_policy: HostPolicy::default(),
         }
@@ -304,12 +308,14 @@ mod tests {
                 let _ = reply.send(ClipKind::Text("stub".into()));
             }
         });
+        let store = Store::new(config_dir.clone());
         AppState {
             clip_tx,
             token: None,
             allow_no_token: false,
             last_clip: Arc::new(Mutex::new(LastClip::default())),
             config_dir,
+            store,
             auto_approve: false,
             host_policy: HostPolicy::default(),
         }
