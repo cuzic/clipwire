@@ -17,6 +17,7 @@ use std::{
 #[cfg(not(windows))]
 use std::time::Instant;
 
+mod core;
 #[cfg(not(windows))]
 mod unix;
 #[cfg(windows)]
@@ -115,8 +116,9 @@ impl Runner {
                 .stderr(Stdio::from(writer));
             Some(LogRelay::start(reader, log))
         };
-        command.envs(spec.env.iter().cloned());
-        command.env_remove("CLIPD_TOKEN");
+        command
+            .env_clear()
+            .envs(core::child_environment(std::env::vars_os(), &spec.env));
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
         }
@@ -189,13 +191,13 @@ fn write_relay_chunk(
     marked: &mut bool,
     bytes: &[u8],
 ) -> io::Result<()> {
-    let available = LOG_SOFT_LIMIT.saturating_sub(*written);
-    let keep = available.min(bytes.len());
+    let decision = core::log_chunk(*written, *marked, bytes.len(), LOG_SOFT_LIMIT);
+    let keep = decision.keep;
     if keep != 0 {
         log.write_all(&bytes[..keep])?;
         *written += keep;
     }
-    if keep != bytes.len() && !*marked {
+    if decision.add_marker {
         log.write_all(LOG_LIMIT_MARKER)?;
         *marked = true;
     }
@@ -237,14 +239,18 @@ fn relay_to_log(mut reader: File, mut log: File, main_finished: &AtomicBool) -> 
         }
         if ready > 0 {
             let count = reader.read(&mut buffer)?;
-            if count == 0 {
+            if core::relay_action(count == 0, main_seen.is_some(), Duration::ZERO)
+                == core::RelayAction::Finish
+            {
                 break;
             }
             write_relay_chunk(&mut log, &mut written, &mut marked, &buffer[..count])?;
             if main_seen.is_some() {
                 main_seen = Some(Instant::now());
             }
-        } else if main_seen.is_some_and(|last_data| last_data.elapsed() >= RELAY_IDLE_TIMEOUT) {
+        } else if main_seen.is_some_and(|last_data| {
+            core::relay_action(false, true, last_data.elapsed()) == core::RelayAction::Finish
+        }) {
             break;
         }
     }
@@ -260,7 +266,7 @@ fn relay_to_log(mut reader: File, mut log: File, _main_finished: &AtomicBool) ->
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let count = reader.read(&mut buffer)?;
-        if count == 0 {
+        if core::relay_action(count == 0, false, Duration::ZERO) == core::RelayAction::Finish {
             break;
         }
         write_relay_chunk(&mut log, &mut written, &mut marked, &buffer[..count])?;
@@ -288,10 +294,7 @@ impl OrderedOutput {
                 if count == 0 {
                     return Ok(());
                 }
-                reader_bytes
-                    .lock()
-                    .unwrap()
-                    .extend_from_slice(&buffer[..count]);
+                core::append_output(&mut reader_bytes.lock().unwrap(), &buffer[..count]);
             }
         });
         Ok((
@@ -438,12 +441,9 @@ impl JobHandle {
     }
 
     fn record_status(&mut self, status: ExitStatus) {
-        self.exit_code = status.code();
-        self.state = if status.success() {
-            JobState::Succeeded
-        } else {
-            JobState::Failed
-        };
+        let completion = core::completion(true, status.success(), status.code());
+        self.exit_code = completion.exit_code;
+        self.state = completion.state;
     }
 
     fn finish_relay(&mut self) -> io::Result<()> {
@@ -611,5 +611,72 @@ mod tests {
             fs::read_to_string(job.log_path()).unwrap(),
             "main-finished\n"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    fn runner() -> (tempfile::TempDir, Runner) {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = Runner::new(temp.path());
+        (temp, runner)
+    }
+
+    fn cmd_job(script: &str) -> JobSpec {
+        let mut spec = JobSpec::new("cmd", "windows-test");
+        spec.args = ["/d", "/c", script].into_iter().map(Into::into).collect();
+        spec
+    }
+
+    #[test]
+    fn direct_child_reports_success_failure_and_spawn_failure() {
+        let (_temp, runner) = runner();
+
+        let mut success = runner.spawn(cmd_job("echo hello")).unwrap();
+        assert_eq!(success.wait().unwrap(), JobState::Succeeded);
+        assert_eq!(success.exit_code(), Some(0));
+        assert_eq!(
+            fs::read_to_string(success.log_path())
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "hello\n"
+        );
+
+        let mut failure = runner.spawn(cmd_job("exit /b 7")).unwrap();
+        assert_eq!(failure.wait().unwrap(), JobState::Failed);
+        assert_eq!(failure.exit_code(), Some(7));
+
+        let missing = runner
+            .spawn(JobSpec::new(
+                "clipwire-command-that-does-not-exist",
+                "windows-test",
+            ))
+            .unwrap();
+        assert_eq!(missing.state(), JobState::SpawnFailed);
+        assert_eq!(missing.exit_code(), None);
+        assert_eq!(
+            missing.spawn_error().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn completed_direct_child_releases_log_handles() {
+        let (temp, runner) = runner();
+        let mut job = runner.spawn(cmd_job("echo complete")).unwrap();
+        assert_eq!(job.wait().unwrap(), JobState::Succeeded);
+        drop(job);
+        drop(runner);
+
+        let job_dir = fs::read_dir(temp.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::remove_dir_all(&job_dir).unwrap();
+        assert!(!job_dir.exists());
     }
 }

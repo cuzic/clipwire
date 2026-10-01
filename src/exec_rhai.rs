@@ -16,6 +16,25 @@ const MAX_ARRAY_SIZE: usize = 100_000;
 const MAX_MAP_SIZE: usize = 10_000;
 const MAX_CALL_LEVELS: usize = 64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RhaiLimits {
+    operations: u64,
+    string_size: usize,
+    array_size: usize,
+    map_size: usize,
+    call_levels: usize,
+}
+
+const fn rhai_limits() -> RhaiLimits {
+    RhaiLimits {
+        operations: MAX_OPERATIONS,
+        string_size: MAX_STRING_SIZE,
+        array_size: MAX_ARRAY_SIZE,
+        map_size: MAX_MAP_SIZE,
+        call_levels: MAX_CALL_LEVELS,
+    }
+}
+
 pub(crate) fn exec_rhai(script: &str, dir: Option<&str>) -> Result<(Vec<u8>, i32)> {
     exec_rhai_cancelable(script, dir, Arc::new(AtomicBool::new(false)))
 }
@@ -32,12 +51,13 @@ pub(crate) fn exec_rhai_cancelable(
     ));
     let dir = dir.map(std::path::PathBuf::from);
     let mut engine = rhai::Engine::new();
+    let limits = rhai_limits();
     engine
-        .set_max_operations(MAX_OPERATIONS)
-        .set_max_string_size(MAX_STRING_SIZE)
-        .set_max_array_size(MAX_ARRAY_SIZE)
-        .set_max_map_size(MAX_MAP_SIZE)
-        .set_max_call_levels(MAX_CALL_LEVELS);
+        .set_max_operations(limits.operations)
+        .set_max_string_size(limits.string_size)
+        .set_max_array_size(limits.array_size)
+        .set_max_map_size(limits.map_size)
+        .set_max_call_levels(limits.call_levels);
 
     {
         let cancelled = Arc::clone(&cancelled);
@@ -164,4 +184,93 @@ fn string_args(args: rhai::Array) -> Vec<String> {
 
 fn resolve_path(dir: Option<&std::path::Path>, path: &str) -> std::path::PathBuf {
     dir.map_or_else(|| path.into(), |dir| dir.join(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_limit_configuration_is_stable() {
+        assert_eq!(
+            rhai_limits(),
+            RhaiLimits {
+                operations: 1_000_000,
+                string_size: 1_048_576,
+                array_size: 100_000,
+                map_size: 10_000,
+                call_levels: 64,
+            }
+        );
+    }
+
+    #[cfg(windows)]
+    mod windows {
+        use super::*;
+        use std::sync::Mutex;
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        fn text(script: &str) -> (String, i32) {
+            let (bytes, code) = exec_rhai(script, None).unwrap();
+            (
+                String::from_utf8(bytes).unwrap().replace("\r\n", "\n"),
+                code,
+            )
+        }
+
+        #[test]
+        fn cmd_output_exit_code_and_print_order() {
+            let (output, code) = text(
+                r#"run(["cmd", "/d", "/c", "echo stdout& echo stderr 1>&2"]); print("done");"#,
+            );
+            assert_eq!(code, 0);
+            assert_eq!(output, "stdout\nstderr\ndone\n");
+
+            let (output, code) = text(r#"run(["cmd", "/d", "/c", "exit /b 7"]);"#);
+            assert_eq!(code, 1);
+            assert!(output.starts_with("script error:"), "{output:?}");
+            assert!(output.contains("exit code 7"), "{output:?}");
+        }
+
+        #[test]
+        fn run_ok_and_missing_command_keep_the_contract() {
+            let (output, code) = text(
+                r#"if run_ok(["cmd", "/d", "/c", "exit /b 0"]) { print("ok"); }
+                   if !run_ok(["cmd", "/d", "/c", "exit /b 9"]) { print("failed"); }
+                   if !run_ok(["clipwire-command-that-does-not-exist"]) { print("missing"); }"#,
+            );
+            assert_eq!(code, 0);
+            assert!(output.contains("ok\n"), "{output:?}");
+            assert!(output.contains("failed\n"), "{output:?}");
+            assert!(
+                output.contains("run_ok: clipwire-command-that-does-not-exist"),
+                "{output:?}"
+            );
+            assert!(output.ends_with("missing\n"), "{output:?}");
+        }
+
+        #[test]
+        fn child_environment_excludes_clipd_token() {
+            let _guard = ENV_LOCK.lock().unwrap();
+            std::env::set_var("CLIPD_TOKEN", "windows-ci-secret");
+            let result = text(r#"run(["cmd", "/d", "/c", "set"]);"#);
+            std::env::remove_var("CLIPD_TOKEN");
+            let (output, code) = result;
+            assert_eq!(code, 0);
+            assert!(
+                !output.to_ascii_uppercase().contains("CLIPD_TOKEN="),
+                "{output:?}"
+            );
+        }
+
+        #[test]
+        fn resource_limits_return_script_errors() {
+            for script in ["loop {}", r#"let s = "a"; loop { s += s; }"#] {
+                let (output, code) = text(script);
+                assert_eq!(code, 1);
+                assert!(output.starts_with("script error:"), "{output:?}");
+            }
+        }
+    }
 }

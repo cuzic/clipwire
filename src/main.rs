@@ -269,7 +269,10 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec_rhai::{exec_rhai, exec_rhai_cancelable};
+    #[cfg(not(windows))]
+    use crate::exec_rhai::exec_rhai;
+    #[cfg(target_os = "linux")]
+    use crate::exec_rhai::exec_rhai_cancelable;
     use proptest::prelude::*;
     use quick_xml::{events::Event, Reader};
     use std::collections::{BTreeMap, HashMap};
@@ -1238,6 +1241,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn ac_t0_2_2_exec_rhai_functions_preserve_success_and_failure_behavior() {
         let dir = tempdir().unwrap();
         let existing = dir.path().join("existing.txt");
@@ -1275,6 +1279,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn ac_t4_5_2_child_output_precedes_following_print() {
         let (output, code) = exec_rhai(
             r#"run(["sh", "-c", "echo a; sleep 0.2"]); print("done");"#,
@@ -1286,6 +1291,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn ac_t4_5_3_and_4_resource_limits_stop_runaway_scripts() {
         for script in ["loop {}", r#"let s = "a"; loop { s += s; }"#] {
             let (output, code) = exec_rhai(script, None).unwrap();
@@ -1295,6 +1301,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn ac_t4_5_5_child_environment_excludes_clipd_token() {
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
