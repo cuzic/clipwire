@@ -3,7 +3,7 @@ use super::*;
 // ── Exec target config ────────────────────────────────────────────────────────
 
 /// `steps` フィールドの値: 構造化配列 or 1行1コマンドの文字列
-#[derive(serde::Deserialize, serde::Serialize, Clone)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum StepsDef {
     Text(String),
@@ -34,12 +34,12 @@ pub(crate) enum ExecPayload {
     Steps {
         steps: StepsDef,
         #[serde(default)]
-        env: std::collections::HashMap<String, String>,
+        env: std::collections::BTreeMap<String, String>,
     },
 }
 
 /// Windows 側 pending.toml / registered.toml のエントリ (dir あり)
-#[derive(serde::Deserialize, serde::Serialize, Clone, Default)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StoredTarget {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) dir: Option<String>,
@@ -47,8 +47,125 @@ pub(crate) struct StoredTarget {
     pub(crate) script: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) steps: Option<StepsDef>,
-    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub(crate) env: std::collections::HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) env: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(serde::Serialize)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct CanonicalTarget<'a> {
+    v: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dir: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    script: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    steps: Option<&'a StepsDef>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    env: &'a std::collections::BTreeMap<String, String>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn canonical_json(target: &StoredTarget) -> Vec<u8> {
+    serde_json::to_vec(&CanonicalTarget {
+        v: 1,
+        dir: target.dir.as_deref(),
+        script: target.script.as_deref(),
+        steps: target.steps.as_ref(),
+        env: &target.env,
+    })
+    .expect("canonical target serialization cannot fail")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn definition_hash(canonical: &[u8]) -> String {
+    use sha2::Digest;
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(canonical)))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DefinitionError {
+    pub(crate) field: String,
+    pub(crate) line: usize,
+    pub(crate) column: usize,
+    pub(crate) codepoint: u32,
+}
+
+impl std::fmt::Display for DefinitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: 行 {} 桁 {}: U+{:04X} は使用できません",
+            self.field, self.line, self.column, self.codepoint
+        )
+    }
+}
+
+impl std::error::Error for DefinitionError {}
+
+fn validate_definition_string(field: String, value: &str) -> Result<(), DefinitionError> {
+    use unicode_general_category::{get_general_category, GeneralCategory};
+
+    let chars: Vec<char> = value.chars().collect();
+    let (mut line, mut column) = (1, 1);
+    for (index, &ch) in chars.iter().enumerate() {
+        let category = get_general_category(ch);
+        let allowed_whitespace =
+            matches!(ch, '\t' | '\n') || (ch == '\r' && chars.get(index + 1) == Some(&'\n'));
+        let forbidden = (!allowed_whitespace
+            && matches!(
+                category,
+                GeneralCategory::Control
+                    | GeneralCategory::Format
+                    | GeneralCategory::LineSeparator
+                    | GeneralCategory::ParagraphSeparator
+            ))
+            || matches!(ch, '\u{115f}' | '\u{1160}' | '\u{3164}');
+        if forbidden {
+            return Err(DefinitionError {
+                field,
+                line,
+                column,
+                codepoint: ch as u32,
+            });
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_definition(target: &StoredTarget) -> Result<(), DefinitionError> {
+    if let Some(dir) = &target.dir {
+        validate_definition_string("dir".into(), dir)?;
+    }
+    if let Some(script) = &target.script {
+        validate_definition_string("script".into(), script)?;
+    }
+    if let Some(steps) = &target.steps {
+        match steps {
+            StepsDef::Text(text) => validate_definition_string("steps".into(), text)?,
+            StepsDef::Argv(commands) => {
+                for (command_index, command) in commands.iter().enumerate() {
+                    for (arg_index, arg) in command.iter().enumerate() {
+                        validate_definition_string(
+                            format!("steps[{command_index}][{arg_index}]"),
+                            arg,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    for (key, value) in &target.env {
+        validate_definition_string(format!("env key {key:?}"), key)?;
+        validate_definition_string(format!("env[{key:?}]"), value)?;
+    }
+    Ok(())
 }
 
 impl StoredTarget {
@@ -128,7 +245,7 @@ pub(crate) fn save_target_map(path: &Path, map: &TargetMap) -> Result<()> {
 
 #[derive(serde::Deserialize)]
 pub(crate) struct TargetsFile {
-    targets: std::collections::HashMap<String, StoredTarget>,
+    pub(crate) targets: std::collections::HashMap<String, StoredTarget>,
 }
 
 pub(crate) fn load_exec_target(name: &str) -> Result<StoredTarget> {

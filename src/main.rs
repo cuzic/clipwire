@@ -242,7 +242,7 @@ mod tests {
     use crate::exec_rhai::exec_rhai;
     use proptest::prelude::*;
     use quick_xml::{events::Event, Reader};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use tempfile::tempdir;
     use tower::ServiceExt;
     use tracing_subscriber::prelude::*;
@@ -728,6 +728,202 @@ mod tests {
             script: Some(script.to_string()),
             ..StoredTarget::default()
         }
+    }
+
+    fn fixture_bytes(path: &str) -> Vec<u8> {
+        let mut bytes = std::fs::read(path).unwrap();
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
+        bytes
+    }
+
+    #[test]
+    fn ac_t3_1_1_canonical_env_order_is_stable_for_100_constructions() {
+        let entries: Vec<_> = (0..11)
+            .map(|i| (format!("KEY_{i:02}"), format!("value-{i}")))
+            .collect();
+        let mut expected = None;
+        for seed in 0..100 {
+            let mut insertion_order = entries.clone();
+            insertion_order.sort_by_key(|(key, _)| {
+                key.bytes().fold(seed as u64 + 17, |hash, byte| {
+                    hash.wrapping_mul(1099511628211) ^ u64::from(byte)
+                })
+            });
+            let target = StoredTarget {
+                script: Some("echo stable".into()),
+                env: insertion_order.into_iter().collect(),
+                ..StoredTarget::default()
+            };
+            let bytes = canonical_json(&target);
+            if let Some(expected) = &expected {
+                assert_eq!(&bytes, expected);
+            } else {
+                expected = Some(bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn ac_t3_1_2_canonical_golden_bytes_and_hashes_are_fixed() {
+        let cases = [
+            (
+                StoredTarget {
+                    dir: Some(r"C:\work".into()),
+                    script: Some("Write-Output 'ok'".into()),
+                    env: BTreeMap::from([
+                        ("ZULU".into(), "two".into()),
+                        ("ALPHA".into(), "one".into()),
+                    ]),
+                    ..StoredTarget::default()
+                },
+                "tests/fixtures/canonical/script.json",
+                "sha256:9bf3420dc591ee601f922597f1b029520676d3a6b7baf7f1158c7d9d7dc016d9",
+            ),
+            (
+                StoredTarget {
+                    steps: Some(StepsDef::Text("echo one\necho two".into())),
+                    ..StoredTarget::default()
+                },
+                "tests/fixtures/canonical/steps-text.json",
+                "sha256:add887b1248be49d82a4c6b6d4bc6bc84495c69e6561336700d1275269e886bd",
+            ),
+            (
+                StoredTarget {
+                    steps: Some(StepsDef::Argv(vec![
+                        vec!["echo".into(), "one".into()],
+                        vec!["echo".into(), "two".into()],
+                    ])),
+                    env: BTreeMap::from([("LANG".into(), "ja_JP.UTF-8".into())]),
+                    ..StoredTarget::default()
+                },
+                "tests/fixtures/canonical/steps-argv.json",
+                "sha256:dbabf65f7f74f7d91e065503472096da52c1ad3311a89b9d78a70f4e94bd8b12",
+            ),
+        ];
+        for (target, fixture, hash) in cases {
+            let bytes = canonical_json(&target);
+            assert_eq!(bytes, fixture_bytes(fixture), "fixture={fixture}");
+            assert_eq!(definition_hash(&bytes), hash, "fixture={fixture}");
+        }
+    }
+
+    #[test]
+    fn ac_t3_1_3_text_and_argv_steps_remain_distinct() {
+        let text = StoredTarget {
+            steps: Some(StepsDef::Text("echo one".into())),
+            ..StoredTarget::default()
+        };
+        let argv = StoredTarget {
+            steps: Some(StepsDef::Argv(vec![vec!["echo".into(), "one".into()]])),
+            ..StoredTarget::default()
+        };
+        assert_ne!(canonical_json(&text), canonical_json(&argv));
+        assert_ne!(
+            definition_hash(&canonical_json(&text)),
+            definition_hash(&canonical_json(&argv))
+        );
+    }
+
+    #[test]
+    fn ac_t3_1_4_unset_future_field_does_not_change_bytes() {
+        #[derive(serde::Serialize)]
+        struct FutureCanonical<'a> {
+            v: u8,
+            script: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            timeout: Option<u64>,
+        }
+        let target = StoredTarget {
+            script: Some("echo stable".into()),
+            ..StoredTarget::default()
+        };
+        assert_eq!(
+            canonical_json(&target),
+            serde_json::to_vec(&FutureCanonical {
+                v: 1,
+                script: "echo stable",
+                timeout: None,
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn ac_t3_2_1_and_2_definition_character_contract() {
+        for forbidden in [
+            '\u{202e}', '\u{2066}', '\u{200b}', '\u{200d}', '\u{feff}', '\u{00ad}', '\u{2028}',
+            '\u{2029}', '\u{3164}', '\0', '\r',
+        ] {
+            let target = script_target(&format!("safe{forbidden}text"));
+            assert!(
+                validate_definition(&target).is_err(),
+                "accepted U+{:04X}",
+                forbidden as u32
+            );
+        }
+        let mut target = script_target("日本語　ok\tline\nCRLF\r\n😀");
+        target.dir = Some("C:\\通常".into());
+        target.env = BTreeMap::from([("NORMAL_KEY".into(), "通常の値 😀".into())]);
+        assert_eq!(validate_definition(&target), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn ac_t3_2_3_register_returns_position_and_codepoint_in_400() {
+        let dir = tempdir().unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "name": "bad-definition",
+            "script": "first\nabc\u{202e}def"
+        }))
+        .unwrap();
+        let response = handle_register(
+            State(test_state(dir.path().to_path_buf(), false)),
+            HeaderMap::new(),
+            body.into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("行 2 桁 4: U+202E"));
+        assert!(!dir.path().join("pending.toml").exists());
+        assert!(!dir.path().join("registered.toml").exists());
+    }
+
+    fn validate_targets_file(path: &Path) {
+        let source = std::fs::read_to_string(path).unwrap();
+        let file: TargetsFile = toml::from_str(&source).unwrap();
+        for (name, target) in file.targets {
+            validate_target_name(&name).unwrap();
+            validate_definition(&target).unwrap();
+        }
+    }
+
+    #[test]
+    fn ac_t3_2_4_real_or_synthetic_targets_fixture_passes() {
+        if let Some(path) = std::env::var_os("CLIPWIRE_TARGETS_FIXTURE") {
+            validate_targets_file(Path::new(&path));
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("targets.toml");
+        let long_ascii = format!("powershell -EncodedCommand {}", "QQ==".repeat(10_000));
+        let file = toml::to_string(&serde_json::json!({
+            "targets": {
+                "long-script": { "script": long_ascii },
+                "normal-steps": {
+                    "steps": [["pwsh", "-Command", "Write-Output '日本語 😀'"]],
+                    "env": { "NORMAL": "value" }
+                }
+            }
+        }))
+        .unwrap();
+        std::fs::write(&path, file).unwrap();
+        validate_targets_file(&path);
     }
 
     fn invalid_target_names() -> Vec<String> {

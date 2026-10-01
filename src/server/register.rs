@@ -27,6 +27,10 @@ pub(crate) async fn handle_register(
         return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response();
     }
 
+    if let Err(e) = validate_definition(&req.target) {
+        return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response();
+    }
+
     let entry = req.target;
     let pending_path = s.config_dir.join("pending.toml");
     let registered_path = s.config_dir.join("registered.toml");
