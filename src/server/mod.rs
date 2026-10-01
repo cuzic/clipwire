@@ -5,12 +5,16 @@ mod exec;
 mod http_surface;
 mod register;
 
+use crate::audit::AuditLog;
 use clip::*;
+#[cfg(test)]
 pub(crate) use exec::handle_exec;
 pub(crate) use http_surface::build_router;
 #[cfg(test)]
 pub(crate) use http_surface::{check_host_header, RouteClass, RouteId, ROUTES};
-pub(crate) use register::{handle_register, handle_targets_check};
+#[cfg(test)]
+pub(crate) use register::handle_register;
+pub(crate) use register::handle_targets_check;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
 pub(crate) enum HostCheckMode {
@@ -87,6 +91,7 @@ pub(crate) struct AppState {
     pub(crate) store: Store,
     pub(crate) auto_approve: bool,
     pub(crate) host_policy: HostPolicy,
+    pub(crate) audit: AuditLog,
 }
 
 // ── Logging / panic visibility (serve) ────────────────────────────────────────
@@ -495,6 +500,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         .migrate()
         .await
         .context("承認ストアを移行できません")?;
+    let audit = AuditLog::new(config_dir.clone());
     let state = AppState {
         clip_tx,
         token,
@@ -504,7 +510,15 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         config_dir,
         auto_approve: args.auto_approve,
         host_policy: build_host_policy(args.host_check, args.allow_host),
+        audit,
     };
+
+    let serve_start = crate::audit::serve_start_event(
+        crate::audit::audit_timestamp(SystemTime::now()),
+        args.auto_approve,
+        state.token.is_some(),
+    );
+    state.audit.record(serve_start);
 
     let app = build_router(state.clone());
 
@@ -562,7 +576,13 @@ pub(crate) async fn serve_forever(addr: SocketAddr, app: Router, label: &str) {
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
                 info!("Listening on http://{addr} ({label})");
-                if let Err(e) = axum::serve(listener, app.clone()).await {
+                if let Err(e) = axum::serve(
+                    listener,
+                    app.clone()
+                        .into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                {
                     warn!("{label} リスナー ({addr}) が停止しました: {e}。5秒後に再試行します");
                 }
             }

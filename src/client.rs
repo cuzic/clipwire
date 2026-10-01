@@ -384,7 +384,7 @@ pub(crate) fn cmd_show(args: &LocalTargetArgs) -> Result<()> {
 
 pub(crate) fn cmd_approve(args: &ApproveArgs) -> Result<()> {
     let config_dir = clipwire_config_dir();
-    let store = Store::new(config_dir);
+    let store = Store::new(config_dir.clone());
     let pending = store.pending()?;
     let entry = pending
         .get(&args.target)
@@ -399,14 +399,36 @@ pub(crate) fn cmd_approve(args: &ApproveArgs) -> Result<()> {
     }
     // The prompt is deliberately outside the lock. approve() reopens pending
     // under the lock and binds the write to the user-supplied hash prefix.
+    let hash = definition_hash(&canonical_json(entry));
     store.approve(&args.target, &args.hash)?;
+    let mut event = crate::audit::AuditEvent::new(crate::audit::AuditEventKind::Approve)
+        .target(&args.target, &hash);
+    event.approver = Some("local-user".into());
+    crate::audit::AuditLog::new(config_dir).record(event);
     println!("承認しました");
     Ok(())
 }
 
 pub(crate) fn cmd_deny(args: &DenyArgs) -> Result<()> {
-    Store::new(clipwire_config_dir()).deny(&args.target, args.hash.as_deref())?;
+    let config_dir = clipwire_config_dir();
+    let store = Store::new(config_dir.clone());
+    let pending = store.pending()?;
+    let entry = pending
+        .get(&args.target)
+        .with_context(|| format!("'{}' は pending にありません", args.target))?;
+    let hash = definition_hash(&canonical_json(entry));
+    store.deny(&args.target, args.hash.as_deref())?;
+    crate::audit::AuditLog::new(config_dir).record(
+        crate::audit::AuditEvent::new(crate::audit::AuditEventKind::Deny)
+            .target(&args.target, &hash),
+    );
     println!("拒否しました");
+    Ok(())
+}
+
+pub(crate) fn cmd_audit(args: &AuditArgs) -> Result<()> {
+    let path = clipwire_config_dir().join(crate::audit::AUDIT_FILE_NAME);
+    print!("{}", crate::audit::tail(&path, args.tail)?);
     Ok(())
 }
 

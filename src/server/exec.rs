@@ -1,12 +1,41 @@
 use super::*;
 use crate::exec_rhai::exec_rhai_with_deadline;
 use crate::runner::{resolve_timeout, valid_timeout, JobSpec, OrderedOutput, Runner};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{atomic::AtomicBool, Arc};
+use std::time::Instant;
 
+static NEXT_AUDIT_JOB_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) async fn handle_exec_http(
+    connect: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    handle_exec_with_ip(
+        state,
+        headers,
+        body,
+        connect.map(|value| value.0.ip().to_string()),
+    )
+    .await
+}
+
+#[cfg(test)]
 pub(crate) async fn handle_exec(
     State(s): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
+) -> Response {
+    handle_exec_with_ip(State(s), headers, body, None).await
+}
+
+async fn handle_exec_with_ip(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+    requester_ip: Option<String>,
 ) -> Response {
     if !check_auth(&s.token, &headers) {
         return unauthorized();
@@ -84,12 +113,29 @@ pub(crate) async fn handle_exec(
         }
     };
 
+    let def_hash = stored
+        .hash
+        .clone()
+        .unwrap_or_else(|| crate::config::definition_hash(&crate::config::canonical_json(&stored)));
     let (dir, payload) = match stored.into_exec() {
         Ok(v) => v,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
     };
 
-    match payload {
+    let job_id = format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT_AUDIT_JOB_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let started = Instant::now();
+    let mut start_event = crate::audit::AuditEvent::new(crate::audit::AuditEventKind::Start)
+        .target(&req.name, &def_hash)
+        .requester(requester_ip.clone());
+    start_event.job_id = Some(job_id.clone());
+    start_event.args = Some(req.timeout.into_iter().collect());
+    s.audit.record(start_event);
+
+    let response = match payload {
         ExecPayload::Steps { steps, env } => {
             let cancelled = Arc::new(AtomicBool::new(false));
             let deadline_cancelled = Arc::clone(&cancelled);
@@ -169,7 +215,35 @@ pub(crate) async fn handle_exec(
                     .into_response(),
             }
         }
+    };
+    let exit_code = response
+        .headers()
+        .get("X-Exit-Code")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(-1);
+    if exit_code == 124 {
+        for kind in [
+            crate::audit::AuditEventKind::Kill,
+            crate::audit::AuditEventKind::Timeout,
+        ] {
+            let mut event = crate::audit::AuditEvent::new(kind)
+                .target(&req.name, &def_hash)
+                .requester(requester_ip.clone());
+            event.job_id = Some(job_id.clone());
+            event.exit_code = Some(exit_code);
+            event.duration_ms = Some(crate::audit::duration_millis(started.elapsed()));
+            s.audit.record(event);
+        }
     }
+    let mut end_event = crate::audit::AuditEvent::new(crate::audit::AuditEventKind::End)
+        .target(&req.name, &def_hash)
+        .requester(requester_ip);
+    end_event.job_id = Some(job_id);
+    end_event.exit_code = Some(exit_code);
+    end_event.duration_ms = Some(crate::audit::duration_millis(started.elapsed()));
+    s.audit.record(end_event);
+    response
 }
 
 pub(crate) fn exec_response(body: Vec<u8>, exit_code: i32) -> Response {

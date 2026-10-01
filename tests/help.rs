@@ -53,6 +53,11 @@ const CASES: &[(&str, &[&str], &str)] = &[
         include_str!("fixtures/help/deny.txt"),
     ),
     (
+        "audit",
+        &["audit", "--help"],
+        include_str!("fixtures/help/audit.txt"),
+    ),
+    (
         "watchdog",
         &["watchdog", "--help"],
         include_str!("fixtures/help/watchdog.txt"),

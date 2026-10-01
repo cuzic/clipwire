@@ -1,5 +1,20 @@
 use super::*;
 
+pub(crate) async fn handle_register_http(
+    connect: Option<axum::extract::ConnectInfo<SocketAddr>>,
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    handle_register_with_ip(
+        state,
+        headers,
+        body,
+        connect.map(|value| value.0.ip().to_string()),
+    )
+    .await
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TargetDefinition {
@@ -65,10 +80,20 @@ fn parse_register_request(body: &[u8]) -> Result<(String, StoredTarget), String>
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn handle_register(
     State(s): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
+) -> Response {
+    handle_register_with_ip(State(s), headers, body, None).await
+}
+
+async fn handle_register_with_ip(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+    requester_ip: Option<String>,
 ) -> Response {
     if !check_auth(&s.token, &headers) {
         return unauthorized();
@@ -113,6 +138,19 @@ pub(crate) async fn handle_register(
     };
 
     let hash_line = format!("hash: {}\n", result.hash);
+
+    s.audit.record(
+        crate::audit::AuditEvent::new(crate::audit::AuditEventKind::Register)
+            .target(&name, &result.hash)
+            .requester(requester_ip.clone()),
+    );
+    if s.auto_approve {
+        let mut event = crate::audit::AuditEvent::new(crate::audit::AuditEventKind::Approve)
+            .target(&name, &result.hash)
+            .requester(requester_ip);
+        event.approver = Some("auto".into());
+        s.audit.record(event);
+    }
 
     if result.unchanged {
         return (

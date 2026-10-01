@@ -72,6 +72,8 @@ enum Cmd {
     Show(LocalTargetArgs),
     /// 承認待ちターゲットを拒否 (Windows ローカルで実行)
     Deny(DenyArgs),
+    /// ローカルの監査ログを末尾から表示
+    Audit(AuditArgs),
     /// /health を監視し、連続失敗時に動作確認済みの serve で復旧する (Windows)
     Watchdog(watchdog::WatchdogArgs),
 }
@@ -104,6 +106,13 @@ struct DenyArgs {
     /// 現在の pending 定義の sha256 ハッシュ (prefix 可)
     #[arg(long, value_name = "PREFIX")]
     hash: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct AuditArgs {
+    /// 表示する末尾の行数
+    #[arg(long, default_value = "50")]
+    tail: usize,
 }
 
 #[derive(Args, Debug)]
@@ -198,6 +207,7 @@ struct ExecArgs {
     timeout: Option<String>,
 }
 
+mod audit;
 mod client;
 mod config;
 mod exec_rhai;
@@ -265,6 +275,7 @@ fn main() -> Result<()> {
         Cmd::Pending => cmd_pending(),
         Cmd::Show(args) => cmd_show(&args),
         Cmd::Deny(args) => cmd_deny(&args),
+        Cmd::Audit(args) => cmd_audit(&args),
         Cmd::Watchdog(args) => watchdog::run_watchdog(args),
     }
 }
@@ -328,10 +339,11 @@ mod tests {
             token: None,
             allow_no_token: false,
             last_clip: Arc::new(Mutex::new(LastClip::default())),
-            config_dir,
+            config_dir: config_dir.clone(),
             store,
             auto_approve,
             host_policy: HostPolicy::default(),
+            audit: audit::AuditLog::new(config_dir),
         }
     }
 
@@ -348,10 +360,11 @@ mod tests {
             token: None,
             allow_no_token: false,
             last_clip: Arc::new(Mutex::new(LastClip::default())),
-            config_dir,
+            config_dir: config_dir.clone(),
             store,
             auto_approve: false,
             host_policy: HostPolicy::default(),
+            audit: audit::AuditLog::new(config_dir),
         }
     }
 
@@ -1944,5 +1957,243 @@ mod tests {
             let decoded = quick_xml::escape::unescape(&encoded.decode().unwrap()).unwrap().into_owned();
             prop_assert_eq!(decoded, value);
         }
+    }
+
+    fn audit_values(dir: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dir.join(audit::AUDIT_FILE_NAME))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn ac_t5_2_1_register_approve_exec_events_are_ordered_jsonl() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), false);
+        let response = handle_register(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"audit-flow","script":"()"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let target = state.store.pending().unwrap()["audit-flow"].clone();
+        let hash = definition_hash(&canonical_json(&target));
+        state.store.approve("audit-flow", &hash).unwrap();
+        let mut approval =
+            audit::AuditEvent::new(audit::AuditEventKind::Approve).target("audit-flow", &hash);
+        approval.approver = Some("local-user".into());
+        state.audit.record(approval);
+        let response = handle_exec(
+            State(state),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"audit-flow"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let values = audit_values(dir.path());
+        let events: Vec<_> = values
+            .iter()
+            .map(|value| value["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(events, ["register", "approve", "start", "end"]);
+    }
+
+    #[tokio::test]
+    async fn ac_t5_2_2_secrets_environment_and_child_output_are_not_audited() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        let secret_token = "TOKEN_DO_NOT_AUDIT";
+        let secret_env = "ENV_DO_NOT_AUDIT";
+        let secret_output = "OUTPUT_DO_NOT_AUDIT";
+        handle_register(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({
+                "name":"audit-secret", "script": format!("print(\"{secret_output}\");"),
+                "env":{"SECRET":secret_env}
+            }))
+            .unwrap()
+            .into(),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {secret_token}").parse().unwrap(),
+        );
+        let response = handle_exec(
+            State(state),
+            headers,
+            serde_json::to_vec(&serde_json::json!({"name":"audit-secret"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains(secret_output));
+        let log = std::fs::read_to_string(dir.path().join(audit::AUDIT_FILE_NAME)).unwrap();
+        for secret in [secret_token, secret_env, secret_output] {
+            assert!(!log.contains(secret));
+        }
+    }
+
+    #[test]
+    fn ac_t5_2_3_rotates_at_ten_mib_and_keeps_one_generation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(audit::AUDIT_FILE_NAME);
+        std::fs::write(&path, vec![b'x'; audit::AUDIT_ROTATE_BYTES as usize]).unwrap();
+        let log = audit::AuditLog::new(dir.path().to_path_buf());
+        log.record(audit::AuditEvent::new(audit::AuditEventKind::Start));
+        assert_eq!(
+            std::fs::metadata(dir.path().join(audit::AUDIT_ROTATED_FILE_NAME))
+                .unwrap()
+                .len(),
+            audit::AUDIT_ROTATE_BYTES
+        );
+        std::fs::write(&path, vec![b'y'; audit::AUDIT_ROTATE_BYTES as usize]).unwrap();
+        log.record(audit::AuditEvent::new(audit::AuditEventKind::End));
+        assert_eq!(
+            std::fs::read(dir.path().join(audit::AUDIT_ROTATED_FILE_NAME)).unwrap()[0],
+            b'y'
+        );
+        assert!(!dir.path().join("audit.2.jsonl").exists());
+    }
+
+    #[derive(Default)]
+    struct WarningRecorder(std::sync::atomic::AtomicUsize);
+
+    impl audit::ApprovalAuditWarning for WarningRecorder {
+        fn warn(&self, _message: &str) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_t5_2_4_audit_failure_does_not_stop_exec_and_warns_for_approval() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        state
+            .store
+            .register("audit-io".into(), script_target("()"), true)
+            .await
+            .unwrap();
+        let invalid_root = dir.path().join("not-a-directory");
+        std::fs::write(&invalid_root, b"file").unwrap();
+        let warning = Arc::new(WarningRecorder::default());
+        let mut state = state;
+        state.audit = audit::AuditLog::with_warning(invalid_root, warning.clone());
+        state
+            .audit
+            .record(audit::AuditEvent::new(audit::AuditEventKind::Approve));
+        assert_eq!(warning.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let response = handle_exec(
+            State(state),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"audit-io"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn ac_t5_2_5_audit_is_not_an_http_route() {
+        assert!(ROUTES.iter().all(|route| route.path != "/audit"));
+    }
+
+    #[tokio::test]
+    async fn ac_t5_2_6_def_hash_recovers_the_approved_definition() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        handle_register(
+            State(state),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"recover","script":"let x = 1;"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        let event = &audit_values(dir.path())[0];
+        let digest = event["def_hash"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap();
+        let approved =
+            std::fs::read(dir.path().join("approved").join(format!("{digest}.json"))).unwrap();
+        let expected = canonical_json(&script_target("let x = 1;"));
+        assert_eq!(approved, expected);
+    }
+
+    #[tokio::test]
+    async fn ac_t5_2_7_auto_approve_records_auto_approver_and_approval_record() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        handle_register(
+            State(state),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"automatic","script":"()"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        let values = audit_values(dir.path());
+        assert_eq!(values[1]["event"], "approve");
+        assert_eq!(values[1]["approver"], "auto");
+        let digest = values[1]["def_hash"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap();
+        assert!(dir
+            .path()
+            .join("approved")
+            .join(format!("{digest}.json"))
+            .exists());
+    }
+
+    #[test]
+    fn ac_t5_2_8_auto_approve_serve_start_is_audited() {
+        let dir = tempdir().unwrap();
+        let log = audit::AuditLog::new(dir.path().to_path_buf());
+        log.record(audit::serve_start_event(123, true, true));
+        let value = &audit_values(dir.path())[0];
+        assert_eq!(value["event"], "serve-start");
+        assert_eq!(value["auto_approve"], true);
+        assert_eq!(value["auth"], "token");
+    }
+
+    #[tokio::test]
+    async fn ac_t5_2_9_1571_auto_approved_registers_finish_with_valid_json_under_60s() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        let started = std::time::Instant::now();
+        for _ in 0..1571 {
+            let response = handle_register(
+                State(state.clone()),
+                HeaderMap::new(),
+                serde_json::to_vec(
+                    &serde_json::json!({"name":"bulk-register","script":"let x = 1;"}),
+                )
+                .unwrap()
+                .into(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let elapsed = started.elapsed();
+        // 2026-10-01, Linux debug test run in this repository: 1.63 seconds.
+        assert!(elapsed < Duration::from_secs(60), "elapsed={elapsed:?}");
+        let values = audit_values(dir.path());
+        assert_eq!(values.len(), 1571 * 2);
     }
 }
