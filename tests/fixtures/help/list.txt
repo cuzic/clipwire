@@ -1,0 +1,7 @@
+ローカルと Windows のターゲット状態を表示
+
+Usage: clipwire list [OPTIONS]
+
+Options:
+      --json  安定した JSON 形式で表示
+  -h, --help  Print help

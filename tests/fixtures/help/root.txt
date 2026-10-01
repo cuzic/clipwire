@@ -9,6 +9,8 @@ Commands:
   open      Windows のデフォルトブラウザで Web サービスを開く
   exec      登録済みターゲットを Windows で実行して結果を取得
   jobs      ジョブ一覧を表示
+  list      ローカルと Windows のターゲット状態を表示
+  status    ターゲット状態、実行中ジョブ、サーバー情報を表示
   logs      ジョブのログを表示
   kill      実行中のジョブを終了
   register  ターゲットの定義を Windows に送って承認待ちに追加

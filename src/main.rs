@@ -64,6 +64,10 @@ enum Cmd {
     Exec(ExecArgs),
     /// ジョブ一覧を表示
     Jobs,
+    /// ローカルと Windows のターゲット状態を表示
+    List(ListArgs),
+    /// ターゲット状態、実行中ジョブ、サーバー情報を表示
+    Status,
     /// ジョブのログを表示
     Logs(JobIdArgs),
     /// 実行中のジョブを終了
@@ -88,6 +92,13 @@ enum Cmd {
 struct RegisterArgs {
     /// 登録するターゲット名 (~/.config/clipwire/targets.toml で定義)
     target: String,
+}
+
+#[derive(Args, Debug)]
+struct ListArgs {
+    /// 安定した JSON 形式で表示
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -302,6 +313,14 @@ fn main() -> Result<()> {
         Cmd::Jobs => {
             let cfg = ClientConfig::from_env()?;
             cmd_jobs(&cfg)
+        }
+        Cmd::List(args) => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_list(&cfg, &args)
+        }
+        Cmd::Status => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_status(&cfg)
         }
         Cmd::Logs(args) => {
             let cfg = ClientConfig::from_env()?;
@@ -1954,6 +1973,7 @@ mod tests {
         let target = script_target("echo compatible");
         let old = client::ServerCapabilities::default();
         let new = client::ServerCapabilities {
+            version: "test".into(),
             proto: 2,
             features: vec!["hash".into()],
         };

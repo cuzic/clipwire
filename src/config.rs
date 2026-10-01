@@ -270,15 +270,18 @@ pub(crate) fn save_target_map(path: &Path, map: &TargetMap) -> Result<()> {
 
 #[derive(serde::Deserialize)]
 pub(crate) struct TargetsFile {
-    pub(crate) targets: std::collections::HashMap<String, StoredTarget>,
+    pub(crate) targets: std::collections::BTreeMap<String, StoredTarget>,
 }
 
-pub(crate) fn load_exec_target(name: &str) -> Result<StoredTarget> {
+pub(crate) fn load_local_targets() -> Result<std::collections::BTreeMap<String, StoredTarget>> {
     let path = clipwire_config_dir().join("targets.toml");
     let src = std::fs::read_to_string(&path)
         .with_context(|| format!("設定ファイルが見つかりません: {}", path.display()))?;
-    let file: TargetsFile = toml::from_str(&src)?;
-    file.targets
+    Ok(toml::from_str::<TargetsFile>(&src)?.targets)
+}
+
+pub(crate) fn load_exec_target(name: &str) -> Result<StoredTarget> {
+    load_local_targets()?
         .into_iter()
         .find(|(k, _)| k == name)
         .map(|(_, v)| v)

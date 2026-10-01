@@ -33,11 +33,32 @@ impl ClientConfig {
     }
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 pub(crate) struct ServerCapabilities {
+    #[serde(default = "unknown_server_version")]
+    pub(crate) version: String,
+    #[serde(default = "legacy_protocol_version")]
     pub(crate) proto: u32,
     #[serde(default)]
     pub(crate) features: Vec<String>,
+}
+
+fn unknown_server_version() -> String {
+    "unknown".into()
+}
+
+const fn legacy_protocol_version() -> u32 {
+    1
+}
+
+impl Default for ServerCapabilities {
+    fn default() -> Self {
+        Self {
+            version: unknown_server_version(),
+            proto: legacy_protocol_version(),
+            features: Vec::new(),
+        }
+    }
 }
 
 fn discover_capabilities(cfg: &ClientConfig) -> ServerCapabilities {
@@ -60,6 +81,351 @@ fn discover_capabilities(cfg: &ClientConfig) -> ServerCapabilities {
         .ok()
         .and_then(|body| serde_json::from_str::<ServerCapabilities>(&body).ok())
         .unwrap_or_default()
+}
+
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TargetState {
+    Ok,
+    Changed,
+    Pending,
+    Unregistered,
+    RemoteOnly,
+}
+
+impl TargetState {
+    const ALL: [Self; 5] = [
+        Self::Ok,
+        Self::Changed,
+        Self::Pending,
+        Self::Unregistered,
+        Self::RemoteOnly,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Changed => "changed",
+            Self::Pending => "pending",
+            Self::Unregistered => "unregistered",
+            Self::RemoteOnly => "remote-only",
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CheckTarget {
+    #[serde(rename = "status")]
+    state: TargetState,
+    hash: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CheckResponse {
+    targets: std::collections::BTreeMap<String, CheckTarget>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ListEntry {
+    name: String,
+    state: TargetState,
+    hash: String,
+}
+
+fn list_entries(response: CheckResponse) -> Vec<ListEntry> {
+    response
+        .targets
+        .into_iter()
+        .map(|(name, target)| ListEntry {
+            name,
+            state: target.state,
+            hash: target.hash,
+        })
+        .collect()
+}
+
+fn state_counts(entries: &[ListEntry]) -> [(TargetState, usize); 5] {
+    TargetState::ALL.map(|state| {
+        let count = entries.iter().filter(|entry| entry.state == state).count();
+        (state, count)
+    })
+}
+
+fn format_target_list(entries: &[ListEntry]) -> String {
+    let mut output = String::from("NAME\tSTATE\tHASH\n");
+    for entry in entries {
+        output.push_str(&format!(
+            "{}\t{}\t{}\n",
+            entry.name,
+            entry.state.label(),
+            entry.hash
+        ));
+    }
+    output.push_str("集計:");
+    for (state, count) in state_counts(entries) {
+        output.push_str(&format!(" {}={count}", state.label()));
+    }
+    output.push('\n');
+    output
+}
+
+fn format_target_json(entries: &[ListEntry]) -> Result<String> {
+    Ok(serde_json::to_string_pretty(entries)?)
+}
+
+fn is_unsupported_status(status: u16) -> bool {
+    status == 404
+}
+
+fn fetch_target_list(cfg: &ClientConfig) -> Result<Vec<ListEntry>> {
+    let targets = load_local_targets()?;
+    check_targets(cfg, &targets)
+}
+
+fn check_targets(
+    cfg: &ClientConfig,
+    targets: &std::collections::BTreeMap<String, StoredTarget>,
+) -> Result<Vec<ListEntry>> {
+    let body = serde_json::json!({ "targets": targets }).to_string();
+    let url = format!("{}/targets/check", cfg.base_url());
+    let response = match cfg
+        .set_auth(
+            ureq::post(&url)
+                .set("Content-Type", "application/json")
+                .timeout(Duration::from_secs(30)),
+        )
+        .send_string(&body)
+    {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, _)) if is_unsupported_status(code) => {
+            bail!("サーバが未対応: /targets/check")
+        }
+        Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
+        Err(ureq::Error::Status(code, response)) => bail!(
+            "HTTP {}: {}",
+            code,
+            response.into_string().unwrap_or_default().trim()
+        ),
+        Err(error) => bail!("{} に接続できません: {}", cfg.base_url(), error),
+    };
+    let response: CheckResponse = serde_json::from_reader(response.into_reader())?;
+    Ok(list_entries(response))
+}
+
+pub(crate) fn cmd_list(cfg: &ClientConfig, args: &ListArgs) -> Result<()> {
+    let entries = fetch_target_list(cfg)?;
+    if args.json {
+        println!("{}", format_target_json(&entries)?);
+    } else {
+        print!("{}", format_target_list(&entries));
+    }
+    Ok(())
+}
+
+fn running_jobs(cfg: &ClientConfig) -> Result<Vec<crate::jobs::JobMeta>> {
+    let url = format!("{}/jobs?state=running", cfg.base_url());
+    let response = match cfg
+        .set_auth(ureq::get(&url).timeout(Duration::from_secs(30)))
+        .call()
+    {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, _)) if is_unsupported_status(code) => {
+            bail!("ジョブ API 未対応")
+        }
+        Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
+        Err(ureq::Error::Status(code, response)) => bail!(
+            "HTTP {}: {}",
+            code,
+            response.into_string().unwrap_or_default().trim()
+        ),
+        Err(error) => bail!("{} に接続できません: {}", cfg.base_url(), error),
+    };
+    Ok(serde_json::from_reader(response.into_reader())?)
+}
+
+fn format_server(capabilities: &ServerCapabilities) -> String {
+    let features = if capabilities.features.is_empty() {
+        "なし".into()
+    } else {
+        capabilities.features.join(",")
+    };
+    format!(
+        "サーバー: version={} proto={} features={}\n",
+        capabilities.version, capabilities.proto, features
+    )
+}
+
+fn format_running_jobs(jobs: &[crate::jobs::JobMeta]) -> String {
+    if jobs.is_empty() {
+        return "実行中ジョブ: なし\n".into();
+    }
+    let mut output = String::from("実行中ジョブ:\nID\tTARGET\n");
+    for job in jobs {
+        output.push_str(&format!("{}\t{}\n", job.id, job.target));
+    }
+    output
+}
+
+pub(crate) fn cmd_status(cfg: &ClientConfig) -> Result<()> {
+    let capabilities = discover_capabilities(cfg);
+    let entries = fetch_target_list(cfg)?;
+    let jobs = running_jobs(cfg)?;
+    print!("{}", format_server(&capabilities));
+    print!("{}", format_target_list(&entries));
+    print!("{}", format_running_jobs(&jobs));
+    Ok(())
+}
+
+#[cfg(test)]
+mod list_status_tests {
+    use super::*;
+
+    fn all_states() -> Vec<ListEntry> {
+        [
+            ("changed-target", TargetState::Changed, "sha256:changed"),
+            ("ok-target", TargetState::Ok, "sha256:ok"),
+            ("pending-target", TargetState::Pending, "sha256:pending"),
+            ("remote-target", TargetState::RemoteOnly, "sha256:remote"),
+            (
+                "unregistered-target",
+                TargetState::Unregistered,
+                "sha256:unregistered",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, state, hash)| ListEntry {
+            name: name.into(),
+            state,
+            hash: hash.into(),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn ac_t7_2_1_all_states_and_counts_are_table_driven() {
+        let rendered = format_target_list(&all_states());
+        for state in TargetState::ALL {
+            assert!(rendered.contains(&format!("{}=1", state.label())));
+            assert!(rendered.contains(state.label()));
+        }
+    }
+
+    #[test]
+    fn ac_t7_2_2_json_matches_golden_schema() {
+        let rendered = format!("{}\n", format_target_json(&all_states()).unwrap());
+        assert_eq!(rendered, include_str!("../tests/fixtures/list.json"));
+    }
+
+    #[test]
+    fn ac_t7_2_3_unsupported_detection_is_pure() {
+        assert!(is_unsupported_status(404));
+        assert!(!is_unsupported_status(401));
+        assert!(!is_unsupported_status(500));
+    }
+
+    #[test]
+    fn ac_t7_3_1_running_job_empty_display() {
+        assert_eq!(format_running_jobs(&[]), "実行中ジョブ: なし\n");
+        let job = crate::jobs::JobMeta {
+            id: "01TEST".into(),
+            target: "build".into(),
+            def_hash: "sha256:test".into(),
+            started_at: 1,
+            ended_at: None,
+            state: crate::jobs::JobStatus::Running,
+            exit_code: None,
+            requester: None,
+            child: None,
+            detached: false,
+        };
+        assert_eq!(
+            format_running_jobs(&[job]),
+            "実行中ジョブ:\nID\tTARGET\n01TEST\tbuild\n"
+        );
+    }
+
+    #[test]
+    fn ac_t7_3_2_health_defaults_missing_proto_to_one() {
+        let capabilities: ServerCapabilities =
+            serde_json::from_str(r#"{"version":"old","features":[]}"#).unwrap();
+        assert_eq!(capabilities.proto, 1);
+        assert_eq!(
+            format_server(&capabilities),
+            "サーバー: version=old proto=1 features=なし\n"
+        );
+    }
+
+    fn one_response_server(
+        status: &'static str,
+        body: &'static str,
+    ) -> Option<(ClientConfig, std::thread::JoinHandle<()>)> {
+        use std::io::{Read, Write};
+        let listener = match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("bind mock server: {error}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        Some((
+            ClientConfig {
+                host: std::net::Ipv4Addr::LOCALHOST.to_string(),
+                port,
+                token: None,
+            },
+            server,
+        ))
+    }
+
+    #[test]
+    fn ac_t7_2_1_mock_server_returns_all_five_states() {
+        let body = r#"{"targets":{"a":{"status":"ok","hash":"h1"},"b":{"status":"changed","hash":"h2"},"c":{"status":"pending","hash":"h3"},"d":{"status":"unregistered","hash":"h4"},"e":{"status":"remote-only","hash":"h5"}}}"#;
+        let Some((cfg, server)) = one_response_server("200 OK", body) else {
+            return;
+        };
+        let entries = check_targets(&cfg, &std::collections::BTreeMap::new()).unwrap();
+        assert_eq!(state_counts(&entries).map(|(_, count)| count), [1; 5]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn ac_t7_2_3_mock_server_404_is_an_error() {
+        let Some((cfg, server)) = one_response_server("404 Not Found", "") else {
+            return;
+        };
+        let error = check_targets(&cfg, &std::collections::BTreeMap::new()).unwrap_err();
+        assert!(error.to_string().contains("サーバが未対応"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn ac_t7_3_1_mock_jobs_supports_running_and_empty() {
+        for (body, expected) in [
+            ("[]", "実行中ジョブ: なし\n"),
+            (
+                r#"[{"id":"J1","target":"build","def_hash":"h","started_at":1,"state":"running","detached":false}]"#,
+                "実行中ジョブ:\nID\tTARGET\nJ1\tbuild\n",
+            ),
+        ] {
+            let Some((cfg, server)) = one_response_server("200 OK", body) else {
+                return;
+            };
+            let jobs = running_jobs(&cfg).unwrap();
+            assert_eq!(format_running_jobs(&jobs), expected);
+            server.join().unwrap();
+        }
+    }
 }
 
 pub(crate) fn require_features(capabilities: &ServerCapabilities, required: &[&str]) -> Result<()> {

@@ -1,0 +1,6 @@
+ターゲット状態、実行中ジョブ、サーバー情報を表示
+
+Usage: clipwire status
+
+Options:
+  -h, --help  Print help
