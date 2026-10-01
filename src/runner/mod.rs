@@ -136,6 +136,9 @@ impl Runner {
                 spec,
             }),
             Err(error) => {
+                // Command が書き込み側ハンドルを保持したままだとリレーは EOF にならない。
+                // Unix では無通信 2 秒で抜けるが、Windows では永久に待つ。
+                drop(command);
                 if let Some(relay) = relay {
                     relay.finish()?;
                 }
@@ -495,6 +498,20 @@ mod tests {
             missing.spawn_error().unwrap().kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn spawn_failure_returns_without_waiting_for_the_idle_timeout() {
+        // Command が書き込みハンドルを保持したままリレーを待つと、EOF にならず
+        // 無通信タイムアウト(Windows では無限)まで固まる。
+        let temp = tempfile::tempdir().unwrap();
+        let runner = Runner::new(temp.path());
+        let started = Instant::now();
+        let missing = runner
+            .spawn(JobSpec::new("clipwire-command-that-does-not-exist", "test"))
+            .unwrap();
+        assert_eq!(missing.state(), JobState::SpawnFailed);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
