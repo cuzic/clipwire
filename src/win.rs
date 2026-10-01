@@ -513,8 +513,9 @@ pub(crate) mod win_clip {
         {
             // The toast never holds the store lock while waiting for user input.
             // Re-open and mutate the current pending entry only after activation.
+            let hash = super::definition_hash(&super::canonical_json(&entry));
             drop(entry);
-            super::Store::new(config_dir).approve(&name, None)?;
+            super::Store::new(config_dir).approve(&name, &hash)?;
             eprintln!("[clipwire] '{}' 承認 → registered.toml", name);
             show_balloon(&format!("'{}' を承認しました", name));
         }

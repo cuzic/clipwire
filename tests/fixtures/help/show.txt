@@ -1,0 +1,9 @@
+承認待ちターゲットの定義全文を表示 (Windows ローカルで実行)
+
+Usage: clipwire show <TARGET>
+
+Arguments:
+  <TARGET>  承認待ちターゲット名
+
+Options:
+  -h, --help  Print help

@@ -136,23 +136,45 @@ impl Store {
         .context("store worker panicked")?
     }
 
-    pub(crate) fn approve(&self, name: &str, dir: Option<&str>) -> Result<()> {
+    pub(crate) fn pending(&self) -> Result<TargetMap> {
+        with_store_lock(&self.root, LOCK_TIMEOUT, || {
+            load_for_update(&self.root.join("pending.toml"))
+        })
+    }
+
+    pub(crate) fn approve(&self, name: &str, expected_hash: &str) -> Result<()> {
         with_store_lock(&self.root, LOCK_TIMEOUT, || {
             let pending_path = self.root.join("pending.toml");
             let registered_path = self.root.join("registered.toml");
             let mut pending = load_for_update(&pending_path)?;
-            let mut entry = pending
-                .remove(name)
+            let entry = pending
+                .get(name)
+                .cloned()
                 .with_context(|| format!("'{name}' は pending にありません"))?;
-            if let Some(dir) = dir {
-                entry.dir = Some(dir.to_owned());
-            }
             let canonical = canonical_json(&entry);
             let hash = definition_hash(&canonical);
+            ensure_hash_matches(expected_hash, &hash)?;
             let entry = approve_target(&self.root, entry, &canonical, &hash)?;
             let mut registered = load_for_update(&registered_path)?;
             registered.insert(name.to_owned(), entry);
+            pending.remove(name);
             atomic_save_target_map(&registered_path, &registered)?;
+            atomic_save_target_map(&pending_path, &pending)
+        })
+    }
+
+    pub(crate) fn deny(&self, name: &str, expected_hash: Option<&str>) -> Result<()> {
+        with_store_lock(&self.root, LOCK_TIMEOUT, || {
+            let pending_path = self.root.join("pending.toml");
+            let mut pending = load_for_update(&pending_path)?;
+            let entry = pending
+                .get(name)
+                .with_context(|| format!("'{name}' は pending にありません"))?;
+            if let Some(expected_hash) = expected_hash {
+                let hash = definition_hash(&canonical_json(entry));
+                ensure_hash_matches(expected_hash, &hash)?;
+            }
+            pending.remove(name);
             atomic_save_target_map(&pending_path, &pending)
         })
     }
@@ -230,6 +252,19 @@ impl Store {
         })
         .await
         .context("store check worker panicked")?
+    }
+}
+
+fn ensure_hash_matches(prefix: &str, hash: &str) -> Result<()> {
+    let prefix = prefix.strip_prefix("sha256:").unwrap_or(prefix);
+    let digest = hash.strip_prefix("sha256:").unwrap_or(hash);
+    if !prefix.is_empty()
+        && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && digest.starts_with(&prefix.to_ascii_lowercase())
+    {
+        Ok(())
+    } else {
+        bail!("指定されたハッシュ prefix は現在の pending 定義と一致しません")
     }
 }
 
@@ -809,5 +844,68 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(store.verified_target("item").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn ac_t3_8_1_3_approve_is_hash_bound_and_rechecks_current_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        store
+            .register("demo".into(), target("echo first"), false)
+            .await
+            .unwrap();
+        let first_hash = definition_hash(&canonical_json(
+            store.pending().unwrap().get("demo").unwrap(),
+        ));
+
+        assert!(store.approve("demo", "deadbeef").is_err());
+        assert!(store.pending().unwrap().contains_key("demo"));
+
+        // Simulate a re-register while the CLI confirmation prompt is open.
+        store
+            .register("demo".into(), target("echo second"), false)
+            .await
+            .unwrap();
+        assert!(store.approve("demo", &first_hash).is_err());
+        assert_eq!(
+            store
+                .pending()
+                .unwrap()
+                .get("demo")
+                .unwrap()
+                .script
+                .as_deref(),
+            Some("echo second")
+        );
+
+        let current_hash = definition_hash(&canonical_json(
+            store.pending().unwrap().get("demo").unwrap(),
+        ));
+        store.approve("demo", &current_hash[7..19]).unwrap();
+        assert!(!store.pending().unwrap().contains_key("demo"));
+        assert!(store.verified_target("demo").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn ac_t3_8_5_deny_only_removes_matching_pending_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        store
+            .register("kept".into(), target("echo approved"), true)
+            .await
+            .unwrap();
+        store
+            .register("denied".into(), target("echo pending"), false)
+            .await
+            .unwrap();
+
+        assert!(store.deny("denied", Some("badbad")).is_err());
+        assert!(store.pending().unwrap().contains_key("denied"));
+        let hash = definition_hash(&canonical_json(
+            store.pending().unwrap().get("denied").unwrap(),
+        ));
+        store.deny("denied", Some(&hash)).unwrap();
+        assert!(!store.pending().unwrap().contains_key("denied"));
+        assert!(store.verified_target("kept").unwrap().is_some());
     }
 }

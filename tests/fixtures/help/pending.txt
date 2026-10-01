@@ -1,0 +1,6 @@
+承認待ちターゲットの一覧を表示 (Windows ローカルで実行)
+
+Usage: clipwire pending
+
+Options:
+  -h, --help  Print help

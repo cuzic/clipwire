@@ -66,6 +66,12 @@ enum Cmd {
     Register(RegisterArgs),
     /// 承認待ちターゲットを承認して registered.toml に保存 (Windows ローカルで実行)
     Approve(ApproveArgs),
+    /// 承認待ちターゲットの一覧を表示 (Windows ローカルで実行)
+    Pending,
+    /// 承認待ちターゲットの定義全文を表示 (Windows ローカルで実行)
+    Show(LocalTargetArgs),
+    /// 承認待ちターゲットを拒否 (Windows ローカルで実行)
+    Deny(DenyArgs),
     /// /health を監視し、連続失敗時に動作確認済みの serve で復旧する (Windows)
     Watchdog(watchdog::WatchdogArgs),
 }
@@ -78,11 +84,26 @@ struct RegisterArgs {
 
 #[derive(Args, Debug)]
 struct ApproveArgs {
-    /// 承認するターゲット名 (省略時は pending 一覧を表示)
-    target: Option<String>,
-    /// 実行ディレクトリ (Windows パス)
-    #[arg(long, short)]
-    dir: Option<String>,
+    /// 承認するターゲット名
+    target: String,
+    /// 現在の pending 定義の sha256 ハッシュ (prefix 可)
+    #[arg(long, value_name = "PREFIX", required = true)]
+    hash: String,
+}
+
+#[derive(Args, Debug)]
+struct LocalTargetArgs {
+    /// 承認待ちターゲット名
+    target: String,
+}
+
+#[derive(Args, Debug)]
+struct DenyArgs {
+    /// 拒否するターゲット名
+    target: String,
+    /// 現在の pending 定義の sha256 ハッシュ (prefix 可)
+    #[arg(long, value_name = "PREFIX")]
+    hash: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -234,6 +255,9 @@ fn main() -> Result<()> {
             cmd_register(&cfg, &args)
         }
         Cmd::Approve(args) => cmd_approve(&args),
+        Cmd::Pending => cmd_pending(),
+        Cmd::Show(args) => cmd_show(&args),
+        Cmd::Deny(args) => cmd_deny(&args),
         Cmd::Watchdog(args) => watchdog::run_watchdog(args),
     }
 }
@@ -416,6 +440,28 @@ mod tests {
         };
         assert_eq!(args.host_check, HostCheckMode::Log);
         assert_eq!(args.allow_host, ["foo", "BAR"]);
+    }
+
+    #[test]
+    fn ac_t3_8_2_approve_requires_hash_and_dir_is_removed() {
+        assert!(Cli::try_parse_from(["clipwire", "approve", "demo"]).is_err());
+        assert!(Cli::try_parse_from(["clipwire", "approve", "demo", "--hash", "0123"]).is_ok());
+        let error = Cli::try_parse_from([
+            "clipwire", "approve", "demo", "--hash", "0123", "--dir", "C:\\tmp",
+        ])
+        .err()
+        .expect("--dir must be rejected");
+        assert!(error.to_string().contains("--dir"));
+    }
+
+    #[test]
+    fn ac_t3_8_4_http_routes_have_no_approval_or_denial_endpoint() {
+        assert!(ROUTES.iter().all(|route| {
+            !route.path.contains("approve")
+                && !route.path.contains("deny")
+                && !route.path.contains("pending")
+                && !route.path.contains("show")
+        }));
     }
 
     #[tokio::test]

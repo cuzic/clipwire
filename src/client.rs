@@ -315,52 +315,77 @@ pub(crate) fn cmd_register(cfg: &ClientConfig, args: &RegisterArgs) -> Result<()
     }
 }
 
-// ── Local: approve (Windows 側で実行) ────────────────────────────────────────
+// ── Local approval commands (Windows 側で実行) ───────────────────────────────
+
+fn print_target(name: &str, entry: &StoredTarget) {
+    println!("=== {name} ===");
+    println!("hash:   {}", definition_hash(&canonical_json(entry)));
+    if let Some(ref d) = entry.dir {
+        println!("dir:    {d}");
+    }
+    if let Some(ref s) = entry.script {
+        println!("script:\n{s}");
+    } else if let Some(ref steps) = entry.steps {
+        let lines = match steps {
+            StepsDef::Text(s) => s.to_string(),
+            StepsDef::Argv(v) => v.iter().map(|a| a.join(" ")).collect::<Vec<_>>().join("\n"),
+        };
+        println!("steps:\n{lines}");
+    }
+    if !entry.env.is_empty() {
+        println!("env:");
+        for (key, value) in &entry.env {
+            println!("  {key}={value}");
+        }
+    }
+}
+
+pub(crate) fn cmd_pending() -> Result<()> {
+    let pending = Store::new(clipwire_config_dir()).pending()?;
+    if pending.is_empty() {
+        println!("承認待ちのターゲットはありません");
+    } else {
+        for (name, target) in pending {
+            println!("{}  {}", definition_hash(&canonical_json(&target)), name);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_show(args: &LocalTargetArgs) -> Result<()> {
+    let pending = Store::new(clipwire_config_dir()).pending()?;
+    let entry = pending
+        .get(&args.target)
+        .with_context(|| format!("'{}' は pending にありません", args.target))?;
+    print_target(&args.target, entry);
+    Ok(())
+}
 
 pub(crate) fn cmd_approve(args: &ApproveArgs) -> Result<()> {
     let config_dir = clipwire_config_dir();
-    let pending_path = config_dir.join("pending.toml");
-    let mut pending = load_target_map(&pending_path)?;
-
-    if args.target.is_none() {
-        if pending.is_empty() {
-            println!("承認待ちのターゲットはありません");
-        } else {
-            for name in pending.keys() {
-                println!("{name}");
-            }
-        }
-        return Ok(());
+    let store = Store::new(config_dir);
+    let pending = store.pending()?;
+    let entry = pending
+        .get(&args.target)
+        .with_context(|| format!("'{}' は pending にありません", args.target))?;
+    print_target(&args.target, entry);
+    print!("承認しますか? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if !answer.trim().eq_ignore_ascii_case("y") {
+        bail!("承認を中止しました");
     }
-
-    let name = args.target.as_ref().unwrap();
-    let mut entry = pending
-        .remove(name)
-        .with_context(|| format!("'{}' は pending にありません", name))?;
-
-    if let Some(ref d) = args.dir {
-        entry.dir = Some(d.clone());
-    }
-
-    // 承認内容を表示
-    println!("=== {} ===", name);
-    if let Some(ref d) = entry.dir {
-        println!("dir:    {}", d);
-    }
-    if let Some(ref s) = entry.script {
-        println!("script:\n{}", s.trim());
-    } else if let Some(ref steps) = entry.steps {
-        let lines = match steps {
-            StepsDef::Text(s) => s.trim().to_string(),
-            StepsDef::Argv(v) => v.iter().map(|a| a.join(" ")).collect::<Vec<_>>().join("\n"),
-        };
-        println!("steps:\n{}", lines);
-    }
-
-    drop(entry);
-    drop(pending);
-    Store::new(config_dir).approve(name, args.dir.as_deref())?;
+    // The prompt is deliberately outside the lock. approve() reopens pending
+    // under the lock and binds the write to the user-supplied hash prefix.
+    store.approve(&args.target, &args.hash)?;
     println!("承認しました");
+    Ok(())
+}
+
+pub(crate) fn cmd_deny(args: &DenyArgs) -> Result<()> {
+    Store::new(clipwire_config_dir()).deny(&args.target, args.hash.as_deref())?;
+    println!("拒否しました");
     Ok(())
 }
 

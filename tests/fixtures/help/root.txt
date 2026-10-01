@@ -10,6 +10,9 @@ Commands:
   exec      登録済みターゲットを Windows で実行して結果を取得
   register  ターゲットの定義を Windows に送って承認待ちに追加
   approve   承認待ちターゲットを承認して registered.toml に保存 (Windows ローカルで実行)
+  pending   承認待ちターゲットの一覧を表示 (Windows ローカルで実行)
+  show      承認待ちターゲットの定義全文を表示 (Windows ローカルで実行)
+  deny      承認待ちターゲットを拒否 (Windows ローカルで実行)
   watchdog  /health を監視し、連続失敗時に動作確認済みの serve で復旧する (Windows)
   help      Print this message or the help of the given subcommand(s)
 
