@@ -15,6 +15,9 @@ use std::{
 };
 
 #[cfg(not(windows))]
+use std::time::Instant;
+
+#[cfg(not(windows))]
 mod unix;
 #[cfg(windows)]
 mod windows;
@@ -25,6 +28,9 @@ use unix::OsProcessGroup;
 use windows::OsProcessGroup;
 
 static NEXT_LOG_ID: AtomicU64 = AtomicU64::new(0);
+const LOG_SOFT_LIMIT: usize = 10 * 1024 * 1024;
+const LOG_LIMIT_MARKER: &[u8] = b"[output > 10 MiB: further output discarded]\n";
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub(crate) struct JobSpec {
@@ -68,6 +74,13 @@ pub(crate) struct Runner {
     output: Option<OrderedOutput>,
 }
 
+impl Default for Runner {
+    fn default() -> Self {
+        let base = dirs_next::data_local_dir().unwrap_or_else(std::env::temp_dir);
+        Self::new(base.join("clipwire").join("jobs"))
+    }
+}
+
 impl Runner {
     pub(crate) fn new(log_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -84,20 +97,24 @@ impl Runner {
     }
 
     pub(crate) fn spawn(&self, spec: JobSpec) -> io::Result<JobHandle> {
-        fs::create_dir_all(&self.log_dir)?;
         let log_path = self.next_log_path();
+        fs::create_dir_all(log_path.parent().unwrap())?;
         let log = File::create(&log_path)?;
         let mut command = Command::new(&spec.command);
         command.args(&spec.args).stdin(Stdio::null());
-        if let Some(output) = &self.output {
+        let relay = if let Some(output) = &self.output {
             command
                 .stdout(Stdio::from(output.try_clone_writer()?))
                 .stderr(Stdio::from(output.try_clone_writer()?));
+            drop(log);
+            None
         } else {
+            let (reader, writer) = pipe()?;
             command
-                .stdout(Stdio::from(log.try_clone()?))
-                .stderr(Stdio::from(log));
-        }
+                .stdout(Stdio::from(writer.try_clone()?))
+                .stderr(Stdio::from(writer));
+            Some(LogRelay::start(reader, log))
+        };
         command.envs(spec.env.iter().cloned());
         command.env_remove("CLIPD_TOKEN");
         if let Some(cwd) = &spec.cwd {
@@ -113,25 +130,142 @@ impl Runner {
                 state: JobState::Running,
                 exit_code: None,
                 spawn_error: None,
+                relay,
                 spec,
             }),
-            Err(error) => Ok(JobHandle {
-                child: None,
-                group: Box::new(group),
-                log_path,
-                state: JobState::SpawnFailed,
-                exit_code: None,
-                spawn_error: Some(error),
-                spec,
-            }),
+            Err(error) => {
+                if let Some(relay) = relay {
+                    relay.finish()?;
+                }
+                Ok(JobHandle {
+                    child: None,
+                    group: Box::new(group),
+                    log_path,
+                    state: JobState::SpawnFailed,
+                    exit_code: None,
+                    spawn_error: Some(error),
+                    relay: None,
+                    spec,
+                })
+            }
         }
     }
 
     fn next_log_path(&self) -> PathBuf {
         let id = NEXT_LOG_ID.fetch_add(1, Ordering::Relaxed);
         self.log_dir
-            .join(format!("{}-{id}.log", std::process::id()))
+            .join(format!("{}-{id}", std::process::id()))
+            .join("log")
     }
+}
+
+struct LogRelay {
+    main_finished: Arc<AtomicBool>,
+    thread: thread::JoinHandle<io::Result<()>>,
+}
+
+impl LogRelay {
+    fn start(reader: File, log: File) -> Self {
+        let main_finished = Arc::new(AtomicBool::new(false));
+        let finished = Arc::clone(&main_finished);
+        let thread = thread::spawn(move || relay_to_log(reader, log, &finished));
+        Self {
+            main_finished,
+            thread,
+        }
+    }
+
+    fn finish(self) -> io::Result<()> {
+        self.main_finished.store(true, Ordering::Release);
+        self.thread
+            .join()
+            .map_err(|_| io::Error::other("log relay panicked"))?
+    }
+}
+
+fn write_relay_chunk(
+    log: &mut File,
+    written: &mut usize,
+    marked: &mut bool,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let available = LOG_SOFT_LIMIT.saturating_sub(*written);
+    let keep = available.min(bytes.len());
+    if keep != 0 {
+        log.write_all(&bytes[..keep])?;
+        *written += keep;
+    }
+    if keep != bytes.len() && !*marked {
+        log.write_all(LOG_LIMIT_MARKER)?;
+        *marked = true;
+    }
+    Ok(())
+}
+
+// T4.1 will replace only this boundary when Windows selects its cancellation
+// mechanism. The relay policy and JobHandle ordering remain platform-neutral.
+#[cfg(not(windows))]
+fn relay_to_log(mut reader: File, mut log: File, main_finished: &AtomicBool) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let mut written = 0;
+    let mut marked = false;
+    let mut main_seen = None;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if main_seen.is_none() && main_finished.load(Ordering::Acquire) {
+            main_seen = Some(Instant::now());
+        }
+        let timeout = main_seen.map_or(100, |last_data| {
+            RELAY_IDLE_TIMEOUT
+                .saturating_sub(last_data.elapsed())
+                .as_millis()
+                .min(100) as i32
+        });
+        let mut descriptor = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready > 0 {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            write_relay_chunk(&mut log, &mut written, &mut marked, &buffer[..count])?;
+            if main_seen.is_some() {
+                main_seen = Some(Instant::now());
+            }
+        } else if main_seen.is_some_and(|last_data| last_data.elapsed() >= RELAY_IDLE_TIMEOUT) {
+            break;
+        }
+    }
+    log.flush()
+}
+
+#[cfg(windows)]
+fn relay_to_log(mut reader: File, mut log: File, _main_finished: &AtomicBool) -> io::Result<()> {
+    // T4.1 decides how a Windows blocking read is cancelled. Until then this
+    // compile-only stub preserves EOF relay behavior without choosing (a)/(b).
+    let mut written = 0;
+    let mut marked = false;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        write_relay_chunk(&mut log, &mut written, &mut marked, &buffer[..count])?;
+    }
+    log.flush()
 }
 
 /// A deliberately small single-pipe collector. T4.3 can replace the reader's
@@ -231,6 +365,7 @@ pub(crate) struct JobHandle {
     state: JobState,
     exit_code: Option<i32>,
     spawn_error: Option<io::Error>,
+    relay: Option<LogRelay>,
     spec: JobSpec,
 }
 
@@ -240,6 +375,7 @@ impl JobHandle {
             return Ok(self.state);
         };
         let status = child.wait()?;
+        self.finish_relay()?;
         self.record_status(status);
         Ok(self.state)
     }
@@ -250,6 +386,7 @@ impl JobHandle {
         };
         loop {
             if let Some(status) = child.try_wait()? {
+                self.finish_relay()?;
                 self.record_status(status);
                 return Ok(self.state);
             }
@@ -308,6 +445,13 @@ impl JobHandle {
             JobState::Failed
         };
     }
+
+    fn finish_relay(&mut self) -> io::Result<()> {
+        if let Some(relay) = self.relay.take() {
+            relay.finish()?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -319,6 +463,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let runner = Runner::new(temp.path());
         (temp, runner)
+    }
+
+    fn shell_job(script: &str) -> JobSpec {
+        let mut spec = JobSpec::new("sh", "test");
+        spec.args = ["-c", script].into_iter().map(Into::into).collect();
+        spec
     }
 
     #[test]
@@ -384,5 +534,82 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn ac_t4_3_1_preserves_stdout_stderr_order() {
+        let (_temp, runner) = runner();
+        let mut job = runner
+            .spawn(shell_job(
+                "i=0; while [ $i -lt 10000 ]; do printf 'out-%05d\\n' \"$i\"; printf 'err-%05d\\n' \"$i\" >&2; i=$((i+1)); done",
+            ))
+            .unwrap();
+        assert_eq!(job.wait().unwrap(), JobState::Succeeded);
+
+        let actual = fs::read_to_string(job.log_path()).unwrap();
+        let mut expected = String::new();
+        for i in 0..10_000 {
+            expected.push_str(&format!("out-{i:05}\nerr-{i:05}\n"));
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn ac_t4_3_2_discards_after_limit_without_blocking_child() {
+        let (_temp, runner) = runner();
+        let mut job = runner
+            .spawn(shell_job("head -c 20971520 /dev/zero"))
+            .unwrap();
+        assert_eq!(job.wait().unwrap(), JobState::Succeeded);
+        assert_eq!(job.exit_code(), Some(0));
+
+        let log = fs::read(job.log_path()).unwrap();
+        assert_eq!(log.len(), LOG_SOFT_LIMIT + LOG_LIMIT_MARKER.len());
+        assert!(log.ends_with(LOG_LIMIT_MARKER));
+    }
+
+    #[test]
+    fn ac_t4_3_3_receives_final_output_before_state_changes() {
+        let (_temp, runner) = runner();
+        for iteration in 0..100 {
+            let marker = format!("final-marker-{iteration}");
+            let mut job = runner
+                .spawn(shell_job(&format!("printf '{marker}\\n'")))
+                .unwrap();
+            assert_eq!(job.state(), JobState::Running);
+            assert_eq!(job.wait().unwrap(), JobState::Succeeded);
+            assert_eq!(
+                fs::read_to_string(job.log_path()).unwrap(),
+                format!("{marker}\n")
+            );
+        }
+    }
+
+    #[test]
+    fn ac_t4_3_4_large_output_finishes_without_a_follower() {
+        let (_temp, runner) = runner();
+        let mut job = runner
+            .spawn(shell_job("head -c 12582912 /dev/zero"))
+            .unwrap();
+        assert_eq!(job.wait().unwrap(), JobState::Succeeded);
+    }
+
+    #[test]
+    fn ac_t4_3_6_lingering_writer_does_not_keep_job_running() {
+        let (_temp, runner) = runner();
+        let mut job = runner
+            .spawn(shell_job("sleep 10 & printf 'main-finished\\n'"))
+            .unwrap();
+        let started = Instant::now();
+        assert_eq!(job.wait().unwrap(), JobState::Succeeded);
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "リレーの無通信タイムアウトを超えた: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            fs::read_to_string(job.log_path()).unwrap(),
+            "main-finished\n"
+        );
     }
 }
