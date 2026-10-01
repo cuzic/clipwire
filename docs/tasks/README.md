@@ -24,10 +24,12 @@
 | T3.3 | L 完了 / C・W 未検証 | AC-T3.3.1〜T3.3.4 の L テスト完了。AC-T3.3.1・T3.3.3 は Windows CI でも走る共通テスト、AC-T3.3.5 は `#[cfg(windows)]` の別プロセステストを実装済みだが Windows CI 未検証。AC-T3.3.6〜T3.3.8 は Windows 実機未検証 |
 | T3.4 | L 完了 / C・X 未検証 | AC-T3.4.1〜T3.4.4・T3.4.6〜T3.4.8・T3.4.10 の L テスト完了。AC-T3.4.9 は P2 互換のメタデータ欠落を合成テスト済みだが、旧実バイナリによる L/C 検証は T8.1 待ち。AC-T3.4.5 は Windows 実機との X 未検証 |
 | T3.5 | 完了 (L) | AC-T3.5.1〜T3.5.4 完了。同一ハッシュは no-op、別 pending の掃除、応答ハッシュをテスト済み |
+| T3.6 | L 完了 / X 未検証 | AC-T3.6.1〜T3.6.5 の L テスト完了。AC-T3.6.6・T3.6.7（旧/新バイナリと Windows 実機の相互接続）は未検証 |
+| T3.7 | 完了 (L) | AC-T3.7.1〜T3.7.4 完了。`/targets/check` の状態判定・本文非返却・認証・16 MiB 上限をテスト済み |
 | T1.6 | 未着手 | Windows での入れ替えが必要 |
 | T0.5 | 完了 (C) | `.github/workflows/ci.yml`(ubuntu: `scripts/check.sh` / windows-latest: gnu ターゲットで clippy + `cargo test`)。公開リポジトリなので課金なし。AC-T0.5.1〜T0.5.3 緑。`tests/windows_ci.rs` に AC-T0.5.2。Job Object・ミューテックス用の足場(`IsProcessInJob` 確認等)は該当タスク(T4.4/T4.7)で追加 |
 | T0.4 | L・C 完了 / W 未検証 | `clipwire watchdog` と `dev-loop.md` を追加。判断ロジックは単体テスト、実プロセスの復旧・保守ファイル・good 起動失敗は `tests/watchdog.rs`(Linux/Windows CI。AC-T0.4.1・0.4.2・0.4.4 の C 版)。実機の AC-T0.4.1〜0.4.4・0.4.6〜0.4.8(24 時間生存・Tailscale ACL など)と、`clipwire-stage` ターゲット、good.exe 配置、タスクスケジューラ登録は未実施 |
-| T0.6, T2.6, T3.6 以降 | 未着手 | T2.4 (b) の実機作業と (c) は未完了 |
+| T0.6, T2.6, T3.8 以降 | 未着手 | T2.4 (b) の実機作業と (c) は未完了 |
 
 ## 運用の実態(計画の前提)
 

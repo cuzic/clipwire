@@ -33,6 +33,61 @@ impl ClientConfig {
     }
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct ServerCapabilities {
+    pub(crate) proto: u32,
+    #[serde(default)]
+    pub(crate) features: Vec<String>,
+}
+
+fn discover_capabilities(cfg: &ClientConfig) -> ServerCapabilities {
+    let url = format!("{}/health", cfg.base_url());
+    let Ok(response) = ureq::get(&url)
+        .set("Accept", "application/json")
+        .timeout(Duration::from_secs(10))
+        .call()
+    else {
+        return ServerCapabilities::default();
+    };
+    if !response
+        .header("Content-Type")
+        .is_some_and(|value| value.split(';').next() == Some("application/json"))
+    {
+        return ServerCapabilities::default();
+    }
+    response
+        .into_string()
+        .ok()
+        .and_then(|body| serde_json::from_str::<ServerCapabilities>(&body).ok())
+        .unwrap_or_default()
+}
+
+pub(crate) fn require_features(capabilities: &ServerCapabilities, required: &[&str]) -> Result<()> {
+    for feature in required {
+        if !capabilities.features.iter().any(|value| value == feature) {
+            bail!("サーバーが必要な機能 '{feature}' に対応していません");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn register_body(
+    capabilities: &ServerCapabilities,
+    name: &str,
+    target: &StoredTarget,
+) -> serde_json::Value {
+    if capabilities.proto >= 2 {
+        serde_json::json!({ "name": name, "target": target })
+    } else {
+        let mut body =
+            serde_json::to_value(target).expect("StoredTarget serialization cannot fail");
+        body.as_object_mut()
+            .expect("StoredTarget serializes as an object")
+            .insert("name".into(), name.into());
+        body
+    }
+}
+
 // ── Client: get ───────────────────────────────────────────────────────────────
 
 pub(crate) fn cmd_get(cfg: &ClientConfig, args: &GetArgs) -> Result<()> {
@@ -204,6 +259,8 @@ pub(crate) fn cmd_put(cfg: &ClientConfig) -> Result<()> {
 
 pub(crate) fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
     validate_target_name(&args.target)?;
+    let capabilities = discover_capabilities(cfg);
+    require_features(&capabilities, &[])?;
     let body = serde_json::json!({ "name": args.target }).to_string();
     let url = format!("{}/exec", cfg.base_url());
     let req = cfg.set_auth(
@@ -239,9 +296,9 @@ pub(crate) fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
 pub(crate) fn cmd_register(cfg: &ClientConfig, args: &RegisterArgs) -> Result<()> {
     validate_target_name(&args.target)?;
     let target = load_exec_target(&args.target)?;
-    let mut body = serde_json::to_value(&target)?;
-    let obj = body.as_object_mut().unwrap();
-    obj.insert("name".into(), args.target.clone().into());
+    let capabilities = discover_capabilities(cfg);
+    require_features(&capabilities, &[])?;
+    let body = register_body(&capabilities, &args.target, &target);
     let url = format!("{}/register", cfg.base_url());
     let req = cfg.set_auth(
         ureq::post(&url)

@@ -25,6 +25,16 @@ pub(crate) struct RegisterResult {
     pub(crate) hash: String,
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct TargetCheckResult {
+    pub(crate) status: &'static str,
+    pub(crate) hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_matches: Option<bool>,
+}
+
 impl Store {
     pub(crate) fn new(root: PathBuf) -> Self {
         Self {
@@ -164,6 +174,62 @@ impl Store {
         };
         verify_approval(&self.root, target)?;
         Ok(Some(target.clone()))
+    }
+
+    pub(crate) async fn check_targets(
+        &self,
+        targets: std::collections::BTreeMap<String, StoredTarget>,
+    ) -> Result<std::collections::BTreeMap<String, TargetCheckResult>> {
+        let _serial = self.serial.lock().await;
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || {
+            with_store_lock(&root, LOCK_TIMEOUT, || {
+                let registered = load_for_update(&root.join("registered.toml"))?;
+                let pending = load_for_update(&root.join("pending.toml"))?;
+                let mut results = std::collections::BTreeMap::new();
+                for (name, target) in targets {
+                    let hash = definition_hash(&canonical_json(&target));
+                    let pending_hash = pending
+                        .get(&name)
+                        .map(|entry| definition_hash(&canonical_json(entry)));
+                    let registered_hash = registered
+                        .get(&name)
+                        .map(|entry| definition_hash(&canonical_json(entry)));
+                    let status = if pending_hash.is_some() {
+                        "pending"
+                    } else if let Some(registered_hash) = &registered_hash {
+                        if registered_hash == &hash {
+                            "ok"
+                        } else {
+                            "changed"
+                        }
+                    } else {
+                        "unregistered"
+                    };
+                    let pending_matches = pending_hash.as_ref().map(|value| value == &hash);
+                    results.insert(
+                        name,
+                        TargetCheckResult {
+                            status,
+                            hash,
+                            pending_hash,
+                            pending_matches,
+                        },
+                    );
+                }
+                for (name, target) in registered {
+                    results.entry(name).or_insert_with(|| TargetCheckResult {
+                        status: "remote-only",
+                        hash: definition_hash(&canonical_json(&target)),
+                        pending_hash: None,
+                        pending_matches: None,
+                    });
+                }
+                Ok(results)
+            })
+        })
+        .await
+        .context("store check worker panicked")?
     }
 }
 

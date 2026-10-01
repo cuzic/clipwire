@@ -10,7 +10,7 @@ pub(crate) use exec::handle_exec;
 pub(crate) use http_surface::build_router;
 #[cfg(test)]
 pub(crate) use http_surface::{check_host_header, RouteClass, RouteId, ROUTES};
-pub(crate) use register::handle_register;
+pub(crate) use register::{handle_register, handle_targets_check};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
 pub(crate) enum HostCheckMode {
@@ -336,8 +336,30 @@ pub(crate) fn unauthorized() -> Response {
 
 // ── HTTP handlers (serve) ─────────────────────────────────────────────────────
 
-pub(crate) async fn handle_health() -> &'static str {
-    "OK\n"
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
+pub(crate) const PROTOCOL_FEATURES: &[&str] = &["hash"];
+
+pub(crate) async fn handle_health(headers: HeaderMap) -> Response {
+    let wants_json = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|media| {
+                media
+                    .split(';')
+                    .next()
+                    .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+            })
+        });
+    if wants_json {
+        return axum::Json(serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "proto": PROTOCOL_VERSION,
+            "features": PROTOCOL_FEATURES,
+        }))
+        .into_response();
+    }
+    "OK\n".into_response()
 }
 
 pub(crate) fn resolve_serve_token(

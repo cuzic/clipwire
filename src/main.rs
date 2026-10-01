@@ -338,6 +338,11 @@ mod tests {
                 (RouteId::Open, "/open", RouteClass::Clipboard),
                 (RouteId::Exec, "/exec", RouteClass::Protected),
                 (RouteId::Register, "/register", RouteClass::Protected),
+                (
+                    RouteId::TargetsCheck,
+                    "/targets/check",
+                    RouteClass::Protected,
+                ),
             ]
         );
     }
@@ -420,7 +425,7 @@ mod tests {
 
         for route in ROUTES {
             let method = match route.id {
-                RouteId::Exec | RouteId::Register => "POST",
+                RouteId::Exec | RouteId::Register | RouteId::TargetsCheck => "POST",
                 _ => "GET",
             };
             let request = axum::http::Request::builder()
@@ -1426,6 +1431,258 @@ mod tests {
     fn xml_escape_replaces_entities_and_removes_forbidden_controls() {
         assert_eq!(xml_escape("&<>\"'"), "&amp;&lt;&gt;&quot;&apos;");
         assert_eq!(xml_escape("a\0\u{1f}\tb\nc\rd"), "a\tb\nc\rd");
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn protected_post(path: &str, body: String) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ac_t3_6_1_and_4_health_preserves_text_and_advertises_protocol() {
+        let dir = tempdir().unwrap();
+        let app = build_router(test_state(dir.path().to_path_buf(), false));
+        let plain = axum::http::Request::builder()
+            .uri("/health")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(plain).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "OK\n"
+        );
+
+        let json = axum::http::Request::builder()
+            .uri("/health")
+            .header(header::HOST, "localhost")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let value = response_json(app.oneshot(json).await.unwrap()).await;
+        assert_eq!(value["proto"], 2);
+        assert_eq!(value["features"], serde_json::json!(["hash"]));
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn ac_t3_6_2_and_3_register_forms_are_equivalent_and_strict() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), true);
+        state.allow_no_token = true;
+        let app = build_router(state);
+        let nested = r#"{"name":"nested","target":{"script":"echo hi","env":{"B":"2","A":"1"}}}"#;
+        let flat = r#"{"name":"flat","script":"echo hi","env":{"A":"1","B":"2"}}"#;
+        let nested_response = app
+            .clone()
+            .oneshot(protected_post("/register", nested.into()))
+            .await
+            .unwrap();
+        let flat_response = app
+            .clone()
+            .oneshot(protected_post("/register", flat.into()))
+            .await
+            .unwrap();
+        let body = |response: Response| async move {
+            String::from_utf8(
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap()
+        };
+        let nested_body = body(nested_response).await;
+        let flat_body = body(flat_response).await;
+        assert_eq!(
+            nested_body.lines().find(|line| line.starts_with("hash:")),
+            flat_body.lines().find(|line| line.starts_with("hash:"))
+        );
+
+        for invalid in [
+            r#"{"name":"bad-flat","script":"x","unknown":1}"#,
+            r#"{"name":"bad-nested","target":{"script":"x","unknown":1}}"#,
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(protected_post("/register", invalid.into()))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[test]
+    fn ac_t3_6_4_and_5_feature_gate_and_old_server_wire_format() {
+        let target = script_target("echo compatible");
+        let old = client::ServerCapabilities::default();
+        let new = client::ServerCapabilities {
+            proto: 2,
+            features: vec!["hash".into()],
+        };
+        assert!(client::require_features(&new, &["hash"]).is_ok());
+        assert!(client::require_features(&old, &["future-field"]).is_err());
+
+        #[derive(Deserialize)]
+        struct OldRequest {
+            name: String,
+            #[serde(flatten)]
+            target: StoredTarget,
+        }
+        let nested = client::register_body(&new, "compat", &target);
+        let parsed_nested: OldRequest = serde_json::from_value(nested).unwrap();
+        assert_eq!(parsed_nested.name, "compat");
+        assert!(parsed_nested.target.script.is_none());
+
+        let flat = client::register_body(&old, "compat", &target);
+        let parsed_flat: OldRequest = serde_json::from_value(flat).unwrap();
+        assert_eq!(
+            parsed_flat.target.script.as_deref(),
+            Some("echo compatible")
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t3_7_1_and_2_check_reports_all_states_without_definitions() {
+        let dir = tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        store
+            .register("ok".into(), script_target("A"), true)
+            .await
+            .unwrap();
+        store
+            .register("changed".into(), script_target("A"), true)
+            .await
+            .unwrap();
+        store
+            .register("remote".into(), script_target("R"), true)
+            .await
+            .unwrap();
+        store
+            .register("pending-same".into(), script_target("P"), false)
+            .await
+            .unwrap();
+        store
+            .register("pending-different".into(), script_target("P"), false)
+            .await
+            .unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.allow_no_token = true;
+        let app = build_router(state);
+        let request = serde_json::json!({"targets": {
+            "ok": {"script":"A"},
+            "changed": {"script":"B"},
+            "pending-same": {"script":"P"},
+            "pending-different": {"script":"Q"},
+            "new": {"script":"N"}
+        }});
+        let response = app
+            .oneshot(protected_post("/targets/check", request.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = response_json(response).await;
+        let targets = &value["targets"];
+        assert_eq!(targets["ok"]["status"], "ok");
+        assert_eq!(targets["changed"]["status"], "changed");
+        assert_eq!(targets["pending-same"]["status"], "pending");
+        assert_eq!(targets["pending-same"]["pending_matches"], true);
+        assert_eq!(targets["pending-different"]["pending_matches"], false);
+        assert_eq!(targets["new"]["status"], "unregistered");
+        assert_eq!(targets["remote"]["status"], "remote-only");
+        let encoded = value.to_string();
+        for secret in ["script", "steps", "env", "dir", "echo"] {
+            assert!(!encoded.contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_t3_7_3_check_authentication_matches_other_protected_routes() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.token = Some("secret".into());
+        let app = build_router(state);
+        let body = r#"{"targets":{}}"#;
+        assert_eq!(
+            app.clone()
+                .oneshot(protected_post("/targets/check", body.into()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut wrong = protected_post("/targets/check", body.into());
+        wrong
+            .headers_mut()
+            .insert(header::AUTHORIZATION, "Bearer wrong".parse().unwrap());
+        assert_eq!(
+            app.clone().oneshot(wrong).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let no_token_app = build_router(test_state(dir.path().to_path_buf(), false));
+        assert_eq!(
+            no_token_app
+                .oneshot(protected_post("/targets/check", body.into()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t3_7_4_check_accepts_three_megabytes_and_rejects_over_sixteen_mib() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.allow_no_token = true;
+        let app = build_router(state);
+        let large_script = "x".repeat(1_600);
+        let targets: serde_json::Map<String, serde_json::Value> = (0..2_000)
+            .map(|index| {
+                (
+                    format!("target-{index}"),
+                    serde_json::json!({"script": large_script}),
+                )
+            })
+            .collect();
+        let body = serde_json::json!({"targets": targets}).to_string();
+        assert!(body.len() > 3 * 1024 * 1024);
+        assert_eq!(
+            app.clone()
+                .oneshot(protected_post("/targets/check", body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let oversized = format!(
+            r#"{{"targets":{{"huge":{{"script":"{}"}}}}}}"#,
+            "x".repeat(17 * 1024 * 1024)
+        );
+        assert_eq!(
+            app.oneshot(protected_post("/targets/check", oversized))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 
     proptest! {

@@ -21,6 +21,7 @@ pub(crate) enum RouteId {
     Open,
     Exec,
     Register,
+    TargetsCheck,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +72,11 @@ pub(crate) const ROUTES: &[RouteSpec] = &[
         path: "/register",
         class: RouteClass::Protected,
     },
+    RouteSpec {
+        id: RouteId::TargetsCheck,
+        path: "/targets/check",
+        class: RouteClass::Protected,
+    },
 ];
 
 pub(crate) fn build_router(state: AppState) -> Router {
@@ -90,6 +96,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
             RouteId::Open => Router::new().route(route.path, get(handle_open)),
             RouteId::Exec => Router::new().route(route.path, post(handle_exec)),
             RouteId::Register => Router::new().route(route.path, post(handle_register)),
+            RouteId::TargetsCheck => Router::new().route(
+                route.path,
+                post(handle_targets_check)
+                    .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+            ),
         };
         match route.class {
             RouteClass::Common => common = common.merge(router),
