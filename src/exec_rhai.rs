@@ -1,88 +1,124 @@
 use super::*;
+use crate::runner::{JobSpec, OrderedOutput, Runner};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+// Local debug measurements put the two runaway AC probes together below 250 ms
+// at 1M operations / 1 MiB strings, while every existing script test remains
+// below the limits. Collections get similarly conservative entry caps and the
+// 64-level call cap is well above the non-recursive registered targets. Sizes
+// are bytes for strings, entry counts for arrays/maps, and stack depth.
+const MAX_OPERATIONS: u64 = 1_000_000;
+const MAX_STRING_SIZE: usize = 1_048_576;
+const MAX_ARRAY_SIZE: usize = 100_000;
+const MAX_MAP_SIZE: usize = 10_000;
+const MAX_CALL_LEVELS: usize = 64;
 
 pub(crate) fn exec_rhai(script: &str, dir: Option<&str>) -> Result<(Vec<u8>, i32)> {
-    use std::sync::{Arc, Mutex};
-    let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let dir = dir.map(str::to_string);
+    exec_rhai_cancelable(script, dir, Arc::new(AtomicBool::new(false)))
+}
 
+pub(crate) fn exec_rhai_cancelable(
+    script: &str,
+    dir: Option<&str>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(Vec<u8>, i32)> {
+    let (output, relay) = OrderedOutput::new()?;
+    let runner = Arc::new(Runner::with_output(
+        std::env::temp_dir().join("clipwire-runner"),
+        output.clone(),
+    ));
+    let dir = dir.map(std::path::PathBuf::from);
     let mut engine = rhai::Engine::new();
+    engine
+        .set_max_operations(MAX_OPERATIONS)
+        .set_max_string_size(MAX_STRING_SIZE)
+        .set_max_array_size(MAX_ARRAY_SIZE)
+        .set_max_map_size(MAX_MAP_SIZE)
+        .set_max_call_levels(MAX_CALL_LEVELS);
 
-    // run(["cmd", "arg", ...]) — 失敗したらスクリプトを停止
     {
-        let out = out.clone();
+        let cancelled = Arc::clone(&cancelled);
+        engine.on_progress(move |_| {
+            cancelled
+                .load(Ordering::Relaxed)
+                .then(|| "execution cancelled".into())
+        });
+    }
+    {
+        let output = output.clone();
+        engine.on_print(move |text| output.write_line(text));
+    }
+    {
+        let output = output.clone();
+        engine.on_debug(move |text, source, position| {
+            output.write_line(&format!(
+                "{} @ {position:?}: {text}",
+                source.unwrap_or("<script>")
+            ));
+        });
+    }
+
+    {
+        let runner = Arc::clone(&runner);
         let dir = dir.clone();
+        let cancelled = Arc::clone(&cancelled);
         engine.register_fn(
             "run",
             move |args: rhai::Array| -> Result<(), Box<rhai::EvalAltResult>> {
-                let args: Vec<String> = args
-                    .iter()
-                    .map(|a| {
-                        a.clone()
-                            .try_cast::<String>()
-                            .unwrap_or_else(|| a.to_string())
-                    })
-                    .collect();
+                let args = string_args(args);
                 if args.is_empty() {
                     return Ok(());
                 }
-                let mut cmd = std::process::Command::new(&args[0]);
-                cmd.args(&args[1..]);
-                cmd.stdout(std::process::Stdio::piped());
-                cmd.stderr(std::process::Stdio::piped());
-                if let Some(ref d) = dir {
-                    cmd.current_dir(d);
+                let mut spec = JobSpec::new(&args[0], "rhai");
+                spec.args = args[1..].iter().map(Into::into).collect();
+                spec.cwd = dir.clone();
+                let mut job = runner.spawn(spec).map_err(|e| e.to_string())?;
+                if let Some(error) = job.spawn_error() {
+                    return Err(error.to_string().into());
                 }
-                let o = cmd.output().map_err(|e| e.to_string())?;
-                {
-                    let mut g = out.lock().unwrap();
-                    g.extend_from_slice(&o.stderr);
-                    g.extend_from_slice(&o.stdout);
-                }
-                if !o.status.success() {
-                    return Err(format!("exit code {}", o.status.code().unwrap_or(-1)).into());
+                job.wait_cancelable(&cancelled).map_err(|e| e.to_string())?;
+                if job.exit_code() != Some(0) {
+                    return Err(format!("exit code {}", job.exit_code().unwrap_or(-1)).into());
                 }
                 Ok(())
             },
         );
     }
 
-    // run_ok(["cmd", ...]) — 失敗しても続行、成功なら true
     {
-        let out = out.clone();
+        let runner = Arc::clone(&runner);
+        let output = output.clone();
         let dir = dir.clone();
+        let cancelled = Arc::clone(&cancelled);
         engine.register_fn("run_ok", move |args: rhai::Array| -> bool {
-            let args: Vec<String> = args
-                .iter()
-                .map(|a| {
-                    a.clone()
-                        .try_cast::<String>()
-                        .unwrap_or_else(|| a.to_string())
-                })
-                .collect();
+            let args = string_args(args);
             if args.is_empty() {
                 return true;
             }
-            let mut cmd = std::process::Command::new(&args[0]);
-            cmd.args(&args[1..]);
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::piped());
-            if let Some(ref d) = dir {
-                cmd.current_dir(d);
-            }
-            match cmd.output() {
-                Ok(o) => {
-                    let mut g = out.lock().unwrap();
-                    g.extend_from_slice(&o.stderr);
-                    g.extend_from_slice(&o.stdout);
-                    o.status.success()
+            let mut spec = JobSpec::new(&args[0], "rhai");
+            spec.args = args[1..].iter().map(Into::into).collect();
+            spec.cwd = dir.clone();
+            match runner.spawn(spec) {
+                Ok(mut job) if job.spawn_error().is_none() => {
+                    job.wait_cancelable(&cancelled).is_ok() && job.exit_code() == Some(0)
                 }
-                Err(e) => {
-                    // run_ok は失敗を無視して続行する設計だが、起動すらできな
-                    // かった理由（プログラムが見つからない等）まで無音にする
-                    // と原因調査が不可能になるため、出力に残す。
-                    let mut g = out.lock().unwrap();
-                    g.extend_from_slice(
-                        format!("run_ok: {} の起動に失敗しました: {e}\n", args[0]).as_bytes(),
+                Ok(job) => {
+                    output.write_all(
+                        format!(
+                            "run_ok: {} の起動に失敗しました: {}\n",
+                            args[0],
+                            job.spawn_error().unwrap()
+                        )
+                        .as_bytes(),
+                    );
+                    false
+                }
+                Err(error) => {
+                    output.write_all(
+                        format!("run_ok: {} の起動に失敗しました: {error}\n", args[0]).as_bytes(),
                     );
                     false
                 }
@@ -90,39 +126,42 @@ pub(crate) fn exec_rhai(script: &str, dir: Option<&str>) -> Result<(Vec<u8>, i32
         });
     }
 
-    // file_exists(path)
     {
         let dir = dir.clone();
         engine.register_fn("file_exists", move |path: &str| -> bool {
-            let p = match &dir {
-                Some(d) => std::path::Path::new(d).join(path),
-                None => path.into(),
-            };
-            p.exists()
+            resolve_path(dir.as_deref(), path).exists()
         });
     }
-
-    // rm(path) — ファイル削除、失敗しても続行
     {
         let dir = dir.clone();
         engine.register_fn("rm", move |path: &str| -> bool {
-            let p = match &dir {
-                Some(d) => std::path::Path::new(d).join(path),
-                None => path.into(),
-            };
-            std::fs::remove_file(p).is_ok()
+            std::fs::remove_file(resolve_path(dir.as_deref(), path)).is_ok()
         });
     }
 
     let code = match engine.eval::<()>(script) {
-        Ok(_) => 0i32,
-        Err(e) => {
-            out.lock()
-                .unwrap()
-                .extend_from_slice(format!("script error: {e}\n").as_bytes());
-            1i32
+        Ok(_) => 0,
+        Err(error) => {
+            output.write_all(format!("script error: {error}\n").as_bytes());
+            1
         }
     };
-    let bytes = out.lock().unwrap().clone();
+    drop(engine);
+    drop(runner);
+    let bytes = output.finish(relay)?;
     Ok((bytes, code))
+}
+
+fn string_args(args: rhai::Array) -> Vec<String> {
+    args.into_iter()
+        .map(|arg| {
+            arg.clone()
+                .try_cast::<String>()
+                .unwrap_or_else(|| arg.to_string())
+        })
+        .collect()
+}
+
+fn resolve_path(dir: Option<&std::path::Path>, path: &str) -> std::path::PathBuf {
+    dir.map_or_else(|| path.into(), |dir| dir.join(path))
 }

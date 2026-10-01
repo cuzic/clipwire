@@ -1,5 +1,6 @@
 use super::*;
 use crate::exec_rhai::exec_rhai;
+use crate::runner::{JobSpec, OrderedOutput, Runner};
 
 pub(crate) async fn handle_exec(
     State(s): State<AppState>,
@@ -58,36 +59,49 @@ pub(crate) async fn handle_exec(
 
     match payload {
         ExecPayload::Steps { steps, env } => {
-            let mut combined = Vec::new();
-            for args in &steps.into_argv() {
-                if args.is_empty() {
-                    continue;
-                }
-                let mut cmd = tokio::process::Command::new(&args[0]);
-                cmd.args(&args[1..]);
-                cmd.envs(&env);
-                cmd.stdout(std::process::Stdio::piped());
-                cmd.stderr(std::process::Stdio::piped());
-                if let Some(ref d) = dir {
-                    cmd.current_dir(d);
-                }
-                let output = match cmd.output().await {
-                    Ok(o) => o,
-                    Err(e) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("実行エラー: {e}\n"),
-                        )
-                            .into_response()
+            let result = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, i32)> {
+                let (output, relay) = OrderedOutput::new()?;
+                let runner = Runner::with_output(
+                    std::env::temp_dir().join("clipwire-runner"),
+                    output.clone(),
+                );
+                let mut exit_code = 0;
+                for args in steps.into_argv() {
+                    if args.is_empty() {
+                        continue;
                     }
-                };
-                combined.extend_from_slice(&output.stderr);
-                combined.extend_from_slice(&output.stdout);
-                if !output.status.success() {
-                    return exec_response(combined, output.status.code().unwrap_or(-1));
+                    let mut spec = JobSpec::new(&args[0], "http");
+                    spec.args = args[1..].iter().map(Into::into).collect();
+                    spec.cwd = dir.as_ref().map(Into::into);
+                    spec.env = env
+                        .iter()
+                        .map(|(key, value)| (key.into(), value.into()))
+                        .collect();
+                    let mut job = runner.spawn(spec)?;
+                    if let Some(error) = job.spawn_error() {
+                        return Err(anyhow::anyhow!("実行エラー: {error}"));
+                    }
+                    job.wait()?;
+                    exit_code = job.exit_code().unwrap_or(-1);
+                    if exit_code != 0 {
+                        break;
+                    }
                 }
+                drop(runner);
+                Ok((output.finish(relay)?, exit_code))
+            })
+            .await;
+            match result {
+                Ok(Ok((output, code))) => exec_response(output, code),
+                Ok(Err(error)) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, format!("{error}\n")).into_response()
+                }
+                Err(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("thread panic: {error}\n"),
+                )
+                    .into_response(),
             }
-            exec_response(combined, 0)
         }
 
         ExecPayload::Script { script } => {

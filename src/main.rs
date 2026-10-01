@@ -198,7 +198,8 @@ struct ExecArgs {
 mod client;
 mod config;
 mod exec_rhai;
-// T4.5 で exec/exec_rhai へ接続するまでは、runner の公開 API は単体テストだけが使う。
+// T4.5 now uses Runner, while some T4.2 API surface remains reserved for the
+// timeout/job lifecycle tasks and is intentionally not called yet.
 #[allow(dead_code)]
 mod runner;
 mod server;
@@ -268,7 +269,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec_rhai::exec_rhai;
+    use crate::exec_rhai::{exec_rhai, exec_rhai_cancelable};
     use proptest::prelude::*;
     use quick_xml::{events::Event, Reader};
     use std::collections::{BTreeMap, HashMap};
@@ -1257,6 +1258,10 @@ mod tests {
         assert!(output.contains("run-ok"));
         assert!(output.contains("run-fail"));
         assert!(output.contains("run_ok: clipwire-command-that-does-not-exist"));
+        // stdout/stderr are no longer concatenated in fixed stderr-first order;
+        // child output and Rhai print now retain their actual production order.
+        assert!(output.find("run-ok").unwrap() < output.find("run-fail").unwrap());
+        assert!(output.find("run-fail").unwrap() < output.find("run_ok=false").unwrap());
         assert!(!removable.exists());
 
         let (output, code) = exec_rhai("run([\"sh\", \"-c\", \"exit 9\"]);", None).unwrap();
@@ -1267,6 +1272,66 @@ mod tests {
             exec_rhai("run([\"clipwire-command-that-does-not-exist\"]);", None).unwrap();
         assert_eq!(code, 1);
         assert!(String::from_utf8(output).unwrap().contains("script error"));
+    }
+
+    #[test]
+    fn ac_t4_5_2_child_output_precedes_following_print() {
+        let (output, code) = exec_rhai(
+            r#"run(["sh", "-c", "echo a; sleep 0.2"]); print("done");"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(output).unwrap(), "a\ndone\n");
+    }
+
+    #[test]
+    fn ac_t4_5_3_and_4_resource_limits_stop_runaway_scripts() {
+        for script in ["loop {}", r#"let s = "a"; loop { s += s; }"#] {
+            let (output, code) = exec_rhai(script, None).unwrap();
+            assert_eq!(code, 1);
+            assert!(String::from_utf8(output).unwrap().contains("script error:"));
+        }
+    }
+
+    #[test]
+    fn ac_t4_5_5_child_environment_excludes_clipd_token() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CLIPD_TOKEN", "ac-t4-5-secret");
+        let result = exec_rhai(r#"run(["sh", "-c", "env"]);"#, None);
+        std::env::remove_var("CLIPD_TOKEN");
+        let (output, code) = result.unwrap();
+        assert_eq!(code, 0);
+        assert!(!String::from_utf8(output).unwrap().contains("CLIPD_TOKEN="));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn ac_t4_5_6_cancellation_kills_run_process_group_and_returns() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker = std::thread::spawn(move || {
+            exec_rhai_cancelable(
+                r#"run(["sh", "-c", "echo $$; sleep 100 & wait"]);"#,
+                None,
+                worker_cancelled,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        cancelled.store(true, Ordering::Relaxed);
+        let (output, code) = worker.join().unwrap().unwrap();
+        assert_eq!(code, 1);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("script error:"));
+        let pid: i32 = output.lines().next().unwrap().parse().unwrap();
+        // SAFETY: signal 0 only probes whether the emitted process-group leader remains.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[test]

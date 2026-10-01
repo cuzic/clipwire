@@ -3,10 +3,14 @@
 use std::{
     ffi::OsString,
     fs::{self, File},
-    io,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    thread,
     time::Duration,
 };
 
@@ -29,6 +33,7 @@ pub(crate) struct JobSpec {
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) requester: String,
+    pub(crate) env: Vec<(OsString, OsString)>,
 }
 
 impl JobSpec {
@@ -39,6 +44,7 @@ impl JobSpec {
             cwd: None,
             timeout: None,
             requester: requester.into(),
+            env: Vec::new(),
         }
     }
 }
@@ -59,12 +65,21 @@ pub(crate) trait ProcessGroup: Send {
 
 pub(crate) struct Runner {
     log_dir: PathBuf,
+    output: Option<OrderedOutput>,
 }
 
 impl Runner {
     pub(crate) fn new(log_dir: impl Into<PathBuf>) -> Self {
         Self {
             log_dir: log_dir.into(),
+            output: None,
+        }
+    }
+
+    pub(crate) fn with_output(log_dir: impl Into<PathBuf>, output: OrderedOutput) -> Self {
+        Self {
+            log_dir: log_dir.into(),
+            output: Some(output),
         }
     }
 
@@ -73,11 +88,18 @@ impl Runner {
         let log_path = self.next_log_path();
         let log = File::create(&log_path)?;
         let mut command = Command::new(&spec.command);
-        command
-            .args(&spec.args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log));
+        command.args(&spec.args).stdin(Stdio::null());
+        if let Some(output) = &self.output {
+            command
+                .stdout(Stdio::from(output.try_clone_writer()?))
+                .stderr(Stdio::from(output.try_clone_writer()?));
+        } else {
+            command
+                .stdout(Stdio::from(log.try_clone()?))
+                .stderr(Stdio::from(log));
+        }
+        command.envs(spec.env.iter().cloned());
+        command.env_remove("CLIPD_TOKEN");
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
         }
@@ -112,6 +134,96 @@ impl Runner {
     }
 }
 
+/// A deliberately small single-pipe collector. T4.3 can replace the reader's
+/// closing/limiting policy without changing Runner or the Rhai callbacks.
+#[derive(Clone)]
+pub(crate) struct OrderedOutput {
+    writer: Arc<Mutex<File>>,
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl OrderedOutput {
+    pub(crate) fn new() -> io::Result<(Self, thread::JoinHandle<io::Result<()>>)> {
+        let (mut reader, writer) = pipe()?;
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let reader_bytes = Arc::clone(&bytes);
+        let relay = thread::spawn(move || {
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let count = reader.read(&mut buffer)?;
+                if count == 0 {
+                    return Ok(());
+                }
+                reader_bytes
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&buffer[..count]);
+            }
+        });
+        Ok((
+            Self {
+                writer: Arc::new(Mutex::new(writer)),
+                bytes,
+            },
+            relay,
+        ))
+    }
+
+    pub(crate) fn write_line(&self, text: &str) {
+        let mut writer = self.writer.lock().unwrap();
+        let _ = writer.write_all(text.as_bytes());
+        let _ = writer.write_all(b"\n");
+    }
+
+    pub(crate) fn write_all(&self, bytes: &[u8]) {
+        let _ = self.writer.lock().unwrap().write_all(bytes);
+    }
+
+    fn try_clone_writer(&self) -> io::Result<File> {
+        self.writer.lock().unwrap().try_clone()
+    }
+
+    pub(crate) fn finish(self, relay: thread::JoinHandle<io::Result<()>>) -> io::Result<Vec<u8>> {
+        let bytes = Arc::clone(&self.bytes);
+        drop(self);
+        relay
+            .join()
+            .map_err(|_| io::Error::other("output relay panicked"))??;
+        let result = bytes.lock().unwrap().clone();
+        Ok(result)
+    }
+}
+
+#[cfg(not(windows))]
+fn pipe() -> io::Result<(File, File)> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0; 2];
+    // SAFETY: pipe initializes both integers on success; each descriptor is
+    // transferred exactly once into an owning File.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
+}
+
+#[cfg(windows)]
+fn pipe() -> io::Result<(File, File)> {
+    use ::windows::Win32::{Foundation::HANDLE, System::Pipes::CreatePipe};
+    use std::os::windows::io::FromRawHandle;
+    let mut reader = HANDLE::default();
+    let mut writer = HANDLE::default();
+    // SAFETY: CreatePipe initializes both handles and ownership is immediately
+    // transferred to File. Command's Stdio machinery duplicates child handles.
+    unsafe { CreatePipe(&mut reader, &mut writer, None, 0) }
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(unsafe {
+        (
+            File::from_raw_handle(reader.0),
+            File::from_raw_handle(writer.0),
+        )
+    })
+}
+
 pub(crate) struct JobHandle {
     child: Option<Child>,
     group: Box<dyn ProcessGroup>,
@@ -132,8 +244,36 @@ impl JobHandle {
         Ok(self.state)
     }
 
+    pub(crate) fn wait_cancelable(&mut self, cancelled: &AtomicBool) -> io::Result<JobState> {
+        let Some(child) = &mut self.child else {
+            return Ok(self.state);
+        };
+        loop {
+            if let Some(status) = child.try_wait()? {
+                self.record_status(status);
+                return Ok(self.state);
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                self.terminate()?;
+                return self.wait();
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     pub(crate) fn terminate(&mut self) -> io::Result<()> {
-        self.group.terminate()
+        #[cfg(not(windows))]
+        return self.group.terminate();
+        #[cfg(windows)]
+        {
+            // T4.4 owns Job Objects. Until then Windows deliberately retains
+            // the old std::process fallback and can only kill the direct child.
+            if let Some(child) = &mut self.child {
+                child.kill()
+            } else {
+                Ok(())
+            }
+        }
     }
 
     pub(crate) fn members(&self) -> io::Result<Vec<u32>> {
