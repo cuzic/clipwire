@@ -198,6 +198,9 @@ struct ExecArgs {
 mod client;
 mod config;
 mod exec_rhai;
+// T4.5 で exec/exec_rhai へ接続するまでは、runner の公開 API は単体テストだけが使う。
+#[allow(dead_code)]
+mod runner;
 mod server;
 mod store;
 mod watchdog;
