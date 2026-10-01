@@ -40,7 +40,7 @@ fn start_server(config_dir: &Path, port: u16, auto_approve: bool) -> Server {
     if auto_approve {
         args.push("--auto-approve");
     }
-    let child = Command::new(env!("CARGO_BIN_EXE_clipwire"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_clipwire"))
         .args(args)
         .env("CLIPWIRE_CONFIG_DIR", config_dir)
         .stdout(Stdio::null())
@@ -57,6 +57,8 @@ fn start_server(config_dir: &Path, port: u16, auto_approve: bool) -> Server {
         }
         thread::sleep(Duration::from_millis(25));
     }
+    let _ = child.kill();
+    let _ = child.wait();
     panic!("server on port {port} did not start");
 }
 
