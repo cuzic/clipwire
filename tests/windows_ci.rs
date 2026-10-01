@@ -3,7 +3,7 @@
 
 use std::{
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -135,20 +135,39 @@ fn ac_t3_3_5_server_and_cli_processes_preserve_the_union() {
     }
     fs::write(dir.path().join("pending.toml"), pending).unwrap();
 
+    // approve は --hash 必須で y/N を尋ねるので、先に pending からハッシュを集める。
+    let listing = Command::new(env!("CARGO_BIN_EXE_clipwire"))
+        .arg("pending")
+        .env("CLIPWIRE_CONFIG_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(listing.status.success());
+    let hashes: Vec<(String, String)> = String::from_utf8(listing.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let (hash, name) = line.split_once("  ")?;
+            Some((name.to_owned(), hash.to_owned()))
+        })
+        .collect();
+    assert_eq!(hashes.len(), 100);
+
     let port = free_port();
     let _server = start_server(dir.path(), port, true);
     let server_writes = thread::spawn(move || register_range(port, "server"));
     let config_dir = dir.path().to_owned();
     let cli_writes = thread::spawn(move || {
-        for index in 0..100 {
-            let status = Command::new(env!("CARGO_BIN_EXE_clipwire"))
-                .args(["approve", &format!("cli-{index}")])
+        for (name, hash) in hashes {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_clipwire"))
+                .args(["approve", &name, "--hash", &hash])
                 .env("CLIPWIRE_CONFIG_DIR", &config_dir)
+                .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()
+                .spawn()
                 .unwrap();
-            assert!(status.success());
+            child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+            assert!(child.wait().unwrap().success(), "approve {name} failed");
         }
     });
     server_writes.join().unwrap();
