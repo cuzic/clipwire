@@ -766,6 +766,30 @@ mod tests {
         assert!(first.starts_with("Global\\clipwire_singleton_"));
     }
 
+    #[test]
+    fn pid_file_overwrites_stale_content_and_is_removed_on_drop() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(PID_FILE_NAME);
+        std::fs::write(&path, "stale\n").unwrap();
+
+        let guard = PidFile::create_with_pid(dir.path(), 4242).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "4242\n");
+
+        drop(guard);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn pid_file_drop_does_not_remove_a_replacement_servers_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(PID_FILE_NAME);
+        let guard = PidFile::create_with_pid(dir.path(), 4242).unwrap();
+        std::fs::write(&path, "4343\n").unwrap();
+
+        drop(guard);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "4343\n");
+    }
+
     #[tokio::test]
     async fn invalid_register_names_return_400_without_changing_stores() {
         let dir = tempdir().unwrap();

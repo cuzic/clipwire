@@ -11,12 +11,15 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-fn free_port() -> u16 {
-    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+fn free_port() -> Option<u16> {
+    match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+        Ok(listener) => Some(listener.local_addr().unwrap().port()),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping watchdog integration test: loopback bind is forbidden: {error}");
+            None
+        }
+        Err(error) => panic!("allocate watchdog test port: {error}"),
+    }
 }
 
 fn healthy(port: u16) -> bool {
@@ -96,7 +99,7 @@ fn start_watchdog(port: u16, dir: tempfile::TempDir, maintenance: Option<&Path>)
 /// AC-T0.4.1 (C): サーバが無い状態から、手作業なしで good により復旧して /health が 200。
 #[test]
 fn ac_t0_4_1_watchdog_recovers_a_missing_server_with_good() {
-    let port = free_port();
+    let Some(port) = free_port() else { return };
     let dir = tempfile::tempdir().unwrap();
     let mut h = start_watchdog(port, dir, None);
     assert!(
@@ -112,7 +115,7 @@ fn ac_t0_4_1_watchdog_recovers_a_missing_server_with_good() {
 /// 期限切れのファイルは無視される。
 #[test]
 fn ac_t0_4_2_maintenance_file_suppresses_recovery_until_removed_or_expired() {
-    let port = free_port();
+    let Some(port) = free_port() else { return };
     let dir = tempfile::tempdir().unwrap();
     let maintenance = dir.path().join("maintenance");
     let now = SystemTime::now()
@@ -135,7 +138,7 @@ fn ac_t0_4_2_maintenance_file_suppresses_recovery_until_removed_or_expired() {
     drop(h);
 
     // 期限切れ(過去)のファイルは無視され、復旧する
-    let port = free_port();
+    let Some(port) = free_port() else { return };
     let dir = tempfile::tempdir().unwrap();
     let maintenance = dir.path().join("maintenance");
     fs::write(&maintenance, (now - 10).to_string()).unwrap();
@@ -149,7 +152,7 @@ fn ac_t0_4_2_maintenance_file_suppresses_recovery_until_removed_or_expired() {
 /// AC-T0.4.4 (C): good が起動できなくても、ウォッチドッグは落ちずに試行を続ける。
 #[test]
 fn ac_t0_4_4_watchdog_survives_an_unstartable_good() {
-    let port = free_port();
+    let Some(port) = free_port() else { return };
     let dir = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_clipwire"))
         .args(["watchdog", "--good"])

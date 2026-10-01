@@ -34,6 +34,13 @@ Add-Content -Path 'C:\Users\cuzic\clipwire-rebuild.log' -Value '=== restart comp
 - トークンは環境変数 `CLIPD_TOKEN` の継承頼み(`--token-file` ではない)。
 - ウォッチドッグの抑止(`maintenance` ファイル)がない。
 
+`clipwire serve` は、既存の設定ディレクトリ解決に従って
+`clipwire.pid` を書く。Windows の通常環境では
+`%APPDATA%\clipwire\clipwire.pid`、`CLIPWIRE_CONFIG_DIR` 指定時は
+`%CLIPWIRE_CONFIG_DIR%\clipwire.pid` である。起動時に古い内容を上書きし、
+Ctrl+C を含む正常終了時に削除する。再起動スクリプトはこのファイルの PID
+だけを停止対象にする。
+
 ## ウォッチドッグ
 
 `clipwire watchdog --good <bin\good\clipwire.exe> [--port 9999] [--interval 30] -- <serve の引数>`

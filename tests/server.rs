@@ -42,6 +42,15 @@ fn ac_t0_3_1_health_returns_ok() {
 }
 
 #[test]
+fn ac_t2_4_b_serve_writes_its_pid_file_to_the_config_directory() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let pid = std::fs::read_to_string(server.config_dir().join("clipwire.pid")).unwrap();
+    assert_eq!(pid.trim(), server.process_id().to_string());
+}
+
+#[test]
 fn ac_t0_3_2_register_writes_pending_to_the_overridden_config_dir() {
     let Some(server) = TestServer::start() else {
         return;

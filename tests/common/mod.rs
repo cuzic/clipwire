@@ -78,6 +78,10 @@ impl TestServer {
         self.port
     }
 
+    pub fn process_id(&self) -> u32 {
+        self.child.id()
+    }
+
     fn wait_until_ready(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {

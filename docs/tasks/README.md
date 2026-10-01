@@ -17,10 +17,12 @@
 | T2.1 | L 完了 | AC-T2.1.1〜T2.1.2 完了。W/X AC なし |
 | T2.2 | L 完了 / X 未検証 | AC-T2.2.1 / 2.2.1b / 2.2.2 / 2.2.3 / 2.2.4 完了。AC-T2.2.5(実機の再起動ターゲット)は未検証 |
 | T2.3 | L 完了 / X 未検証 | AC-T2.3.1〜T2.3.4・T2.3.7 完了。AC-T2.3.5・T2.3.6・T2.3.8(Windows/Tailscale/実運用)は未検証 |
+| T2.4 | (b) コード側 L 完了 / W・X 未検証 | `serve` の `clipwire.pid` 作成・上書き・正常終了時削除を実装。(b) の実機再起動・トークン移行は未検証。(c) `remove_var` は出荷禁止のため未実装 |
+| T2.5 | 完了 (L) | ADR-0011 に `GET /open` を既知の許容事項として明記。POST 化は T7.7 に起票 |
 | T1.6 | 未着手 | Windows での入れ替えが必要 |
 | T0.5 | 完了 (C) | `.github/workflows/ci.yml`(ubuntu: `scripts/check.sh` / windows-latest: gnu ターゲットで clippy + `cargo test`)。公開リポジトリなので課金なし。AC-T0.5.1〜T0.5.3 緑。`tests/windows_ci.rs` に AC-T0.5.2。Job Object・ミューテックス用の足場(`IsProcessInJob` 確認等)は該当タスク(T4.4/T4.7)で追加 |
 | T0.4 | L・C 完了 / W 未検証 | `clipwire watchdog` と `dev-loop.md` を追加。判断ロジックは単体テスト、実プロセスの復旧・保守ファイル・good 起動失敗は `tests/watchdog.rs`(Linux/Windows CI。AC-T0.4.1・0.4.2・0.4.4 の C 版)。実機の AC-T0.4.1〜0.4.4・0.4.6〜0.4.8(24 時間生存・Tailscale ACL など)と、`clipwire-stage` ターゲット、good.exe 配置、タスクスケジューラ登録は未実施 |
-| T0.6, T2.4 以降 | 未着手 | T2.4 (b) は PID ファイル書き出しも未実装 |
+| T0.6, T2.6 以降 | 未着手 | T2.4 (b) の実機作業と (c) は未完了 |
 
 ## 運用の実態(計画の前提)
 

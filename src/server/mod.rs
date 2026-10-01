@@ -95,6 +95,49 @@ pub(crate) fn log_file_path() -> PathBuf {
     clipwire_config_dir().join("clipd.log")
 }
 
+pub(crate) const PID_FILE_NAME: &str = "clipwire.pid";
+
+pub(crate) struct PidFile {
+    path: PathBuf,
+    contents: String,
+}
+
+impl PidFile {
+    fn create(config_dir: &Path) -> Result<Self> {
+        Self::create_with_pid_impl(config_dir, std::process::id())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_with_pid(config_dir: &Path, pid: u32) -> Result<Self> {
+        Self::create_with_pid_impl(config_dir, pid)
+    }
+
+    fn create_with_pid_impl(config_dir: &Path, pid: u32) -> Result<Self> {
+        std::fs::create_dir_all(config_dir).with_context(|| {
+            format!(
+                "PID ファイル用の設定ディレクトリを作成できません: {}",
+                config_dir.display()
+            )
+        })?;
+        let path = config_dir.join(PID_FILE_NAME);
+        let contents = format!("{pid}\n");
+        std::fs::write(&path, &contents)
+            .with_context(|| format!("PID ファイルを書き込めません: {}", path.display()))?;
+        Ok(Self { path, contents })
+    }
+}
+
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        // A replacement server may have already overwritten the stale file.
+        // Only remove the file while it still identifies this process.
+        if matches!(std::fs::read_to_string(&self.path), Ok(ref contents) if contents == &self.contents)
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 pub(crate) fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -406,6 +449,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
 
     #[cfg(windows)]
     let _mutex = unsafe { win_clip::acquire_mutex(&config_dir) };
+    let _pid_file = PidFile::create(&config_dir)?;
     #[cfg(windows)]
     win_clip::ensure_aumid_registered();
 
@@ -438,22 +482,35 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let localhost = SocketAddr::from(([127, 0, 0, 1], args.port));
 
     if args.bind_localhost_only {
-        serve_forever(localhost, app, "localhost").await;
+        serve_until_shutdown(serve_forever(localhost, app, "localhost")).await;
     } else {
         match find_tailscale_ip() {
             Some(ts_ip) => {
                 let ts_addr = SocketAddr::from((ts_ip, args.port));
                 let app2 = app.clone();
                 tokio::spawn(serve_forever(localhost, app2, "localhost"));
-                serve_forever(ts_addr, app, "tailscale").await;
+                serve_until_shutdown(serve_forever(ts_addr, app, "tailscale")).await;
             }
             None => {
                 warn!("Tailscale IP not found; falling back to localhost-only");
-                serve_forever(localhost, app, "localhost").await;
+                serve_until_shutdown(serve_forever(localhost, app, "localhost")).await;
             }
         }
     }
     Ok(())
+}
+
+async fn serve_until_shutdown(server: impl std::future::Future<Output = ()>) {
+    tokio::select! {
+        _ = server => {}
+        signal = tokio::signal::ctrl_c() => match signal {
+            Ok(()) => info!("shutdown signal received"),
+            Err(error) => {
+                warn!("shutdown signal handler failed: {error}; continuing to serve");
+                std::future::pending::<()>().await;
+            }
+        }
+    }
 }
 
 /// `addr` へ bind して `app` を serve し続ける。エラーが起きても**プロセスを
