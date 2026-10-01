@@ -34,52 +34,42 @@ impl ClientConfig {
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub(crate) struct ServerCapabilities {
+pub(crate) struct ServerInfo {
     #[serde(default = "unknown_server_version")]
     pub(crate) version: String,
-    #[serde(default = "legacy_protocol_version")]
-    pub(crate) proto: u32,
-    #[serde(default)]
-    pub(crate) features: Vec<String>,
 }
 
 fn unknown_server_version() -> String {
     "unknown".into()
 }
 
-const fn legacy_protocol_version() -> u32 {
-    1
-}
-
-impl Default for ServerCapabilities {
+impl Default for ServerInfo {
     fn default() -> Self {
         Self {
             version: unknown_server_version(),
-            proto: legacy_protocol_version(),
-            features: Vec::new(),
         }
     }
 }
 
-fn discover_capabilities(cfg: &ClientConfig) -> ServerCapabilities {
+fn fetch_server_info(cfg: &ClientConfig) -> ServerInfo {
     let url = format!("{}/health", cfg.base_url());
     let Ok(response) = ureq::get(&url)
         .set("Accept", "application/json")
         .timeout(Duration::from_secs(10))
         .call()
     else {
-        return ServerCapabilities::default();
+        return ServerInfo::default();
     };
     if !response
         .header("Content-Type")
         .is_some_and(|value| value.split(';').next() == Some("application/json"))
     {
-        return ServerCapabilities::default();
+        return ServerInfo::default();
     }
     response
         .into_string()
         .ok()
-        .and_then(|body| serde_json::from_str::<ServerCapabilities>(&body).ok())
+        .and_then(|body| serde_json::from_str::<ServerInfo>(&body).ok())
         .unwrap_or_default()
 }
 
@@ -175,10 +165,6 @@ fn format_target_json(entries: &[ListEntry]) -> Result<String> {
     Ok(serde_json::to_string_pretty(entries)?)
 }
 
-fn is_unsupported_status(status: u16) -> bool {
-    status == 404
-}
-
 fn fetch_target_list(cfg: &ClientConfig) -> Result<Vec<ListEntry>> {
     let targets = load_local_targets()?;
     check_targets(cfg, &targets)
@@ -199,9 +185,6 @@ fn check_targets(
         .send_string(&body)
     {
         Ok(response) => response,
-        Err(ureq::Error::Status(code, _)) if is_unsupported_status(code) => {
-            bail!("サーバが未対応: /targets/check")
-        }
         Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
         Err(ureq::Error::Status(code, response)) => bail!(
             "HTTP {}: {}",
@@ -231,9 +214,6 @@ fn running_jobs(cfg: &ClientConfig) -> Result<Vec<crate::jobs::JobMeta>> {
         .call()
     {
         Ok(response) => response,
-        Err(ureq::Error::Status(code, _)) if is_unsupported_status(code) => {
-            bail!("ジョブ API 未対応")
-        }
         Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
         Err(ureq::Error::Status(code, response)) => bail!(
             "HTTP {}: {}",
@@ -245,16 +225,8 @@ fn running_jobs(cfg: &ClientConfig) -> Result<Vec<crate::jobs::JobMeta>> {
     Ok(serde_json::from_reader(response.into_reader())?)
 }
 
-fn format_server(capabilities: &ServerCapabilities) -> String {
-    let features = if capabilities.features.is_empty() {
-        "なし".into()
-    } else {
-        capabilities.features.join(",")
-    };
-    format!(
-        "サーバー: version={} proto={} features={}\n",
-        capabilities.version, capabilities.proto, features
-    )
+fn format_server(info: &ServerInfo) -> String {
+    format!("サーバー: version={}\n", info.version)
 }
 
 fn format_running_jobs(jobs: &[crate::jobs::JobMeta]) -> String {
@@ -269,10 +241,10 @@ fn format_running_jobs(jobs: &[crate::jobs::JobMeta]) -> String {
 }
 
 pub(crate) fn cmd_status(cfg: &ClientConfig) -> Result<()> {
-    let capabilities = discover_capabilities(cfg);
+    let info = fetch_server_info(cfg);
     let entries = fetch_target_list(cfg)?;
     let jobs = running_jobs(cfg)?;
-    print!("{}", format_server(&capabilities));
+    print!("{}", format_server(&info));
     print!("{}", format_target_list(&entries));
     print!("{}", format_running_jobs(&jobs));
     Ok(())
@@ -319,13 +291,6 @@ mod list_status_tests {
     }
 
     #[test]
-    fn ac_t7_2_3_unsupported_detection_is_pure() {
-        assert!(is_unsupported_status(404));
-        assert!(!is_unsupported_status(401));
-        assert!(!is_unsupported_status(500));
-    }
-
-    #[test]
     fn ac_t7_3_1_running_job_empty_display() {
         assert_eq!(format_running_jobs(&[]), "実行中ジョブ: なし\n");
         let job = crate::jobs::JobMeta {
@@ -347,14 +312,9 @@ mod list_status_tests {
     }
 
     #[test]
-    fn ac_t7_3_2_health_defaults_missing_proto_to_one() {
-        let capabilities: ServerCapabilities =
-            serde_json::from_str(r#"{"version":"old","features":[]}"#).unwrap();
-        assert_eq!(capabilities.proto, 1);
-        assert_eq!(
-            format_server(&capabilities),
-            "サーバー: version=old proto=1 features=なし\n"
-        );
+    fn ac_t7_3_2_health_displays_version() {
+        let info: ServerInfo = serde_json::from_str(r#"{"version":"test"}"#).unwrap();
+        assert_eq!(format_server(&info), "サーバー: version=test\n");
     }
 
     fn one_response_server(
@@ -421,7 +381,7 @@ mod list_status_tests {
             return;
         };
         let error = check_targets(&cfg, &std::collections::BTreeMap::new()).unwrap_err();
-        assert!(error.to_string().contains("サーバが未対応"));
+        assert!(error.to_string().contains("HTTP 404"));
         server.join().unwrap();
     }
 
@@ -442,32 +402,20 @@ mod list_status_tests {
             server.join().unwrap();
         }
     }
+
+    #[test]
+    fn status_jobs_404_is_a_normal_http_error() {
+        let Some((cfg, server)) = one_response_server("404 Not Found", "missing") else {
+            return;
+        };
+        let error = running_jobs(&cfg).unwrap_err();
+        assert!(error.to_string().contains("HTTP 404: missing"));
+        server.join().unwrap();
+    }
 }
 
-pub(crate) fn require_features(capabilities: &ServerCapabilities, required: &[&str]) -> Result<()> {
-    for feature in required {
-        if !capabilities.features.iter().any(|value| value == feature) {
-            bail!("サーバーが必要な機能 '{feature}' に対応していません");
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn register_body(
-    capabilities: &ServerCapabilities,
-    name: &str,
-    target: &StoredTarget,
-) -> serde_json::Value {
-    if capabilities.proto >= 2 {
-        serde_json::json!({ "name": name, "target": target })
-    } else {
-        let mut body =
-            serde_json::to_value(target).expect("StoredTarget serialization cannot fail");
-        body.as_object_mut()
-            .expect("StoredTarget serializes as an object")
-            .insert("name".into(), name.into());
-        body
-    }
+pub(crate) fn register_body(name: &str, target: &StoredTarget) -> serde_json::Value {
+    serde_json::json!({ "name": name, "target": target })
 }
 
 // ── Client: get ───────────────────────────────────────────────────────────────
@@ -666,32 +614,16 @@ enum ExecResponseMode {
     Buffered,
 }
 
-fn exec_response_mode(content_type: Option<&str>, requested_stream: bool) -> ExecResponseMode {
-    if requested_stream
-        && content_type.is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/x-ndjson"))
-        })
-    {
+fn exec_response_mode(requested_stream: bool) -> ExecResponseMode {
+    if requested_stream {
         ExecResponseMode::Stream
     } else {
         ExecResponseMode::Buffered
     }
 }
 
-fn should_request_exec_stream(
-    capabilities: &ServerCapabilities,
-    no_stream: bool,
-    detach: bool,
-) -> bool {
-    !no_stream
-        && !detach
-        && capabilities
-            .features
-            .iter()
-            .any(|feature| feature == "stream")
+fn should_request_exec_stream(no_stream: bool, detach: bool) -> bool {
+    !no_stream && !detach
 }
 
 #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
@@ -830,16 +762,7 @@ fn cmd_exec_with_io(
     stderr: &mut dyn Write,
 ) -> Result<()> {
     validate_target_name(&args.target)?;
-    let capabilities = discover_capabilities(cfg);
-    let mut required = Vec::new();
-    if args.timeout.is_some() {
-        required.push("timeout");
-    }
-    if args.detach {
-        required.push("jobs");
-    }
-    require_features(&capabilities, &required)?;
-    let requested_stream = should_request_exec_stream(&capabilities, args.no_stream, args.detach);
+    let requested_stream = should_request_exec_stream(args.no_stream, args.detach);
     let body =
         serde_json::json!({ "name": args.target, "timeout": args.timeout, "detach": args.detach })
             .to_string();
@@ -888,9 +811,7 @@ fn cmd_exec_with_io(
         return Ok(());
     }
     let mut captured = Vec::new();
-    let exit_code = if exec_response_mode(resp.header("Content-Type"), requested_stream)
-        == ExecResponseMode::Buffered
-    {
+    let exit_code = if exec_response_mode(requested_stream) == ExecResponseMode::Buffered {
         let exit_code = resp
             .header("X-Exit-Code")
             .and_then(|value| value.parse().ok())
@@ -986,13 +907,6 @@ mod exec_tests {
         };
         let port = listener.local_addr().unwrap().port();
         let handle = thread::spawn(move || {
-            let (mut health, _) = listener.accept().unwrap();
-            let _ = read_request(&mut health);
-            health
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 50\r\nConnection: close\r\n\r\n{\"proto\":2,\"features\":[\"timeout\",\"jobs\",\"stream\"]}",
-                )
-                .unwrap();
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_request(&mut stream);
             exec(stream, request);
@@ -1048,10 +962,6 @@ mod exec_tests {
         let received = Arc::new(Mutex::new(None));
         let received_by_server = received.clone();
         let handle = thread::spawn(move || {
-            let (mut health, _) = listener.accept().unwrap();
-            let _ = read_request(&mut health);
-            health.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 50\r\nConnection: close\r\n\r\n{\"proto\":2,\"features\":[\"timeout\",\"jobs\",\"stream\"]}").unwrap();
-
             let (mut exec, _) = listener.accept().unwrap();
             let _ = read_request(&mut exec);
             write!(exec, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Exit-Code: {exit_code}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", output.len()).unwrap();
@@ -1140,30 +1050,28 @@ mod exec_tests {
     }
 
     #[test]
-    fn ac_t6_4_3_text_plain_response_falls_back_to_buffered() {
+    fn ac_t6_4_3_stream_request_rejects_text_plain_as_invalid_ndjson() {
         let _guard = test_lock();
         let Some((cfg, server)) = mock_server(|mut stream, request| {
             assert!(request.contains("Accept: application/x-ndjson"));
-            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nX-Exit-Code: 0\r\nContent-Length: 6\r\nConnection: close\r\n\r\nlegacy").unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nX-Exit-Code: 0\r\nContent-Length: 6\r\nConnection: close\r\n\r\nbuffer").unwrap();
         }) else {
             return;
         };
         let mut out = Vec::new();
-        cmd_exec_with_io(
+        let error = cmd_exec_with_io(
             &cfg,
             &args(false),
             short_timeouts(),
             &mut out,
             &mut Vec::new(),
         )
-        .unwrap();
+        .unwrap_err();
         server.join().unwrap();
-        assert_eq!(out, b"legacy");
-        assert!(!should_request_exec_stream(
-            &ServerCapabilities::default(),
-            false,
-            false
-        ));
+        assert!(error.to_string().contains("不正な NDJSON"));
+        assert!(out.is_empty());
+        assert!(should_request_exec_stream(false, false));
+        assert!(!should_request_exec_stream(true, false));
     }
 
     #[test]
@@ -1388,43 +1296,9 @@ mod exec_tests {
         .unwrap();
         server.join().unwrap();
     }
-
-    #[test]
-    fn open_client_falls_back_to_get_for_old_server() {
-        let _guard = test_lock();
-        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
-            Ok(listener) => listener,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
-            Err(error) => panic!("mock server bind failed: {error}"),
-        };
-        let port = listener.local_addr().unwrap().port();
-        let server = thread::spawn(move || {
-            let (mut post, _) = listener.accept().unwrap();
-            assert!(read_request(&mut post).starts_with("POST /open HTTP/1.1"));
-            post.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-            let (mut get, _) = listener.accept().unwrap();
-            assert!(read_request(&mut get).starts_with("GET /open?name=claude HTTP/1.1"));
-            get.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .unwrap();
-        });
-        let cfg = ClientConfig {
-            host: Ipv4Addr::LOCALHOST.to_string(),
-            port,
-            token: None,
-        };
-        cmd_open(
-            &cfg,
-            &OpenArgs {
-                target: OpenTarget::Claude,
-            },
-        )
-        .unwrap();
-        server.join().unwrap();
-    }
 }
 
 fn jobs_request(cfg: &ClientConfig, path: &str) -> Result<ureq::Response> {
-    require_features(&discover_capabilities(cfg), &["jobs"])?;
     let url = format!("{}{}", cfg.base_url(), path);
     match cfg
         .set_auth(ureq::get(&url).timeout(Duration::from_secs(30)))
@@ -1458,7 +1332,6 @@ pub(crate) fn cmd_logs(cfg: &ClientConfig, args: &JobIdArgs) -> Result<()> {
 }
 
 pub(crate) fn cmd_kill(cfg: &ClientConfig, args: &JobIdArgs) -> Result<()> {
-    require_features(&discover_capabilities(cfg), &["jobs"])?;
     let url = format!("{}/jobs/{}/kill", cfg.base_url(), args.id);
     match cfg
         .set_auth(
@@ -1488,17 +1361,7 @@ pub(crate) fn cmd_kill(cfg: &ClientConfig, args: &JobIdArgs) -> Result<()> {
 pub(crate) fn cmd_register(cfg: &ClientConfig, args: &RegisterArgs) -> Result<()> {
     validate_target_name(&args.target)?;
     let target = load_exec_target(&args.target)?;
-    let capabilities = discover_capabilities(cfg);
-    require_features(
-        &capabilities,
-        match (target.timeout.is_some(), target.concurrency.is_some()) {
-            (true, true) => &["timeout", "concurrency"],
-            (true, false) => &["timeout"],
-            (false, true) => &["concurrency"],
-            (false, false) => &[],
-        },
-    )?;
-    let body = register_body(&capabilities, &args.target, &target);
+    let body = register_body(&args.target, &target);
     let url = format!("{}/register", cfg.base_url());
     let req = cfg.set_auth(
         ureq::post(&url)
@@ -1621,14 +1484,7 @@ pub(crate) fn cmd_open(cfg: &ClientConfig, args: &OpenArgs) -> Result<()> {
             .set("Content-Type", "application/json")
             .timeout(Duration::from_secs(10)),
     );
-    let response = match req.send_string(&body) {
-        Err(ureq::Error::Status(404 | 405, _)) => {
-            let legacy_url = format!("{url}?name={}", args.target.as_str());
-            cfg.set_auth(ureq::get(&legacy_url).timeout(Duration::from_secs(10)))
-                .call()
-        }
-        response => response,
-    };
+    let response = req.send_string(&body);
     match response {
         Ok(_) => {
             println!("Windows ブラウザで {} を開きました", args.target.url());

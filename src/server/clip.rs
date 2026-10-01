@@ -85,22 +85,9 @@ pub(crate) struct VFileQuery {
     i: usize,
 }
 #[derive(Deserialize)]
-pub(crate) struct OpenQuery {
-    name: String,
-}
-
-#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OpenBody {
     name: String,
-}
-
-pub(crate) async fn handle_open(
-    State(s): State<AppState>,
-    headers: HeaderMap,
-    Query(q): Query<OpenQuery>,
-) -> Response {
-    open_target(&s, &headers, &q.name)
 }
 
 pub(crate) async fn handle_open_post(

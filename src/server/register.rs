@@ -48,40 +48,10 @@ struct NestedRegisterRequest {
     target: TargetDefinition,
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FlatRegisterRequest {
-    name: String,
-    dir: Option<String>,
-    script: Option<String>,
-    steps: Option<StepsDef>,
-    #[serde(default)]
-    env: std::collections::BTreeMap<String, String>,
-    timeout: Option<String>,
-    concurrency: Option<crate::config::Concurrency>,
-}
-
 fn parse_register_request(body: &[u8]) -> Result<(String, StoredTarget), String> {
-    match serde_json::from_slice::<NestedRegisterRequest>(body) {
-        Ok(request) => Ok((request.name, request.target.into())),
-        Err(nested_error) => match serde_json::from_slice::<FlatRegisterRequest>(body) {
-            Ok(request) => Ok((
-                request.name,
-                TargetDefinition {
-                    dir: request.dir,
-                    script: request.script,
-                    steps: request.steps,
-                    env: request.env,
-                    timeout: request.timeout,
-                    concurrency: request.concurrency,
-                }
-                .into(),
-            )),
-            Err(flat_error) => Err(format!(
-                "nested form: {nested_error}; flat form: {flat_error}"
-            )),
-        },
-    }
+    serde_json::from_slice::<NestedRegisterRequest>(body)
+        .map(|request| (request.name, request.target.into()))
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

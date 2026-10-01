@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ac_t7_7_1_open_accepts_json_post_and_legacy_get() {
+    async fn ac_t7_7_1_open_accepts_only_json_post() {
         let dir = tempdir().unwrap();
         let app = build_router(test_state(dir.path().to_path_buf(), false));
         let post = axum::http::Request::builder()
@@ -522,7 +522,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             app.clone().oneshot(get).await.unwrap().status(),
-            StatusCode::OK
+            StatusCode::METHOD_NOT_ALLOWED
         );
 
         let missing_content_type = axum::http::Request::builder()
@@ -641,7 +641,7 @@ mod tests {
         let response = handle_register(
             State(state),
             HeaderMap::new(),
-            serde_json::to_vec(&serde_json::json!({"name":"manual","script":"()"}))
+            serde_json::to_vec(&serde_json::json!({"name":"manual","target":{"script":"()"}}))
                 .unwrap()
                 .into(),
         )
@@ -660,9 +660,11 @@ mod tests {
 
         for route in ROUTES {
             let method = match route.id {
-                RouteId::Exec | RouteId::Register | RouteId::TargetsCheck | RouteId::JobKill => {
-                    "POST"
-                }
+                RouteId::Open
+                | RouteId::Exec
+                | RouteId::Register
+                | RouteId::TargetsCheck
+                | RouteId::JobKill => "POST",
                 _ => "GET",
             };
             let request = axum::http::Request::builder()
@@ -855,7 +857,7 @@ mod tests {
             app.clone()
                 .oneshot(request(
                     "/register",
-                    r#"{"name":"no-token-test","script":"()"}"#,
+                    r#"{"name":"no-token-test","target":{"script":"()"}}"#,
                 ))
                 .await
                 .unwrap()
@@ -930,7 +932,7 @@ mod tests {
         let register = request(
             "/register",
             "secret",
-            r#"{"name":"token-test","script":"()"}"#,
+            r#"{"name":"token-test","target":{"script":"()"}}"#,
         );
         assert_eq!(
             app.clone().oneshot(register).await.unwrap().status(),
@@ -1171,7 +1173,8 @@ mod tests {
                 State(test_state(dir.path().to_path_buf(), true)),
                 HeaderMap::new(),
                 serde_json::to_vec(&serde_json::json!({
-                    "name": format!("bad-{timeout}"), "script": "()", "timeout": timeout
+                    "name": format!("bad-{timeout}"),
+                    "target": {"script": "()", "timeout": timeout}
                 }))
                 .unwrap()
                 .into(),
@@ -1233,7 +1236,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let body = serde_json::to_vec(&serde_json::json!({
             "name": "bad-definition",
-            "script": "first\nabc\u{202e}def"
+            "target": {"script": "first\nabc\u{202e}def"}
         }))
         .unwrap();
         let response = handle_register(
@@ -1260,7 +1263,7 @@ mod tests {
         let expected = definition_hash(&canonical_json(&target));
         let body = serde_json::to_vec(&serde_json::json!({
             "name": "hash-response",
-            "script": "let answer = 42;"
+            "target": {"script": "let answer = 42;"}
         }))
         .unwrap();
         let response = handle_register(
@@ -1418,7 +1421,8 @@ mod tests {
 
         for name in invalid_target_names() {
             let body =
-                serde_json::to_vec(&serde_json::json!({"name": name, "script": "()"})).unwrap();
+                serde_json::to_vec(&serde_json::json!({"name": name, "target": {"script": "()"}}))
+                    .unwrap();
             let response = handle_register(
                 State(test_state(dir.path().to_path_buf(), false)),
                 HeaderMap::new(),
@@ -1879,7 +1883,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ac_t3_6_1_and_4_health_preserves_text_and_advertises_protocol() {
+    async fn ac_t3_6_1_health_preserves_text_and_reports_version() {
         let dir = tempdir().unwrap();
         let app = build_router(test_state(dir.path().to_path_buf(), false));
         let plain = axum::http::Request::builder()
@@ -1903,29 +1907,17 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let value = response_json(app.oneshot(json).await.unwrap()).await;
-        assert_eq!(value["proto"], 2);
-        assert_eq!(
-            value["features"],
-            serde_json::json!([
-                "hash",
-                "timeout",
-                "concurrency",
-                "jobs",
-                "stream",
-                "open-post"
-            ])
-        );
+        assert_eq!(value.as_object().unwrap().len(), 1);
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]
-    async fn ac_t3_6_2_and_3_register_forms_are_equivalent_and_strict() {
+    async fn ac_t3_6_2_register_accepts_only_strict_nested_form() {
         let dir = tempdir().unwrap();
         let mut state = test_state(dir.path().to_path_buf(), true);
         state.allow_no_token = true;
         let app = build_router(state);
         let nested = r#"{"name":"nested","target":{"script":"echo hi","env":{"B":"2","A":"1"}}}"#;
-        let flat = r#"{"name":"flat","script":"echo hi","env":{"A":"1","B":"2"}}"#;
         let nested_response = app
             .clone()
             .oneshot(protected_post("/register", nested.into()))
@@ -1933,27 +1925,17 @@ mod tests {
             .unwrap();
         let flat_response = app
             .clone()
-            .oneshot(protected_post("/register", flat.into()))
+            .oneshot(protected_post(
+                "/register",
+                r#"{"name":"flat","script":"echo hi"}"#.into(),
+            ))
             .await
             .unwrap();
-        let body = |response: Response| async move {
-            String::from_utf8(
-                axum::body::to_bytes(response.into_body(), usize::MAX)
-                    .await
-                    .unwrap()
-                    .to_vec(),
-            )
-            .unwrap()
-        };
-        let nested_body = body(nested_response).await;
-        let flat_body = body(flat_response).await;
-        assert_eq!(
-            nested_body.lines().find(|line| line.starts_with("hash:")),
-            flat_body.lines().find(|line| line.starts_with("hash:"))
-        );
+        assert_eq!(nested_response.status(), StatusCode::OK);
+        assert_eq!(flat_response.status(), StatusCode::BAD_REQUEST);
 
         for invalid in [
-            r#"{"name":"bad-flat","script":"x","unknown":1}"#,
+            r#"{"name":"bad-outer","target":{"script":"x"},"unknown":1}"#,
             r#"{"name":"bad-nested","target":{"script":"x","unknown":1}}"#,
         ] {
             assert_eq!(
@@ -1968,32 +1950,18 @@ mod tests {
     }
 
     #[test]
-    fn ac_t3_6_4_and_5_feature_gate_and_old_server_wire_format() {
+    fn ac_t3_6_3_client_register_wire_format_is_nested() {
         let target = script_target("echo compatible");
-        let old = client::ServerCapabilities::default();
-        let new = client::ServerCapabilities {
-            version: "test".into(),
-            proto: 2,
-            features: vec!["hash".into()],
-        };
-        assert!(client::require_features(&new, &["hash"]).is_ok());
-        assert!(client::require_features(&old, &["future-field"]).is_err());
-
         #[derive(Deserialize)]
-        struct OldRequest {
+        struct NestedRequest {
             name: String,
-            #[serde(flatten)]
             target: StoredTarget,
         }
-        let nested = client::register_body(&new, "compat", &target);
-        let parsed_nested: OldRequest = serde_json::from_value(nested).unwrap();
+        let nested = client::register_body("compat", &target);
+        let parsed_nested: NestedRequest = serde_json::from_value(nested).unwrap();
         assert_eq!(parsed_nested.name, "compat");
-        assert!(parsed_nested.target.script.is_none());
-
-        let flat = client::register_body(&old, "compat", &target);
-        let parsed_flat: OldRequest = serde_json::from_value(flat).unwrap();
         assert_eq!(
-            parsed_flat.target.script.as_deref(),
+            parsed_nested.target.script.as_deref(),
             Some("echo compatible")
         );
     }
@@ -2162,7 +2130,7 @@ mod tests {
         let response = handle_register(
             State(state.clone()),
             HeaderMap::new(),
-            serde_json::to_vec(&serde_json::json!({"name":"audit-flow","script":"()"}))
+            serde_json::to_vec(&serde_json::json!({"name":"audit-flow","target":{"script":"()"}}))
                 .unwrap()
                 .into(),
         )
@@ -2198,9 +2166,9 @@ mod tests {
         script: &str,
         concurrency: Option<&str>,
     ) {
-        let mut value = serde_json::json!({"name": name, "script": script});
+        let mut value = serde_json::json!({"name": name, "target": {"script": script}});
         if let Some(concurrency) = concurrency {
-            value["concurrency"] = concurrency.into();
+            value["target"]["concurrency"] = concurrency.into();
         }
         let response = handle_register(
             State(state.clone()),
@@ -2323,8 +2291,11 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             serde_json::to_vec(&serde_json::json!({
-                "name":"audit-secret", "script": format!("print(\"{secret_output}\");"),
-                "env":{"SECRET":secret_env}
+                "name":"audit-secret",
+                "target": {
+                    "script": format!("print(\"{secret_output}\");"),
+                    "env":{"SECRET":secret_env}
+                }
             }))
             .unwrap()
             .into(),
@@ -2425,9 +2396,11 @@ mod tests {
         handle_register(
             State(state),
             HeaderMap::new(),
-            serde_json::to_vec(&serde_json::json!({"name":"recover","script":"let x = 1;"}))
-                .unwrap()
-                .into(),
+            serde_json::to_vec(
+                &serde_json::json!({"name":"recover","target":{"script":"let x = 1;"}}),
+            )
+            .unwrap()
+            .into(),
         )
         .await;
         let event = &audit_values(dir.path())[0];
@@ -2449,7 +2422,7 @@ mod tests {
         handle_register(
             State(state),
             HeaderMap::new(),
-            serde_json::to_vec(&serde_json::json!({"name":"automatic","script":"()"}))
+            serde_json::to_vec(&serde_json::json!({"name":"automatic","target":{"script":"()"}}))
                 .unwrap()
                 .into(),
         )
@@ -2490,7 +2463,7 @@ mod tests {
                 State(state.clone()),
                 HeaderMap::new(),
                 serde_json::to_vec(
-                    &serde_json::json!({"name":"bulk-register","script":"let x = 1;"}),
+                    &serde_json::json!({"name":"bulk-register","target":{"script":"let x = 1;"}}),
                 )
                 .unwrap()
                 .into(),
@@ -2513,7 +2486,7 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             serde_json::to_vec(
-                &serde_json::json!({"name":"detached","script":"sleep(150); print(\"done\");"}),
+                &serde_json::json!({"name":"detached","target":{"script":"sleep(150); print(\"done\");"}}),
             )
             .unwrap()
             .into(),
@@ -2692,14 +2665,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ac_t6_3_5_and_6_legacy_response_and_missing_status_are_preserved() {
+    async fn ac_t6_3_5_and_6_buffered_response_and_missing_status_are_preserved() {
         let dir = tempdir().unwrap();
         let state = test_state(dir.path().to_path_buf(), true);
-        register_exec_target(&state, "legacy-exec", r#"print("done");"#, None).await;
+        register_exec_target(&state, "buffered-exec", r#"print("done");"#, None).await;
         let response = handle_exec(
             State(state.clone()),
             HeaderMap::new(),
-            serde_json::to_vec(&serde_json::json!({"name":"legacy-exec"}))
+            serde_json::to_vec(&serde_json::json!({"name":"buffered-exec"}))
                 .unwrap()
                 .into(),
         )
@@ -2783,7 +2756,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let state = test_state(dir.path().to_path_buf(), true);
         handle_register(State(state.clone()), HeaderMap::new(), serde_json::to_vec(
-            &serde_json::json!({"name":"disconnected","script":"sleep(100); print(\"survived\");"})
+            &serde_json::json!({"name":"disconnected","target":{"script":"sleep(100); print(\"survived\");"}})
         ).unwrap().into()).await;
         let request_state = state.clone();
         let request = tokio::spawn(async move {

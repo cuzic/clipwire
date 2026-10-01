@@ -66,7 +66,7 @@ fn register_range(port: u16, prefix: &str) {
     for index in 0..100 {
         let body = serde_json::json!({
             "name": format!("{prefix}-{index}"),
-            "script": format!("echo {prefix}-{index}")
+            "target": {"script": format!("echo {prefix}-{index}")}
         });
         ureq::post(&format!("http://127.0.0.1:{port}/register"))
             .set("Content-Type", "application/json")

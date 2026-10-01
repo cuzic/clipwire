@@ -345,16 +345,6 @@ pub(crate) fn unauthorized() -> Response {
 
 // ── HTTP handlers (serve) ─────────────────────────────────────────────────────
 
-pub(crate) const PROTOCOL_VERSION: u32 = 2;
-pub(crate) const PROTOCOL_FEATURES: &[&str] = &[
-    "hash",
-    "timeout",
-    "concurrency",
-    "jobs",
-    "stream",
-    "open-post",
-];
-
 pub(crate) async fn handle_health(headers: HeaderMap) -> Response {
     let wants_json = headers
         .get(header::ACCEPT)
@@ -370,8 +360,6 @@ pub(crate) async fn handle_health(headers: HeaderMap) -> Response {
     if wants_json {
         return axum::Json(serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
-            "proto": PROTOCOL_VERSION,
-            "features": PROTOCOL_FEATURES,
         }))
         .into_response();
     }

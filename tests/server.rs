@@ -61,7 +61,7 @@ fn ac_t0_3_2_register_writes_pending_to_the_overridden_config_dir() {
         .send_string(
             &serde_json::json!({
                 "name": "integration-target",
-                "script": "echo integration"
+                "target": {"script": "echo integration"}
             })
             .to_string(),
         )
@@ -84,7 +84,11 @@ fn ac_t3_3_2_corrupt_pending_returns_500_without_replacing_it_with_an_empty_map(
         .set("Content-Type", "application/json")
         .set("Authorization", &format!("Bearer {}", common::TEST_TOKEN))
         .send_string(
-            &serde_json::json!({"name": "must-not-appear", "script": "echo no"}).to_string(),
+            &serde_json::json!({
+                "name": "must-not-appear",
+                "target": {"script": "echo no"}
+            })
+            .to_string(),
         )
         .unwrap_err();
     assert!(matches!(error, ureq::Error::Status(500, _)));
