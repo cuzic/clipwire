@@ -217,6 +217,19 @@ struct ExecArgs {
     /// ジョブ ID を即座に返し、バックグラウンドで実行
     #[arg(long)]
     detach: bool,
+    /// 実行結果を Windows クリップボードへコピー
+    /// 注意: ビルドログにはトークン等が含まれることがあり、コピー内容は他アプリや
+    /// クリップボード履歴から参照される可能性があります。
+    #[arg(long, conflicts_with = "detach")]
+    copy: bool,
+    /// 終了コードが 0 でない場合だけ実行結果を Windows クリップボードへコピー
+    /// 注意: ビルドログにはトークン等が含まれることがあり、コピー内容は他アプリや
+    /// クリップボード履歴から参照される可能性があります。
+    #[arg(long, conflicts_with = "detach")]
+    copy_on_fail: bool,
+    /// クリップボードへのコピー時に ANSI エスケープを維持
+    #[arg(long)]
+    raw: bool,
 }
 
 #[derive(Args, Debug)]
@@ -465,6 +478,44 @@ mod tests {
             let response = app.clone().oneshot(request).await.unwrap();
             assert_eq!(response.status(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn ac_t7_7_1_open_accepts_json_post_and_legacy_get() {
+        let dir = tempdir().unwrap();
+        let app = build_router(test_state(dir.path().to_path_buf(), false));
+        let post = axum::http::Request::builder()
+            .method("POST")
+            .uri("/open")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"name":"chatgpt"}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(post).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let get = axum::http::Request::builder()
+            .uri("/open?name=claude")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(get).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let missing_content_type = axum::http::Request::builder()
+            .method("POST")
+            .uri("/open")
+            .header(header::HOST, "localhost")
+            .body(Body::from(r#"{"name":"chatgpt"}"#))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(missing_content_type).await.unwrap().status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
     }
 
     fn host_policy(mode: HostCheckMode, hosts: &[&str]) -> HostPolicy {
@@ -1392,6 +1443,9 @@ mod tests {
                 timeout: None,
                 no_stream: false,
                 detach: false,
+                copy: false,
+                copy_on_fail: false,
+                raw: false,
             },
         )
         .unwrap_err()
@@ -1666,6 +1720,9 @@ mod tests {
                     timeout: None,
                     no_stream: false,
                     detach: false,
+                    copy: false,
+                    copy_on_fail: false,
+                    raw: false,
                 },
             )
             .unwrap_err()
@@ -1831,7 +1888,14 @@ mod tests {
         assert_eq!(value["proto"], 2);
         assert_eq!(
             value["features"],
-            serde_json::json!(["hash", "timeout", "concurrency", "jobs", "stream"])
+            serde_json::json!([
+                "hash",
+                "timeout",
+                "concurrency",
+                "jobs",
+                "stream",
+                "open-post"
+            ])
         );
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
     }

@@ -137,7 +137,9 @@ pub(crate) fn build_router(state: AppState) -> Router {
             }
             RouteId::File => Router::new().route(route.path, get(handle_file)),
             RouteId::VFile => Router::new().route(route.path, get(handle_vfile)),
-            RouteId::Open => Router::new().route(route.path, get(handle_open)),
+            RouteId::Open => Router::new()
+                .route(route.path, get(handle_open).post(handle_open_post))
+                .route_layer(middleware::from_fn(require_json_content_type)),
             RouteId::Exec => Router::new().route(route.path, post(super::exec::handle_exec_http)),
             RouteId::Register => {
                 Router::new().route(route.path, post(super::register::handle_register_http))

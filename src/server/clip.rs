@@ -89,15 +89,42 @@ pub(crate) struct OpenQuery {
     name: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpenBody {
+    name: String,
+}
+
 pub(crate) async fn handle_open(
     State(s): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<OpenQuery>,
 ) -> Response {
+    open_target(&s, &headers, &q.name)
+}
+
+pub(crate) async fn handle_open_post(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     if !check_auth(&s.token, &headers) {
         return unauthorized();
     }
-    let url = match q.name.as_str() {
+    let body: OpenBody = match serde_json::from_slice(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid JSON: {error}\n")).into_response()
+        }
+    };
+    open_target(&s, &headers, &body.name)
+}
+
+fn open_target(s: &AppState, headers: &HeaderMap, name: &str) -> Response {
+    if !check_auth(&s.token, headers) {
+        return unauthorized();
+    }
+    let url = match name {
         "chatgpt" => "https://chatgpt.com",
         "claude" => "https://claude.ai",
         "tailscale" => "https://login.tailscale.com/admin",

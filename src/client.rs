@@ -346,6 +346,90 @@ fn stream_exit_result(exit_code: Option<i32>, job_id: Option<&str>) -> Result<()
     }
 }
 
+const MAX_COPY_BYTES: usize = 1024 * 1024;
+const TRUNCATED_PREFIX: &[u8] = b"[truncated]";
+
+fn should_copy_exec_output(copy: bool, copy_on_fail: bool, exit_code: i32) -> bool {
+    copy || (copy_on_fail && exit_code != 0)
+}
+
+fn strip_ansi(input: &[u8]) -> Vec<u8> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Text,
+        Escape,
+        Csi,
+        Osc,
+        OscEscape,
+    }
+    let mut state = State::Text;
+    let mut output = Vec::with_capacity(input.len());
+    for &byte in input {
+        state = match state {
+            State::Text if byte == 0x1b => State::Escape,
+            State::Text => {
+                output.push(byte);
+                State::Text
+            }
+            State::Escape if byte == b'[' => State::Csi,
+            State::Escape if byte == b']' => State::Osc,
+            State::Escape => State::Text,
+            State::Csi if (0x40..=0x7e).contains(&byte) => State::Text,
+            State::Csi => State::Csi,
+            State::Osc if byte == 0x07 => State::Text,
+            State::Osc if byte == 0x1b => State::OscEscape,
+            State::Osc => State::Osc,
+            State::OscEscape if byte == b'\\' => State::Text,
+            State::OscEscape if byte == 0x1b => State::OscEscape,
+            State::OscEscape => State::Osc,
+        };
+    }
+    output
+}
+
+fn truncate_copy_output(input: &[u8]) -> Vec<u8> {
+    if input.len() <= MAX_COPY_BYTES {
+        return input.to_vec();
+    }
+    let keep = MAX_COPY_BYTES - TRUNCATED_PREFIX.len();
+    let mut start = input.len() - keep;
+    while start < input.len() && (input[start] & 0b1100_0000) == 0b1000_0000 {
+        start += 1;
+    }
+    let mut output = Vec::with_capacity(MAX_COPY_BYTES);
+    output.extend_from_slice(TRUNCATED_PREFIX);
+    output.extend_from_slice(&input[start..]);
+    output
+}
+
+fn prepare_copy_output(input: &[u8], raw: bool) -> Vec<u8> {
+    let utf8 = String::from_utf8_lossy(input);
+    let cleaned = if raw {
+        utf8.as_bytes().to_vec()
+    } else {
+        strip_ansi(utf8.as_bytes())
+    };
+    truncate_copy_output(&cleaned)
+}
+
+fn send_exec_output_to_clipboard(cfg: &ClientConfig, output: &[u8]) -> Result<()> {
+    let url = format!("{}/clip", cfg.base_url());
+    let req = cfg.set_auth(
+        ureq::post(&url)
+            .set("Content-Type", "text/plain; charset=utf-8")
+            .timeout(Duration::from_secs(30)),
+    );
+    match req.send_bytes(output) {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(code, response)) => bail!(
+            "HTTP {}: {}",
+            code,
+            response.into_string().unwrap_or_default().trim()
+        ),
+        Err(error) => bail!("{} への送信に失敗: {}", cfg.base_url(), error),
+    }
+}
+
 pub(crate) fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
     cmd_exec_with_io(
         cfg,
@@ -421,44 +505,56 @@ fn cmd_exec_with_io(
         )?;
         return Ok(());
     }
-    if exec_response_mode(resp.header("Content-Type"), requested_stream)
+    let mut captured = Vec::new();
+    let exit_code = if exec_response_mode(resp.header("Content-Type"), requested_stream)
         == ExecResponseMode::Buffered
     {
         let exit_code = resp
             .header("X-Exit-Code")
             .and_then(|value| value.parse().ok())
             .unwrap_or(0);
-        io::copy(&mut resp.into_reader(), stdout)?;
-        if exit_code != 0 {
-            bail!("exit code {exit_code}");
-        }
-        return Ok(());
-    }
-
-    let job_id = resp.header("X-Job-Id").map(str::to_owned);
-    let mut exit_code = None;
-    let reader = io::BufReader::new(resp.into_reader());
-    for line in std::io::BufRead::lines(reader) {
-        let Ok(line) = line else {
-            break;
-        };
-        match parse_exec_event(&line)? {
-            ExecStreamEvent::Out { d } => {
-                stdout.write_all(d.as_bytes())?;
-                stdout.flush()?;
-            }
-            ExecStreamEvent::Ping => {}
-            ExecStreamEvent::Exit { code } => {
-                exit_code = Some(code);
+        let mut reader = resp.into_reader();
+        reader.read_to_end(&mut captured)?;
+        stdout.write_all(&captured)?;
+        exit_code
+    } else {
+        let job_id = resp.header("X-Job-Id").map(str::to_owned);
+        let mut stream_exit_code = None;
+        let reader = io::BufReader::new(resp.into_reader());
+        for line in std::io::BufRead::lines(reader) {
+            let Ok(line) = line else {
                 break;
+            };
+            match parse_exec_event(&line)? {
+                ExecStreamEvent::Out { d } => {
+                    captured.extend_from_slice(d.as_bytes());
+                    stdout.write_all(d.as_bytes())?;
+                    stdout.flush()?;
+                }
+                ExecStreamEvent::Ping => {}
+                ExecStreamEvent::Exit { code } => {
+                    stream_exit_code = Some(code);
+                    break;
+                }
+                ExecStreamEvent::Err { msg } => writeln!(stderr, "server error: {msg}")?,
             }
-            ExecStreamEvent::Err { msg } => writeln!(stderr, "server error: {msg}")?,
+        }
+        if stream_exit_code.is_none() {
+            writeln!(stderr, "{}", disconnected_job_message(job_id.as_deref()))?;
+            return stream_exit_result(stream_exit_code, job_id.as_deref());
+        }
+        stream_exit_code.unwrap_or_default()
+    };
+    if should_copy_exec_output(args.copy, args.copy_on_fail, exit_code) {
+        let copy = prepare_copy_output(&captured, args.raw);
+        if let Err(error) = send_exec_output_to_clipboard(cfg, &copy) {
+            writeln!(
+                stderr,
+                "warning: 実行結果をクリップボードへ送信できませんでした: {error}"
+            )?;
         }
     }
-    if exit_code.is_none() {
-        writeln!(stderr, "{}", disconnected_job_message(job_id.as_deref()))?;
-    }
-    stream_exit_result(exit_code, job_id.as_deref())
+    stream_exit_result(Some(exit_code), None)
 }
 
 #[cfg(test)]
@@ -466,7 +562,7 @@ fn cmd_exec_with_io(
 mod exec_tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
     fn test_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -476,6 +572,10 @@ mod exec_tests {
     }
 
     fn read_request(stream: &mut TcpStream) -> String {
+        read_request_with_body(stream).0
+    }
+
+    fn read_request_with_body(stream: &mut TcpStream) -> (String, Vec<u8>) {
         let mut bytes = Vec::new();
         let mut byte = [0_u8; 1];
         while !bytes.ends_with(b"\r\n\r\n") {
@@ -490,7 +590,7 @@ mod exec_tests {
             .unwrap_or(0);
         let mut body = vec![0; length];
         stream.read_exact(&mut body).unwrap();
-        headers
+        (headers, body)
     }
 
     fn mock_server<F>(exec: F) -> Option<(ClientConfig, thread::JoinHandle<()>)>
@@ -531,6 +631,9 @@ mod exec_tests {
             timeout: None,
             no_stream,
             detach: false,
+            copy: false,
+            copy_on_fail: false,
+            raw: false,
         }
     }
 
@@ -540,6 +643,71 @@ mod exec_tests {
             stream_read: Duration::from_millis(500),
             buffered_read: Duration::from_secs(3),
         }
+    }
+
+    type CopyServer = (
+        ClientConfig,
+        Arc<Mutex<Option<Vec<u8>>>>,
+        thread::JoinHandle<()>,
+    );
+
+    fn copy_server(
+        output: Vec<u8>,
+        exit_code: i32,
+        clip_status: u16,
+        expect_clip: bool,
+    ) -> Option<CopyServer> {
+        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("mock server bind failed: {error}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        let received = Arc::new(Mutex::new(None));
+        let received_by_server = received.clone();
+        let handle = thread::spawn(move || {
+            let (mut health, _) = listener.accept().unwrap();
+            let _ = read_request(&mut health);
+            health.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 50\r\nConnection: close\r\n\r\n{\"proto\":2,\"features\":[\"timeout\",\"jobs\",\"stream\"]}").unwrap();
+
+            let (mut exec, _) = listener.accept().unwrap();
+            let _ = read_request(&mut exec);
+            write!(exec, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Exit-Code: {exit_code}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", output.len()).unwrap();
+            exec.write_all(&output).unwrap();
+            exec.flush().unwrap();
+
+            if expect_clip {
+                let (mut clip, _) = listener.accept().unwrap();
+                let (headers, body) = read_request_with_body(&mut clip);
+                assert!(headers.starts_with("POST /clip HTTP/1.1"));
+                *received_by_server.lock().unwrap() = Some(body);
+                write!(
+                    clip,
+                    "HTTP/1.1 {clip_status} Mock\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            } else {
+                listener.set_nonblocking(true).unwrap();
+                for _ in 0..20 {
+                    match listener.accept() {
+                        Ok(_) => panic!("unexpected POST /clip"),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("mock server accept failed: {error}"),
+                    }
+                }
+            }
+        });
+        Some((
+            ClientConfig {
+                host: Ipv4Addr::LOCALHOST.to_string(),
+                port,
+                token: None,
+            },
+            received,
+            handle,
+        ))
     }
 
     #[test]
@@ -660,6 +828,216 @@ mod exec_tests {
         .unwrap();
         server.join().unwrap();
         assert_eq!(out.len(), SIZE);
+    }
+
+    #[test]
+    fn ac_t7_1_1_output_is_posted_to_clip() {
+        let _guard = test_lock();
+        let Some((cfg, received, server)) = copy_server(b"build output\n".to_vec(), 0, 204, true)
+        else {
+            return;
+        };
+        let mut copy_args = args(true);
+        copy_args.copy = true;
+        cmd_exec_with_io(
+            &cfg,
+            &copy_args,
+            short_timeouts(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(*received.lock().unwrap(), Some(b"build output\n".to_vec()));
+    }
+
+    #[test]
+    fn ac_t7_1_2_copy_keeps_tail_with_one_mib_limit() {
+        let _guard = test_lock();
+        let mut output = vec![b'a'; 2 * 1024 * 1024];
+        output.extend_from_slice(b"tail");
+        let Some((cfg, received, server)) = copy_server(output, 0, 204, true) else {
+            return;
+        };
+        let mut copy_args = args(true);
+        copy_args.copy = true;
+        cmd_exec_with_io(
+            &cfg,
+            &copy_args,
+            short_timeouts(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        server.join().unwrap();
+        let body = received.lock().unwrap().clone().unwrap();
+        assert!(body.len() <= MAX_COPY_BYTES);
+        assert!(body.starts_with(TRUNCATED_PREFIX));
+        assert!(body.ends_with(b"tail"));
+    }
+
+    #[test]
+    fn ac_t7_1_3_ansi_is_removed_unless_raw() {
+        let _guard = test_lock();
+        let Some((cfg, received, server)) =
+            copy_server(b"\x1b[31mred\x1b[0m".to_vec(), 0, 204, true)
+        else {
+            return;
+        };
+        let mut copy_args = args(true);
+        copy_args.copy = true;
+        cmd_exec_with_io(
+            &cfg,
+            &copy_args,
+            short_timeouts(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(*received.lock().unwrap(), Some(b"red".to_vec()));
+
+        let Some((cfg, received, server)) =
+            copy_server(b"\x1b[31mred\x1b[0m".to_vec(), 0, 204, true)
+        else {
+            return;
+        };
+        let mut raw_args = args(true);
+        raw_args.copy = true;
+        raw_args.raw = true;
+        cmd_exec_with_io(
+            &cfg,
+            &raw_args,
+            short_timeouts(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            *received.lock().unwrap(),
+            Some(b"\x1b[31mred\x1b[0m".to_vec())
+        );
+        assert_eq!(prepare_copy_output(b"\x1b]0;title\x07text", false), b"text");
+    }
+
+    #[test]
+    fn ac_t7_1_4_copy_on_fail_uses_exit_code() {
+        let _guard = test_lock();
+        let Some((cfg, _, server)) = copy_server(b"ok".to_vec(), 0, 204, false) else {
+            return;
+        };
+        let mut success_args = args(true);
+        success_args.copy_on_fail = true;
+        cmd_exec_with_io(
+            &cfg,
+            &success_args,
+            short_timeouts(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        let Some((cfg, received, server)) = copy_server(b"failed".to_vec(), 7, 204, true) else {
+            return;
+        };
+        let mut failure_args = args(true);
+        failure_args.copy_on_fail = true;
+        let error = cmd_exec_with_io(
+            &cfg,
+            &failure_args,
+            short_timeouts(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(error.to_string().contains("exit code 7"));
+        assert_eq!(*received.lock().unwrap(), Some(b"failed".to_vec()));
+    }
+
+    #[test]
+    fn ac_t7_1_5_clip_failure_preserves_job_failure() {
+        let _guard = test_lock();
+        let Some((cfg, _, server)) = copy_server(b"failed".to_vec(), 9, 500, true) else {
+            return;
+        };
+        let mut args = args(true);
+        args.copy = true;
+        let mut stderr = Vec::new();
+        let error = cmd_exec_with_io(&cfg, &args, short_timeouts(), &mut Vec::new(), &mut stderr)
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(error.to_string().contains("exit code 9"));
+        assert!(String::from_utf8(stderr).unwrap().contains("warning:"));
+    }
+
+    #[test]
+    fn ac_t7_7_1_open_client_uses_json_post() {
+        let _guard = test_lock();
+        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("mock server bind failed: {error}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (headers, body) = read_request_with_body(&mut stream);
+            assert!(headers.starts_with("POST /open HTTP/1.1"));
+            assert!(headers.contains("Content-Type: application/json"));
+            assert_eq!(body, br#"{"name":"chatgpt"}"#);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let cfg = ClientConfig {
+            host: Ipv4Addr::LOCALHOST.to_string(),
+            port,
+            token: None,
+        };
+        cmd_open(
+            &cfg,
+            &OpenArgs {
+                target: OpenTarget::Chatgpt,
+            },
+        )
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn open_client_falls_back_to_get_for_old_server() {
+        let _guard = test_lock();
+        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("mock server bind failed: {error}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut post, _) = listener.accept().unwrap();
+            assert!(read_request(&mut post).starts_with("POST /open HTTP/1.1"));
+            post.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            let (mut get, _) = listener.accept().unwrap();
+            assert!(read_request(&mut get).starts_with("GET /open?name=claude HTTP/1.1"));
+            get.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let cfg = ClientConfig {
+            host: Ipv4Addr::LOCALHOST.to_string(),
+            port,
+            token: None,
+        };
+        cmd_open(
+            &cfg,
+            &OpenArgs {
+                target: OpenTarget::Claude,
+            },
+        )
+        .unwrap();
+        server.join().unwrap();
     }
 }
 
@@ -854,9 +1232,22 @@ pub(crate) fn cmd_audit(args: &AuditArgs) -> Result<()> {
 // ── Client: open ──────────────────────────────────────────────────────────────
 
 pub(crate) fn cmd_open(cfg: &ClientConfig, args: &OpenArgs) -> Result<()> {
-    let url = format!("{}/open?name={}", cfg.base_url(), args.target.as_str());
-    let req = cfg.set_auth(ureq::get(&url).timeout(Duration::from_secs(10)));
-    match req.call() {
+    let url = format!("{}/open", cfg.base_url());
+    let body = serde_json::json!({ "name": args.target.as_str() }).to_string();
+    let req = cfg.set_auth(
+        ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .timeout(Duration::from_secs(10)),
+    );
+    let response = match req.send_string(&body) {
+        Err(ureq::Error::Status(404 | 405, _)) => {
+            let legacy_url = format!("{url}?name={}", args.target.as_str());
+            cfg.set_auth(ureq::get(&legacy_url).timeout(Duration::from_secs(10)))
+                .call()
+        }
+        response => response,
+    };
+    match response {
         Ok(_) => {
             println!("Windows ブラウザで {} を開きました", args.target.url());
             Ok(())
