@@ -356,7 +356,7 @@ fn refresh_existing_approval_record(
 
 fn touch_approval_record(path: &Path, now: SystemTime) -> Result<()> {
     OpenOptions::new()
-        .read(true)
+        .write(true)
         .open(path)?
         .set_modified(now)
         .with_context(|| format!("承認レコード {} の mtime を更新できません", path.display()))
