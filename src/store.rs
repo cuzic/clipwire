@@ -9,7 +9,15 @@ use std::{
 };
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const APPROVAL_RETENTION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+pub(crate) const APPROVAL_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ApprovalRecordAge {
+    file_name: String,
+    modified: SystemTime,
+}
 
 #[derive(Clone)]
 pub(crate) struct Store {
@@ -59,6 +67,7 @@ impl Store {
                 let canonical = canonical_json(&target);
                 let hash = definition_hash(&canonical);
                 let mut pending = load_for_update(&pending_path)?;
+                refresh_existing_approval_record(&root, &hash, &canonical, SystemTime::now())?;
 
                 if registered
                     .get(&name)
@@ -79,7 +88,9 @@ impl Store {
                 // A registered -> B pending -> A registered again: the name is no
                 // longer in registered.toml, so use the immutable approval record
                 // to recognize the previously approved definition.
-                if pending.contains_key(&name) && approval_record_matches(&root, &hash, &canonical)?
+                if auto_approve
+                    && pending.contains_key(&name)
+                    && approval_record_matches(&root, &hash, &canonical)?
                 {
                     let approved = approve_target(&root, target, &canonical, &hash)?;
                     registered.insert(name.clone(), approved);
@@ -123,7 +134,9 @@ impl Store {
                 }
                 pending.insert(name, target);
                 atomic_save_target_map(&pending_path, &pending)?;
-                atomic_save_target_map(&registered_path, &registered)?;
+                if reapproval {
+                    atomic_save_target_map(&registered_path, &registered)?;
+                }
                 Ok(RegisterResult {
                     reapproval,
                     unchanged: false,
@@ -189,13 +202,31 @@ impl Store {
         .context("store migration worker panicked")?
     }
 
+    pub(crate) async fn cleanup_approval_records(
+        &self,
+        retention: Duration,
+        now: SystemTime,
+    ) -> Result<usize> {
+        let _serial = self.serial.lock().await;
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || {
+            with_store_lock(&root, LOCK_TIMEOUT, || {
+                cleanup_approval_records_locked(&root, retention, now)
+            })
+        })
+        .await
+        .context("approval cleanup worker panicked")?
+    }
+
     pub(crate) fn verified_target(&self, name: &str) -> Result<Option<StoredTarget>> {
-        let registered = load_target_map(&self.root.join("registered.toml"))?;
-        let Some(target) = registered.get(name) else {
-            return Ok(None);
-        };
-        verify_approval(&self.root, target)?;
-        Ok(Some(target.clone()))
+        with_store_lock(&self.root, LOCK_TIMEOUT, || {
+            let registered = load_target_map(&self.root.join("registered.toml"))?;
+            let Some(target) = registered.get(name) else {
+                return Ok(None);
+            };
+            verify_approval(&self.root, target)?;
+            Ok(Some(target.clone()))
+        })
     }
 
     pub(crate) async fn check_targets(
@@ -283,7 +314,8 @@ fn write_approval_record(root: &Path, hash: &str, canonical: &[u8]) -> Result<()
     let parent = path.parent().context("approved path has no parent")?;
     fs::create_dir_all(parent)?;
     if path.exists() {
-        return verify_existing_approval(&path, canonical);
+        verify_existing_approval(&path, canonical)?;
+        return touch_approval_record(&path, SystemTime::now());
     }
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temp = parent.join(format!(".approval.tmp.{}.{}", std::process::id(), sequence));
@@ -306,6 +338,28 @@ fn write_approval_record(root: &Path, hash: &str, canonical: &[u8]) -> Result<()
     })();
     let _ = fs::remove_file(&temp);
     result
+}
+
+fn refresh_existing_approval_record(
+    root: &Path,
+    hash: &str,
+    canonical: &[u8],
+    now: SystemTime,
+) -> Result<()> {
+    let path = approved_path(root, hash)?;
+    if path.exists() {
+        verify_existing_approval(&path, canonical)?;
+        touch_approval_record(&path, now)?;
+    }
+    Ok(())
+}
+
+fn touch_approval_record(path: &Path, now: SystemTime) -> Result<()> {
+    OpenOptions::new()
+        .read(true)
+        .open(path)?
+        .set_modified(now)
+        .with_context(|| format!("承認レコード {} の mtime を更新できません", path.display()))
 }
 
 fn verify_existing_approval(path: &Path, canonical: &[u8]) -> Result<()> {
@@ -384,6 +438,62 @@ fn verify_approval(root: &Path, target: &StoredTarget) -> Result<()> {
         bail!("承認レコードと登録本文が一致しません");
     }
     Ok(())
+}
+
+fn approval_records_to_delete(
+    records: &[ApprovalRecordAge],
+    registered_digests: &std::collections::HashSet<String>,
+    retention: Duration,
+    now: SystemTime,
+) -> Vec<String> {
+    records
+        .iter()
+        .filter(|record| !registered_digests.contains(&record.file_name))
+        .filter(|record| {
+            now.duration_since(record.modified)
+                .is_ok_and(|age| age > retention)
+        })
+        .map(|record| record.file_name.clone())
+        .collect()
+}
+
+fn cleanup_approval_records_locked(
+    root: &Path,
+    retention: Duration,
+    now: SystemTime,
+) -> Result<usize> {
+    let registered = load_for_update(&root.join("registered.toml"))?;
+    let registered_digests = registered
+        .values()
+        .filter_map(|target| target.hash.as_deref())
+        .filter_map(|hash| hash.strip_prefix("sha256:"))
+        .map(|digest| format!("{digest}.json"))
+        .collect();
+    let approved_dir = root.join("approved");
+    let entries = match fs::read_dir(&approved_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let valid_name = file_name.len() == 69
+            && file_name.ends_with(".json")
+            && file_name[..64].bytes().all(|byte| byte.is_ascii_hexdigit());
+        if valid_name && entry.file_type()?.is_file() {
+            records.push(ApprovalRecordAge {
+                file_name,
+                modified: entry.metadata()?.modified()?,
+            });
+        }
+    }
+    let selected = approval_records_to_delete(&records, &registered_digests, retention, now);
+    for file_name in &selected {
+        fs::remove_file(approved_dir.join(file_name))?;
+    }
+    Ok(selected.len())
 }
 
 fn load_for_update(path: &Path) -> Result<TargetMap> {
@@ -825,8 +935,9 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        // A was approved, B is pending, then returning to A restores the
-        // content-addressed approval and removes B without another approval.
+        // In auto-approve mode, returning to A restores the content-addressed
+        // approval and removes B. Manual mode must never restore registered via
+        // HTTP register (T5.6).
         store
             .register("item".into(), target("A"), true)
             .await
@@ -836,7 +947,7 @@ mod tests {
             .await
             .unwrap();
         let back_to_a = store
-            .register("item".into(), target("A"), false)
+            .register("item".into(), target("A"), true)
             .await
             .unwrap();
         assert!(back_to_a.unchanged);
@@ -907,5 +1018,113 @@ mod tests {
         store.deny("denied", Some(&hash)).unwrap();
         assert!(!store.pending().unwrap().contains_key("denied"));
         assert!(store.verified_target("kept").unwrap().is_some());
+    }
+
+    #[test]
+    fn ac_t5_7_selection_is_pure_and_keeps_registered_or_recent_records() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let old = now - Duration::from_secs(101);
+        let recent = now - Duration::from_secs(99);
+        let records = vec![
+            ApprovalRecordAge {
+                file_name: "registered.json".into(),
+                modified: old,
+            },
+            ApprovalRecordAge {
+                file_name: "expired.json".into(),
+                modified: old,
+            },
+            ApprovalRecordAge {
+                file_name: "recent.json".into(),
+                modified: recent,
+            },
+        ];
+        let registered = std::collections::HashSet::from(["registered.json".into()]);
+        assert_eq!(
+            approval_records_to_delete(&records, &registered, Duration::from_secs(100), now),
+            ["expired.json"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t5_7_1_and_2_cleanup_keeps_registered_and_recent_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        store
+            .register("kept".into(), target("echo kept"), true)
+            .await
+            .unwrap();
+        store
+            .register("expired".into(), target("echo expired"), true)
+            .await
+            .unwrap();
+        store
+            .register("recent".into(), target("echo recent"), true)
+            .await
+            .unwrap();
+        let mut registered = load_target_map(&dir.path().join("registered.toml")).unwrap();
+        let kept_hash = registered["kept"].hash.clone().unwrap();
+        let expired_hash = registered.remove("expired").unwrap().hash.unwrap();
+        let recent_hash = registered.remove("recent").unwrap().hash.unwrap();
+        atomic_save_target_map(&dir.path().join("registered.toml"), &registered).unwrap();
+
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let old = now - Duration::from_secs(101);
+        touch_approval_record(&approved_path(dir.path(), &kept_hash).unwrap(), old).unwrap();
+        touch_approval_record(&approved_path(dir.path(), &expired_hash).unwrap(), old).unwrap();
+        touch_approval_record(
+            &approved_path(dir.path(), &recent_hash).unwrap(),
+            now - Duration::from_secs(99),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store
+                .cleanup_approval_records(Duration::from_secs(100), now)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(approved_path(dir.path(), &kept_hash).unwrap().exists());
+        assert!(!approved_path(dir.path(), &expired_hash).unwrap().exists());
+        assert!(approved_path(dir.path(), &recent_hash).unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn ac_t5_7_2_reregister_refreshes_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        let item = target("echo same");
+        let result = store
+            .register("same".into(), item.clone(), true)
+            .await
+            .unwrap();
+        let path = approved_path(dir.path(), &result.hash).unwrap();
+        let old = UNIX_EPOCH + Duration::from_secs(1_000);
+        touch_approval_record(&path, old).unwrap();
+        store.register("same".into(), item, true).await.unwrap();
+        assert!(fs::metadata(path).unwrap().modified().unwrap() > old);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ac_t5_7_3_cleanup_and_exec_verification_share_the_store_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        store
+            .register("live".into(), target("echo live"), true)
+            .await
+            .unwrap();
+        let cleanup = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .cleanup_approval_records(Duration::ZERO, SystemTime::now())
+                    .await
+                    .unwrap()
+            })
+        };
+        let verified = tokio::task::spawn_blocking(move || store.verified_target("live").unwrap());
+        assert_eq!(cleanup.await.unwrap(), 0);
+        assert!(verified.await.unwrap().is_some());
     }
 }

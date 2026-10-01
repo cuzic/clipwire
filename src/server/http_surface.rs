@@ -25,10 +25,17 @@ pub(crate) enum RouteId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegisteredMutation {
+    Never,
+    AutoApproveOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RouteSpec {
     pub(crate) id: RouteId,
     pub(crate) path: &'static str,
     pub(crate) class: RouteClass,
+    pub(crate) registered_mutation: RegisteredMutation,
 }
 
 pub(crate) const ROUTES: &[RouteSpec] = &[
@@ -36,46 +43,55 @@ pub(crate) const ROUTES: &[RouteSpec] = &[
         id: RouteId::Health,
         path: "/health",
         class: RouteClass::Common,
+        registered_mutation: RegisteredMutation::Never,
     },
     RouteSpec {
         id: RouteId::Root,
         path: "/",
         class: RouteClass::Clipboard,
+        registered_mutation: RegisteredMutation::Never,
     },
     RouteSpec {
         id: RouteId::Clip,
         path: "/clip",
         class: RouteClass::Clipboard,
+        registered_mutation: RegisteredMutation::Never,
     },
     RouteSpec {
         id: RouteId::File,
         path: "/file",
         class: RouteClass::Clipboard,
+        registered_mutation: RegisteredMutation::Never,
     },
     RouteSpec {
         id: RouteId::VFile,
         path: "/vfile",
         class: RouteClass::Clipboard,
+        registered_mutation: RegisteredMutation::Never,
     },
     RouteSpec {
         id: RouteId::Open,
         path: "/open",
         class: RouteClass::Clipboard,
+        registered_mutation: RegisteredMutation::Never,
     },
     RouteSpec {
         id: RouteId::Exec,
         path: "/exec",
         class: RouteClass::Protected,
+        registered_mutation: RegisteredMutation::Never,
     },
     RouteSpec {
         id: RouteId::Register,
         path: "/register",
         class: RouteClass::Protected,
+        registered_mutation: RegisteredMutation::AutoApproveOnly,
     },
     RouteSpec {
         id: RouteId::TargetsCheck,
         path: "/targets/check",
         class: RouteClass::Protected,
+        registered_mutation: RegisteredMutation::Never,
     },
 ];
 

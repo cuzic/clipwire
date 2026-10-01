@@ -11,7 +11,7 @@ use clip::*;
 pub(crate) use exec::handle_exec;
 pub(crate) use http_surface::build_router;
 #[cfg(test)]
-pub(crate) use http_surface::{check_host_header, RouteClass, RouteId, ROUTES};
+pub(crate) use http_surface::{check_host_header, RegisteredMutation, RouteClass, RouteId, ROUTES};
 #[cfg(test)]
 pub(crate) use register::handle_register;
 pub(crate) use register::handle_targets_check;
@@ -500,6 +500,26 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         .migrate()
         .await
         .context("承認ストアを移行できません")?;
+    store
+        .cleanup_approval_records(crate::store::APPROVAL_RETENTION, SystemTime::now())
+        .await
+        .context("承認レコードを掃除できません")?;
+    let cleanup_store = store.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(crate::store::APPROVAL_CLEANUP_INTERVAL).await;
+            match cleanup_store
+                .cleanup_approval_records(crate::store::APPROVAL_RETENTION, SystemTime::now())
+                .await
+            {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(removed, "期限切れの承認レコードを削除しました");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!("承認レコードの定期掃除に失敗しました: {error:#}"),
+            }
+        }
+    });
     let audit = AuditLog::new(config_dir.clone());
     let state = AppState {
         clip_tx,

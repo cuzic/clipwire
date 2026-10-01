@@ -487,6 +487,55 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn ac_t5_6_1_only_auto_approve_register_may_change_registered() {
+        let mutations: Vec<_> = ROUTES
+            .iter()
+            .map(|route| (route.id, route.path, route.registered_mutation))
+            .collect();
+        assert_eq!(
+            mutations,
+            vec![
+                (RouteId::Health, "/health", RegisteredMutation::Never),
+                (RouteId::Root, "/", RegisteredMutation::Never),
+                (RouteId::Clip, "/clip", RegisteredMutation::Never),
+                (RouteId::File, "/file", RegisteredMutation::Never),
+                (RouteId::VFile, "/vfile", RegisteredMutation::Never),
+                (RouteId::Open, "/open", RegisteredMutation::Never),
+                (RouteId::Exec, "/exec", RegisteredMutation::Never),
+                (
+                    RouteId::Register,
+                    "/register",
+                    RegisteredMutation::AutoApproveOnly,
+                ),
+                (
+                    RouteId::TargetsCheck,
+                    "/targets/check",
+                    RegisteredMutation::Never,
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t5_6_2_manual_register_only_creates_pending() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), false);
+        let response = handle_register(
+            State(state),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"manual","script":"()"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!dir.path().join("registered.toml").exists());
+        assert!(load_target_map(&dir.path().join("pending.toml"))
+            .unwrap()
+            .contains_key("manual"));
+    }
+
     #[tokio::test]
     async fn ac_t2_3_1_origin_is_rejected_on_every_route() {
         let dir = tempdir().unwrap();
