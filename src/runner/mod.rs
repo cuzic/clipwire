@@ -296,6 +296,19 @@ pub(crate) struct OrderedOutput {
 
 impl OrderedOutput {
     pub(crate) fn new() -> io::Result<(Self, thread::JoinHandle<io::Result<()>>)> {
+        Self::new_inner(None)
+    }
+
+    pub(crate) fn new_with_log(
+        path: &Path,
+    ) -> io::Result<(Self, thread::JoinHandle<io::Result<()>>)> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        Self::new_inner(Some(File::create(path)?))
+    }
+
+    fn new_inner(mut log: Option<File>) -> io::Result<(Self, thread::JoinHandle<io::Result<()>>)> {
         let (mut reader, writer) = pipe()?;
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let reader_bytes = Arc::clone(&bytes);
@@ -304,9 +317,18 @@ impl OrderedOutput {
             loop {
                 let count = reader.read(&mut buffer)?;
                 if count == 0 {
+                    if let Some(log) = &mut log {
+                        log.flush()?;
+                    }
                     return Ok(());
                 }
-                core::append_output(&mut reader_bytes.lock().unwrap(), &buffer[..count]);
+                let mut collected = reader_bytes.lock().unwrap();
+                let previous = collected.len();
+                core::append_output(&mut collected, &buffer[..count]);
+                if let Some(log) = &mut log {
+                    log.write_all(&collected[previous..])?;
+                    log.flush()?;
+                }
             }
         });
         Ok((

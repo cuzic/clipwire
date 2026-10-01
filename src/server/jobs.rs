@@ -9,6 +9,22 @@ pub(crate) struct JobsQuery {
 pub(crate) struct LogQuery {
     #[serde(default)]
     pub(crate) offset: usize,
+    #[serde(default, deserialize_with = "deserialize_follow")]
+    pub(crate) follow: bool,
+}
+
+fn deserialize_follow<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    match value.as_str() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(serde::de::Error::custom(
+            "follow must be 0, 1, false, or true",
+        )),
+    }
 }
 
 pub(crate) async fn list(
@@ -33,6 +49,12 @@ pub(crate) async fn log(
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(query): Query<LogQuery>,
 ) -> Response {
+    if state.jobs.get(&id).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if query.follow {
+        return super::stream::follow_response(state, id, query.offset);
+    }
     match state.jobs.read_log(&id, query.offset) {
         Ok(Some(bytes)) => Response::builder()
             .status(StatusCode::OK)

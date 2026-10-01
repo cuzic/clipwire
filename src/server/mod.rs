@@ -5,6 +5,7 @@ mod exec;
 mod http_surface;
 pub(crate) mod jobs;
 mod register;
+mod stream;
 
 use crate::audit::AuditLog;
 use clip::*;
@@ -94,6 +95,7 @@ pub(crate) struct AppState {
     pub(crate) host_policy: HostPolicy,
     pub(crate) audit: AuditLog,
     pub(crate) jobs: crate::jobs::JobRegistry,
+    pub(crate) stream_ping_interval: Duration,
 }
 
 // ── Logging / panic visibility (serve) ────────────────────────────────────────
@@ -344,7 +346,7 @@ pub(crate) fn unauthorized() -> Response {
 // ── HTTP handlers (serve) ─────────────────────────────────────────────────────
 
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
-pub(crate) const PROTOCOL_FEATURES: &[&str] = &["hash", "timeout", "concurrency", "jobs"];
+pub(crate) const PROTOCOL_FEATURES: &[&str] = &["hash", "timeout", "concurrency", "jobs", "stream"];
 
 pub(crate) async fn handle_health(headers: HeaderMap) -> Response {
     let wants_json = headers
@@ -542,6 +544,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         host_policy: build_host_policy(args.host_check, args.allow_host),
         audit,
         jobs,
+        stream_ping_interval: Duration::from_secs(30),
     };
 
     let serve_start = crate::audit::serve_start_event(

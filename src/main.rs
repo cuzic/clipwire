@@ -373,6 +373,7 @@ mod tests {
             host_policy: HostPolicy::default(),
             audit: audit::AuditLog::new(config_dir.clone()),
             jobs: jobs::JobRegistry::new(config_dir).unwrap(),
+            stream_ping_interval: Duration::from_secs(30),
         }
     }
 
@@ -395,6 +396,7 @@ mod tests {
             host_policy: HostPolicy::default(),
             audit: audit::AuditLog::new(config_dir.clone()),
             jobs: jobs::JobRegistry::new(config_dir).unwrap(),
+            stream_ping_interval: Duration::from_secs(30),
         }
     }
 
@@ -1824,7 +1826,7 @@ mod tests {
         assert_eq!(value["proto"], 2);
         assert_eq!(
             value["features"],
-            serde_json::json!(["hash", "timeout", "concurrency", "jobs"])
+            serde_json::json!(["hash", "timeout", "concurrency", "jobs", "stream"])
         );
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
     }
@@ -2102,7 +2104,6 @@ mod tests {
         assert_eq!(events, ["register", "approve", "start", "end"]);
     }
 
-    #[cfg(target_os = "linux")]
     async fn register_exec_target(
         state: &AppState,
         name: &str,
@@ -2466,13 +2467,19 @@ mod tests {
         let full = server::jobs::log(
             State(state.clone()),
             axum::extract::Path(id.clone()),
-            Query(server::jobs::LogQuery { offset: 0 }),
+            Query(server::jobs::LogQuery {
+                offset: 0,
+                follow: false,
+            }),
         )
         .await;
         let tail = server::jobs::log(
             State(state),
             axum::extract::Path(id),
-            Query(server::jobs::LogQuery { offset: 3 }),
+            Query(server::jobs::LogQuery {
+                offset: 3,
+                follow: false,
+            }),
         )
         .await;
         assert_eq!(
@@ -2487,6 +2494,149 @@ mod tests {
                 .unwrap(),
             "def"
         );
+    }
+
+    async fn next_body_chunk<S>(stream: &mut S) -> axum::body::Bytes
+    where
+        S: futures_core::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Unpin,
+    {
+        std::future::poll_fn(|cx| {
+            futures_core::Stream::poll_next(std::pin::Pin::new(&mut *stream), cx)
+        })
+        .await
+        .expect("stream ended")
+        .expect("infallible body")
+    }
+
+    fn ndjson_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, "application/x-ndjson".parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn ac_t6_3_1_first_output_arrives_before_completion() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        register_exec_target(
+            &state,
+            "stream-early",
+            r#"print("first"); sleep(300); print("last");"#,
+            None,
+        )
+        .await;
+        let response = handle_exec(
+            State(state.clone()),
+            ndjson_headers(),
+            serde_json::to_vec(&serde_json::json!({"name":"stream-early"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/x-ndjson"
+        );
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_millis(150), next_body_chunk(&mut body))
+            .await
+            .expect("first output was buffered until completion");
+        let event: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(event["t"], "out");
+        assert_eq!(event["d"], "first\n");
+        assert_eq!(state.jobs.list(Some(jobs::JobStatus::Running)).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ac_t6_3_3_idle_stream_sends_ping() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), true);
+        state.stream_ping_interval = Duration::from_millis(10);
+        register_exec_target(&state, "stream-ping", "sleep(100);", None).await;
+        let response = handle_exec(
+            State(state),
+            ndjson_headers(),
+            serde_json::to_vec(&serde_json::json!({"name":"stream-ping"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        let event: serde_json::Value =
+            serde_json::from_slice(&next_body_chunk(&mut body).await).unwrap();
+        assert_eq!(event, serde_json::json!({"t":"ping"}));
+    }
+
+    #[tokio::test]
+    async fn ac_t6_3_4_exit_is_last_after_all_output_under_repetition() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        register_exec_target(&state, "stream-order", r#"print("tail");"#, None).await;
+        for _ in 0..100 {
+            let response = handle_exec(
+                State(state.clone()),
+                ndjson_headers(),
+                serde_json::to_vec(&serde_json::json!({"name":"stream-order"}))
+                    .unwrap()
+                    .into(),
+            )
+            .await;
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let events: Vec<serde_json::Value> = bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect();
+            assert_eq!(events.last().unwrap()["t"], "exit");
+            assert_eq!(
+                events.iter().filter(|event| event["t"] == "exit").count(),
+                1
+            );
+            let output: String = events
+                .iter()
+                .filter(|event| event["t"] == "out")
+                .map(|event| event["d"].as_str().unwrap())
+                .collect();
+            assert_eq!(output, "tail\n");
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_t6_3_5_and_6_legacy_response_and_missing_status_are_preserved() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        register_exec_target(&state, "legacy-exec", r#"print("done");"#, None).await;
+        let response = handle_exec(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"legacy-exec"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(response.headers()["X-Exit-Code"], "0");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "done\n"
+        );
+
+        let missing = handle_exec(
+            State(state),
+            ndjson_headers(),
+            serde_json::to_vec(&serde_json::json!({"name":"not-registered"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     #[cfg(target_os = "linux")]

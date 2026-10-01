@@ -1,5 +1,5 @@
 use super::*;
-use crate::exec_rhai::exec_rhai_with_deadline;
+use crate::exec_rhai::exec_rhai_with_deadline_output;
 use crate::jobs::{JobControl, JobStatus};
 use crate::runner::{resolve_timeout, valid_timeout, JobSpec, OrderedOutput, Runner};
 use std::sync::{atomic::Ordering, Arc};
@@ -42,7 +42,7 @@ struct Prepared {
 
 async fn handle_exec_with_ip(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: axum::body::Bytes,
     requester_ip: Option<String>,
 ) -> Response {
@@ -51,6 +51,7 @@ async fn handle_exec_with_ip(
         Err(response) => return *response,
     };
     let detached = prepared.request.detach;
+    let streaming = super::stream::accepts_ndjson(&headers) && !detached;
     let job_id = prepared.job_id.clone();
     if detached {
         state.jobs.set_detached(&job_id);
@@ -58,7 +59,13 @@ async fn handle_exec_with_ip(
     let control = Arc::new(JobControl::default());
     state.jobs.register_control(&job_id, Arc::clone(&control));
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(run_job(state, prepared, requester_ip, control, reply_tx));
+    tokio::spawn(run_job(
+        state.clone(),
+        prepared,
+        requester_ip,
+        control,
+        reply_tx,
+    ));
 
     if detached {
         return (
@@ -66,6 +73,9 @@ async fn handle_exec_with_ip(
             axum::Json(serde_json::json!({ "id": job_id })),
         )
             .into_response();
+    }
+    if streaming {
+        return super::stream::follow_response(state, job_id, 0);
     }
     match reply_rx.await {
         Ok(Ok((output, code))) => exec_response(output, code),
@@ -224,9 +234,10 @@ async fn run_job(
     });
     let registry = state.jobs.clone();
     let running_id = job_id.clone();
+    let output_pair = OrderedOutput::new_with_log(&state.jobs.log_path(&job_id));
     let result = tokio::task::spawn_blocking(move || match payload {
         ExecPayload::Steps { steps, env } => {
-            let (output, relay) = OrderedOutput::new().map_err(|e| e.to_string())?;
+            let (output, relay) = output_pair.map_err(|e| e.to_string())?;
             let runner =
                 Runner::with_output(std::env::temp_dir().join("clipwire-runner"), output.clone());
             let mut exit_code = 0;
@@ -268,8 +279,16 @@ async fn run_job(
             let callback_id = running_id.clone();
             let child_changed =
                 Arc::new(move |child| callback_registry.set_child(&callback_id, child));
-            exec_rhai_with_deadline(&script, dir.as_deref(), cancel, child_changed)
-                .map_err(|e| e.to_string())
+            let (output, relay) = output_pair.map_err(|e| e.to_string())?;
+            exec_rhai_with_deadline_output(
+                &script,
+                dir.as_deref(),
+                cancel,
+                child_changed,
+                output,
+                relay,
+            )
+            .map_err(|e| e.to_string())
         }
     })
     .await;

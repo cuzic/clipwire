@@ -26,6 +26,7 @@ hex = "0.4"
 unicode-general-category = "1"
 humantime = "2.4.0"
 getrandom = "0.3.4"
+futures-core = "0.3"
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"

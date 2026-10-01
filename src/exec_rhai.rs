@@ -49,13 +49,24 @@ pub(crate) fn exec_rhai_cancelable(
     exec_rhai_inner(script, dir, cancelled, true, false)
 }
 
-pub(crate) fn exec_rhai_with_deadline(
+pub(crate) fn exec_rhai_with_deadline_output(
     script: &str,
     dir: Option<&str>,
     cancelled: Arc<AtomicBool>,
     child_changed: Arc<dyn Fn(Option<crate::jobs::ChildIdentity>) + Send + Sync>,
+    output: OrderedOutput,
+    relay: std::thread::JoinHandle<std::io::Result<()>>,
 ) -> Result<(Vec<u8>, i32)> {
-    exec_rhai_inner_with_child(script, dir, cancelled, false, true, Some(child_changed))
+    exec_rhai_with_output(
+        script,
+        dir,
+        cancelled,
+        false,
+        true,
+        Some(child_changed),
+        output,
+        relay,
+    )
 }
 
 fn exec_rhai_inner(
@@ -77,6 +88,29 @@ fn exec_rhai_inner_with_child(
     child_changed: Option<Arc<dyn Fn(Option<crate::jobs::ChildIdentity>) + Send + Sync>>,
 ) -> Result<(Vec<u8>, i32)> {
     let (output, relay) = OrderedOutput::new()?;
+    exec_rhai_with_output(
+        script,
+        dir,
+        cancelled,
+        operation_limit,
+        timeout_exit,
+        child_changed,
+        output,
+        relay,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exec_rhai_with_output(
+    script: &str,
+    dir: Option<&str>,
+    cancelled: Arc<AtomicBool>,
+    operation_limit: bool,
+    timeout_exit: bool,
+    child_changed: Option<Arc<dyn Fn(Option<crate::jobs::ChildIdentity>) + Send + Sync>>,
+    output: OrderedOutput,
+    relay: std::thread::JoinHandle<std::io::Result<()>>,
+) -> Result<(Vec<u8>, i32)> {
     let runner = Arc::new(Runner::with_output(
         std::env::temp_dir().join("clipwire-runner"),
         output.clone(),

@@ -307,6 +307,10 @@ impl JobRegistry {
         fs::write(self.root.join(id).join("log"), bytes)
     }
 
+    pub(crate) fn log_path(&self, id: &str) -> PathBuf {
+        self.root.join(id).join("log")
+    }
+
     pub(crate) fn read_log(&self, id: &str, offset: usize) -> io::Result<Option<Vec<u8>>> {
         if !self.jobs.lock().unwrap().contains_key(id) {
             return Ok(None);
