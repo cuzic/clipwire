@@ -385,6 +385,13 @@ pub(crate) struct JobHandle {
 }
 
 impl JobHandle {
+    pub(crate) fn child_identity(&self) -> io::Result<Option<crate::jobs::ChildIdentity>> {
+        self.child
+            .as_ref()
+            .map(|child| crate::jobs::child_identity(child.id()))
+            .transpose()
+    }
+
     pub(crate) fn wait(&mut self) -> io::Result<JobState> {
         let Some(child) = &mut self.child else {
             return Ok(self.state);

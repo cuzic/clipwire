@@ -1,11 +1,8 @@
 use super::*;
 use crate::exec_rhai::exec_rhai_with_deadline;
 use crate::runner::{resolve_timeout, valid_timeout, JobSpec, OrderedOutput, Runner};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Instant;
-
-static NEXT_AUDIT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) async fn handle_exec_http(
     connect: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
@@ -117,16 +114,27 @@ async fn handle_exec_with_ip(
         .hash
         .clone()
         .unwrap_or_else(|| crate::config::definition_hash(&crate::config::canonical_json(&stored)));
+    let concurrency = stored
+        .concurrency
+        .unwrap_or(crate::config::Concurrency::Reject);
+    let job_id = match s
+        .jobs
+        .start(&req.name, &def_hash, requester_ip.clone(), concurrency)
+    {
+        Ok(id) => id,
+        Err(crate::jobs::Conflict(id)) => {
+            return (
+                StatusCode::CONFLICT,
+                format!("ターゲット '{}' はジョブ {id} で実行中です\n", req.name),
+            )
+                .into_response();
+        }
+    };
     let (dir, payload) = match stored.into_exec() {
         Ok(v) => v,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
     };
 
-    let job_id = format!(
-        "{}-{}",
-        std::process::id(),
-        NEXT_AUDIT_JOB_ID.fetch_add(1, Ordering::Relaxed)
-    );
     let started = Instant::now();
     let mut start_event = crate::audit::AuditEvent::new(crate::audit::AuditEventKind::Start)
         .target(&req.name, &def_hash)
@@ -143,6 +151,8 @@ async fn handle_exec_with_ip(
                 tokio::time::sleep(timeout).await;
                 deadline_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
             });
+            let registry = s.jobs.clone();
+            let running_job_id = job_id.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, i32)> {
                 let (output, relay) = OrderedOutput::new()?;
                 let runner = Runner::with_output(
@@ -169,7 +179,9 @@ async fn handle_exec_with_ip(
                     if let Some(error) = job.spawn_error() {
                         return Err(anyhow::anyhow!("実行エラー: {error}"));
                     }
+                    registry.set_child(&running_job_id, job.child_identity()?);
                     job.wait_cancelable(&cancelled)?;
+                    registry.set_child(&running_job_id, None);
                     exit_code = job.exit_code().unwrap_or(-1);
                     if exit_code != 0 {
                         break;
@@ -200,8 +212,11 @@ async fn handle_exec_with_ip(
                 tokio::time::sleep(timeout).await;
                 deadline_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
             });
+            let registry = s.jobs.clone();
+            let running_job_id = job_id.clone();
+            let child_changed = Arc::new(move |child| registry.set_child(&running_job_id, child));
             let result = tokio::task::spawn_blocking(move || {
-                exec_rhai_with_deadline(&script, dir.as_deref(), cancelled)
+                exec_rhai_with_deadline(&script, dir.as_deref(), cancelled, child_changed)
             })
             .await;
             deadline.abort();
@@ -222,6 +237,14 @@ async fn handle_exec_with_ip(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(-1);
+    let final_state = if exit_code == 0 {
+        crate::jobs::JobStatus::Succeeded
+    } else if exit_code == 124 {
+        crate::jobs::JobStatus::Timeout
+    } else {
+        crate::jobs::JobStatus::Failed
+    };
+    s.jobs.finish(&job_id, final_state, Some(exit_code));
     if exit_code == 124 {
         for kind in [
             crate::audit::AuditEventKind::Kill,

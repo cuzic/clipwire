@@ -53,8 +53,9 @@ pub(crate) fn exec_rhai_with_deadline(
     script: &str,
     dir: Option<&str>,
     cancelled: Arc<AtomicBool>,
+    child_changed: Arc<dyn Fn(Option<crate::jobs::ChildIdentity>) + Send + Sync>,
 ) -> Result<(Vec<u8>, i32)> {
-    exec_rhai_inner(script, dir, cancelled, false, true)
+    exec_rhai_inner_with_child(script, dir, cancelled, false, true, Some(child_changed))
 }
 
 fn exec_rhai_inner(
@@ -63,6 +64,17 @@ fn exec_rhai_inner(
     cancelled: Arc<AtomicBool>,
     operation_limit: bool,
     timeout_exit: bool,
+) -> Result<(Vec<u8>, i32)> {
+    exec_rhai_inner_with_child(script, dir, cancelled, operation_limit, timeout_exit, None)
+}
+
+fn exec_rhai_inner_with_child(
+    script: &str,
+    dir: Option<&str>,
+    cancelled: Arc<AtomicBool>,
+    operation_limit: bool,
+    timeout_exit: bool,
+    child_changed: Option<Arc<dyn Fn(Option<crate::jobs::ChildIdentity>) + Send + Sync>>,
 ) -> Result<(Vec<u8>, i32)> {
     let (output, relay) = OrderedOutput::new()?;
     let runner = Arc::new(Runner::with_output(
@@ -107,6 +119,7 @@ fn exec_rhai_inner(
         let runner = Arc::clone(&runner);
         let dir = dir.clone();
         let cancelled = Arc::clone(&cancelled);
+        let child_changed = child_changed.clone();
         engine.register_fn(
             "run",
             move |args: rhai::Array| -> Result<(), Box<rhai::EvalAltResult>> {
@@ -121,7 +134,13 @@ fn exec_rhai_inner(
                 if let Some(error) = job.spawn_error() {
                     return Err(error.to_string().into());
                 }
+                if let Some(callback) = &child_changed {
+                    callback(job.child_identity().map_err(|e| e.to_string())?);
+                }
                 job.wait_cancelable(&cancelled).map_err(|e| e.to_string())?;
+                if let Some(callback) = &child_changed {
+                    callback(None);
+                }
                 if job.exit_code() != Some(0) {
                     return Err(format!("exit code {}", job.exit_code().unwrap_or(-1)).into());
                 }
@@ -135,6 +154,7 @@ fn exec_rhai_inner(
         let output = output.clone();
         let dir = dir.clone();
         let cancelled = Arc::clone(&cancelled);
+        let child_changed = child_changed.clone();
         engine.register_fn("run_ok", move |args: rhai::Array| -> bool {
             let args = string_args(args);
             if args.is_empty() {
@@ -145,7 +165,14 @@ fn exec_rhai_inner(
             spec.cwd = dir.clone();
             match runner.spawn(spec) {
                 Ok(mut job) if job.spawn_error().is_none() => {
-                    job.wait_cancelable(&cancelled).is_ok() && job.exit_code() == Some(0)
+                    if let Some(callback) = &child_changed {
+                        callback(job.child_identity().ok().flatten());
+                    }
+                    let ok = job.wait_cancelable(&cancelled).is_ok() && job.exit_code() == Some(0);
+                    if let Some(callback) = &child_changed {
+                        callback(None);
+                    }
+                    ok
                 }
                 Ok(job) => {
                     output.write_all(

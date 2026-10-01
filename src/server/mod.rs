@@ -92,6 +92,7 @@ pub(crate) struct AppState {
     pub(crate) auto_approve: bool,
     pub(crate) host_policy: HostPolicy,
     pub(crate) audit: AuditLog,
+    pub(crate) jobs: crate::jobs::JobRegistry,
 }
 
 // ── Logging / panic visibility (serve) ────────────────────────────────────────
@@ -342,7 +343,7 @@ pub(crate) fn unauthorized() -> Response {
 // ── HTTP handlers (serve) ─────────────────────────────────────────────────────
 
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
-pub(crate) const PROTOCOL_FEATURES: &[&str] = &["hash", "timeout"];
+pub(crate) const PROTOCOL_FEATURES: &[&str] = &["hash", "timeout", "concurrency"];
 
 pub(crate) async fn handle_health(headers: HeaderMap) -> Response {
     let wants_json = headers
@@ -521,6 +522,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         }
     });
     let audit = AuditLog::new(config_dir.clone());
+    let jobs = crate::jobs::JobRegistry::new(config_dir.clone())
+        .context("ジョブレジストリを初期化できません")?;
     let state = AppState {
         clip_tx,
         token,
@@ -531,6 +534,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         auto_approve: args.auto_approve,
         host_policy: build_host_policy(args.host_check, args.allow_host),
         audit,
+        jobs,
     };
 
     let serve_start = crate::audit::serve_start_event(

@@ -211,6 +211,7 @@ mod audit;
 mod client;
 mod config;
 mod exec_rhai;
+mod jobs;
 // T4.5 now uses Runner, while some T4.2 API surface remains reserved for the
 // timeout/job lifecycle tasks and is intentionally not called yet.
 #[allow(dead_code)]
@@ -343,7 +344,8 @@ mod tests {
             store,
             auto_approve,
             host_policy: HostPolicy::default(),
-            audit: audit::AuditLog::new(config_dir),
+            audit: audit::AuditLog::new(config_dir.clone()),
+            jobs: jobs::JobRegistry::new(config_dir).unwrap(),
         }
     }
 
@@ -364,7 +366,8 @@ mod tests {
             store,
             auto_approve: false,
             host_policy: HostPolicy::default(),
-            audit: audit::AuditLog::new(config_dir),
+            audit: audit::AuditLog::new(config_dir.clone()),
+            jobs: jobs::JobRegistry::new(config_dir).unwrap(),
         }
     }
 
@@ -1009,13 +1012,14 @@ mod tests {
 
     #[tokio::test]
     async fn ac_t5_1_4_rhai_loop_sleep_and_run_time_out() {
-        // run の子ツリー kill は Unix の Runner でのみ実装済み(Windows は T4.4 まで
-        // スタブで、sh もない)ため、run の経路は Unix でだけ検証する。
-        let mut scripts = vec!["loop {}", "sleep(10000);"];
-        if cfg!(unix) {
-            scripts.push(r#"run(["sh", "-c", "sleep 10"]);"#);
-        }
-        for (index, script) in scripts.into_iter().enumerate() {
+        for (index, script) in [
+            "loop {}",
+            "sleep(10000);",
+            r#"run(["sh", "-c", "sleep 10"]);"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let dir = tempdir().unwrap();
             let state = test_state(dir.path().to_path_buf(), true);
             let mut target = script_target(script);
@@ -1775,7 +1779,10 @@ mod tests {
             .unwrap();
         let value = response_json(app.oneshot(json).await.unwrap()).await;
         assert_eq!(value["proto"], 2);
-        assert_eq!(value["features"], serde_json::json!(["hash", "timeout"]));
+        assert_eq!(
+            value["features"],
+            serde_json::json!(["hash", "timeout", "concurrency"])
+        );
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
     }
 
@@ -2050,6 +2057,127 @@ mod tests {
             .map(|value| value["event"].as_str().unwrap())
             .collect();
         assert_eq!(events, ["register", "approve", "start", "end"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn register_exec_target(
+        state: &AppState,
+        name: &str,
+        script: &str,
+        concurrency: Option<&str>,
+    ) {
+        let mut value = serde_json::json!({"name": name, "script": script});
+        if let Some(concurrency) = concurrency {
+            value["concurrency"] = concurrency.into();
+        }
+        let response = handle_register(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&value).unwrap().into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ac_t6_1_1_and_2_concurrency_is_per_target_and_allow_bypasses_it() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        register_exec_target(&state, "reject", r#"run(["sh", "-c", "sleep 0.4"]);"#, None).await;
+        register_exec_target(&state, "other", r#"run(["sh", "-c", "sleep 0.4"]);"#, None).await;
+        register_exec_target(
+            &state,
+            "allow",
+            r#"run(["sh", "-c", "sleep 0.4"]);"#,
+            Some("allow"),
+        )
+        .await;
+
+        let execute = |state: AppState, name: &'static str| {
+            tokio::spawn(async move {
+                handle_exec(
+                    State(state),
+                    HeaderMap::new(),
+                    serde_json::to_vec(&serde_json::json!({"name":name}))
+                        .unwrap()
+                        .into(),
+                )
+                .await
+            })
+        };
+        let first = execute(state.clone(), "reject");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let conflict = execute(state.clone(), "reject").await.unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let conflict_body = String::from_utf8(
+            axum::body::to_bytes(conflict.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(conflict_body.contains("ジョブ"), "{conflict_body}");
+
+        let other = execute(state.clone(), "other");
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(other.await.unwrap().status(), StatusCode::OK);
+
+        let allow_one = execute(state.clone(), "allow");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let allow_two = execute(state, "allow");
+        assert_eq!(allow_one.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(allow_two.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ac_t6_1_4_rhai_records_child_pid_and_rebuilds_as_orphaned() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        register_exec_target(
+            &state,
+            "rhai-child",
+            r#"run(["sh", "-c", "sleep 1"]);"#,
+            None,
+        )
+        .await;
+        let execution = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                handle_exec(
+                    State(state),
+                    HeaderMap::new(),
+                    serde_json::to_vec(&serde_json::json!({"name":"rhai-child"}))
+                        .unwrap()
+                        .into(),
+                )
+                .await
+            })
+        };
+        let jobs_dir = dir.path().join("jobs");
+        let (id, meta) = loop {
+            let found = std::fs::read_dir(&jobs_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .find_map(|entry| {
+                    let bytes = std::fs::read(entry.path().join("meta.json")).ok()?;
+                    let meta: jobs::JobMeta = serde_json::from_slice(&bytes).ok()?;
+                    if meta.child.is_some() {
+                        Some((meta.id.clone(), meta))
+                    } else {
+                        None
+                    }
+                });
+            if let Some(found) = found {
+                break found;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_ne!(meta.child.unwrap().pid, std::process::id());
+        let rebuilt = jobs::JobRegistry::new(dir.path()).unwrap();
+        assert_eq!(rebuilt.get(&id).unwrap().state, jobs::JobStatus::Orphaned);
+        assert_eq!(execution.await.unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]

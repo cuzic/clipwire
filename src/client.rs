@@ -313,10 +313,11 @@ pub(crate) fn cmd_register(cfg: &ClientConfig, args: &RegisterArgs) -> Result<()
     let capabilities = discover_capabilities(cfg);
     require_features(
         &capabilities,
-        if target.timeout.is_some() {
-            &["timeout"]
-        } else {
-            &[]
+        match (target.timeout.is_some(), target.concurrency.is_some()) {
+            (true, true) => &["timeout", "concurrency"],
+            (true, false) => &["timeout"],
+            (false, true) => &["concurrency"],
+            (false, false) => &[],
         },
     )?;
     let body = register_body(&capabilities, &args.target, &target);

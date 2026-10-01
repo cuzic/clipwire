@@ -24,6 +24,7 @@ struct TargetDefinition {
     #[serde(default)]
     env: std::collections::BTreeMap<String, String>,
     timeout: Option<String>,
+    concurrency: Option<crate::config::Concurrency>,
 }
 
 impl From<TargetDefinition> for StoredTarget {
@@ -34,6 +35,7 @@ impl From<TargetDefinition> for StoredTarget {
             steps: value.steps,
             env: value.env,
             timeout: value.timeout,
+            concurrency: value.concurrency,
             ..Self::default()
         }
     }
@@ -56,6 +58,7 @@ struct FlatRegisterRequest {
     #[serde(default)]
     env: std::collections::BTreeMap<String, String>,
     timeout: Option<String>,
+    concurrency: Option<crate::config::Concurrency>,
 }
 
 fn parse_register_request(body: &[u8]) -> Result<(String, StoredTarget), String> {
@@ -70,6 +73,7 @@ fn parse_register_request(body: &[u8]) -> Result<(String, StoredTarget), String>
                     steps: request.steps,
                     env: request.env,
                     timeout: request.timeout,
+                    concurrency: request.concurrency,
                 }
                 .into(),
             )),

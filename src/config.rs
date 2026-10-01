@@ -52,9 +52,18 @@ pub(crate) struct StoredTarget {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) timeout: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) concurrency: Option<Concurrency>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) approved_at: Option<u64>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Concurrency {
+    Reject,
+    Allow,
 }
 
 #[derive(serde::Serialize)]
@@ -71,6 +80,8 @@ struct CanonicalTarget<'a> {
     env: &'a std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    concurrency: Option<Concurrency>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -82,6 +93,7 @@ pub(crate) fn canonical_json(target: &StoredTarget) -> Vec<u8> {
         steps: target.steps.as_ref(),
         env: &target.env,
         timeout: target.timeout.as_deref(),
+        concurrency: target.concurrency,
     })
     .expect("canonical target serialization cannot fail")
 }
