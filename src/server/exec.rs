@@ -1,8 +1,9 @@
 use super::*;
 use crate::exec_rhai::exec_rhai_with_deadline;
+use crate::jobs::{JobControl, JobStatus};
 use crate::runner::{resolve_timeout, valid_timeout, JobSpec, OrderedOutput, Runner};
-use std::sync::{atomic::AtomicBool, Arc};
-use std::time::Instant;
+use std::sync::{atomic::Ordering, Arc};
+use std::time::{Duration, Instant};
 
 pub(crate) async fn handle_exec_http(
     connect: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
@@ -10,106 +11,150 @@ pub(crate) async fn handle_exec_http(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    handle_exec_with_ip(
-        state,
-        headers,
-        body,
-        connect.map(|value| value.0.ip().to_string()),
-    )
-    .await
+    handle_exec_with_ip(state, headers, body, connect.map(|v| v.0.ip().to_string())).await
 }
 
 #[cfg(test)]
 pub(crate) async fn handle_exec(
-    State(s): State<AppState>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    handle_exec_with_ip(State(s), headers, body, None).await
+    handle_exec_with_ip(State(state), headers, body, None).await
+}
+
+#[derive(serde::Deserialize)]
+struct ExecRequest {
+    name: String,
+    timeout: Option<String>,
+    #[serde(default)]
+    detach: bool,
+}
+
+struct Prepared {
+    request: ExecRequest,
+    payload: ExecPayload,
+    dir: Option<String>,
+    timeout: Duration,
+    def_hash: String,
+    job_id: String,
 }
 
 async fn handle_exec_with_ip(
-    State(s): State<AppState>,
-    headers: HeaderMap,
+    State(state): State<AppState>,
+    _headers: HeaderMap,
     body: axum::body::Bytes,
     requester_ip: Option<String>,
 ) -> Response {
-    if !check_auth(&s.token, &headers) {
-        return unauthorized();
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Req {
-        name: String,
-        timeout: Option<String>,
-    }
-
-    let req: Req = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("JSON parse error: {e}\n")).into_response()
-        }
+    let prepared = match prepare(&state, &body, requester_ip.clone()) {
+        Ok(value) => value,
+        Err(response) => return *response,
     };
-
-    if let Err(e) = validate_target_name(&req.name) {
-        return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response();
+    let detached = prepared.request.detach;
+    let job_id = prepared.job_id.clone();
+    if detached {
+        state.jobs.set_detached(&job_id);
     }
+    let control = Arc::new(JobControl::default());
+    state.jobs.register_control(&job_id, Arc::clone(&control));
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(run_job(state, prepared, requester_ip, control, reply_tx));
 
-    let stored = match s.store.verified_target(&req.name) {
+    if detached {
+        return (
+            StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({ "id": job_id })),
+        )
+            .into_response();
+    }
+    match reply_rx.await {
+        Ok(Ok((output, code))) => exec_response(output, code),
+        Ok(Err(message)) => (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ジョブ応答が失われました\n",
+        )
+            .into_response(),
+    }
+}
+
+fn prepare(
+    state: &AppState,
+    body: &[u8],
+    requester_ip: Option<String>,
+) -> Result<Prepared, Box<Response>> {
+    let request: ExecRequest = serde_json::from_slice(body).map_err(|error| {
+        Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                format!("JSON parse error: {error}\n"),
+            )
+                .into_response(),
+        )
+    })?;
+    validate_target_name(&request.name).map_err(|error| {
+        Box::new((StatusCode::BAD_REQUEST, format!("{error}\n")).into_response())
+    })?;
+    let stored = match state.store.verified_target(&request.name) {
         Ok(Some(target)) => target,
         Ok(None) => {
-            let pending = load_target_map_or_warn(&s.config_dir.join("pending.toml"));
-            if pending.contains_key(&req.name) {
-                return (
-                    StatusCode::CONFLICT,
-                    format!(
+            let pending = load_target_map_or_warn(&state.config_dir.join("pending.toml"));
+            if pending.contains_key(&request.name) {
+                return Err(Box::new(
+                    (
+                        StatusCode::CONFLICT,
+                        format!(
                         "'{}' は承認待ちです。Windows で clipwire approve {} を実行してください\n",
-                        req.name, req.name
+                        request.name, request.name
                     ),
-                )
-                    .into_response();
+                    )
+                        .into_response(),
+                ));
             }
-            return StatusCode::NOT_FOUND.into_response();
+            return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
         }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("承認検証エラー: {e:#}\n"),
-            )
-                .into_response()
+        Err(error) => {
+            return Err(Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("承認検証エラー: {error:#}\n"),
+                )
+                    .into_response(),
+            ))
         }
     };
-
     let definition_text = stored.timeout.clone().unwrap_or_else(|| "30m".into());
     let definition_timeout = match stored.timeout.as_deref().map(humantime::parse_duration) {
         Some(Ok(value)) if valid_timeout(value) => Some(value),
         Some(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "登録済み timeout が不正です\n",
-            )
-                .into_response()
+            return Err(Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "登録済み timeout が不正です\n",
+                )
+                    .into_response(),
+            ))
         }
         None => None,
     };
-    let requested_timeout = match req.timeout.as_deref().map(humantime::parse_duration) {
+    let requested_timeout = match request.timeout.as_deref().map(humantime::parse_duration) {
         Some(Ok(value)) if valid_timeout(value) => Some(value),
         Some(_) => {
-            return (StatusCode::BAD_REQUEST, "timeout が不正です\n").into_response();
+            return Err(Box::new(
+                (StatusCode::BAD_REQUEST, "timeout が不正です\n").into_response(),
+            ))
         }
         None => None,
     };
-    let timeout = match resolve_timeout(definition_timeout, requested_timeout) {
-        Ok(value) => value,
-        Err(_) => {
-            return (
+    let timeout = resolve_timeout(definition_timeout, requested_timeout).map_err(|_| {
+        Box::new(
+            (
                 StatusCode::BAD_REQUEST,
                 format!("要求 timeout はサーバー側の定義値 {definition_text} を超えています\n"),
             )
-                .into_response()
-        }
-    };
-
+                .into_response(),
+        )
+    })?;
     let def_hash = stored
         .hash
         .clone()
@@ -117,156 +162,177 @@ async fn handle_exec_with_ip(
     let concurrency = stored
         .concurrency
         .unwrap_or(crate::config::Concurrency::Reject);
-    let job_id = match s
+    let (dir, payload) = stored.into_exec().map_err(|error| {
+        Box::new((StatusCode::INTERNAL_SERVER_ERROR, format!("{error}\n")).into_response())
+    })?;
+    let job_id = state
         .jobs
-        .start(&req.name, &def_hash, requester_ip.clone(), concurrency)
-    {
-        Ok(id) => id,
-        Err(crate::jobs::Conflict(id)) => {
-            return (
-                StatusCode::CONFLICT,
-                format!("ターゲット '{}' はジョブ {id} で実行中です\n", req.name),
+        .start(&request.name, &def_hash, requester_ip, concurrency)
+        .map_err(|crate::jobs::Conflict(id)| {
+            Box::new(
+                (
+                    StatusCode::CONFLICT,
+                    format!("ターゲット '{}' はジョブ {id} で実行中です\n", request.name),
+                )
+                    .into_response(),
             )
-                .into_response();
-        }
-    };
-    let (dir, payload) = match stored.into_exec() {
-        Ok(v) => v,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
-    };
-
-    let started = Instant::now();
-    let mut start_event = crate::audit::AuditEvent::new(crate::audit::AuditEventKind::Start)
-        .target(&req.name, &def_hash)
-        .requester(requester_ip.clone());
-    start_event.job_id = Some(job_id.clone());
-    start_event.args = Some(req.timeout.into_iter().collect());
-    s.audit.record(start_event);
-
-    let response = match payload {
-        ExecPayload::Steps { steps, env } => {
-            let cancelled = Arc::new(AtomicBool::new(false));
-            let deadline_cancelled = Arc::clone(&cancelled);
-            let deadline = tokio::spawn(async move {
-                tokio::time::sleep(timeout).await;
-                deadline_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-            });
-            let registry = s.jobs.clone();
-            let running_job_id = job_id.clone();
-            let result = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, i32)> {
-                let (output, relay) = OrderedOutput::new()?;
-                let runner = Runner::with_output(
-                    std::env::temp_dir().join("clipwire-runner"),
-                    output.clone(),
-                );
-                let mut exit_code = 0;
-                for args in steps.into_argv() {
-                    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                        exit_code = 124;
-                        break;
-                    }
-                    if args.is_empty() {
-                        continue;
-                    }
-                    let mut spec = JobSpec::new(&args[0], "http");
-                    spec.args = args[1..].iter().map(Into::into).collect();
-                    spec.cwd = dir.as_ref().map(Into::into);
-                    spec.env = env
-                        .iter()
-                        .map(|(key, value)| (key.into(), value.into()))
-                        .collect();
-                    let mut job = runner.spawn(spec)?;
-                    if let Some(error) = job.spawn_error() {
-                        return Err(anyhow::anyhow!("実行エラー: {error}"));
-                    }
-                    registry.set_child(&running_job_id, job.child_identity()?);
-                    job.wait_cancelable(&cancelled)?;
-                    registry.set_child(&running_job_id, None);
-                    exit_code = job.exit_code().unwrap_or(-1);
-                    if exit_code != 0 {
-                        break;
-                    }
-                }
-                drop(runner);
-                Ok((output.finish(relay)?, exit_code))
-            })
-            .await;
-            deadline.abort();
-            match result {
-                Ok(Ok((output, code))) => exec_response(output, code),
-                Ok(Err(error)) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, format!("{error}\n")).into_response()
-                }
-                Err(error) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("thread panic: {error}\n"),
-                )
-                    .into_response(),
-            }
-        }
-
-        ExecPayload::Script { script } => {
-            let cancelled = Arc::new(AtomicBool::new(false));
-            let deadline_cancelled = Arc::clone(&cancelled);
-            let deadline = tokio::spawn(async move {
-                tokio::time::sleep(timeout).await;
-                deadline_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-            });
-            let registry = s.jobs.clone();
-            let running_job_id = job_id.clone();
-            let child_changed = Arc::new(move |child| registry.set_child(&running_job_id, child));
-            let result = tokio::task::spawn_blocking(move || {
-                exec_rhai_with_deadline(&script, dir.as_deref(), cancelled, child_changed)
-            })
-            .await;
-            deadline.abort();
-            match result {
-                Ok(Ok((out, code))) => exec_response(out, code),
-                Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("thread panic: {e}\n"),
-                )
-                    .into_response(),
-            }
-        }
-    };
-    let exit_code = response
-        .headers()
-        .get("X-Exit-Code")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<i32>().ok())
-        .unwrap_or(-1);
-    let final_state = if exit_code == 0 {
-        crate::jobs::JobStatus::Succeeded
-    } else if exit_code == 124 {
-        crate::jobs::JobStatus::Timeout
-    } else {
-        crate::jobs::JobStatus::Failed
-    };
-    s.jobs.finish(&job_id, final_state, Some(exit_code));
-    if exit_code == 124 {
-        for kind in [
-            crate::audit::AuditEventKind::Kill,
-            crate::audit::AuditEventKind::Timeout,
-        ] {
-            let mut event = crate::audit::AuditEvent::new(kind)
-                .target(&req.name, &def_hash)
-                .requester(requester_ip.clone());
-            event.job_id = Some(job_id.clone());
-            event.exit_code = Some(exit_code);
-            event.duration_ms = Some(crate::audit::duration_millis(started.elapsed()));
-            s.audit.record(event);
-        }
+        })?;
+    for lost in state.jobs.take_lost_events() {
+        let mut event = crate::audit::AuditEvent::new(crate::audit::AuditEventKind::Lost)
+            .target(&lost.target, &lost.def_hash);
+        event.job_id = Some(lost.id);
+        state.audit.record(event);
     }
-    let mut end_event = crate::audit::AuditEvent::new(crate::audit::AuditEventKind::End)
-        .target(&req.name, &def_hash)
-        .requester(requester_ip);
-    end_event.job_id = Some(job_id);
-    end_event.exit_code = Some(exit_code);
-    end_event.duration_ms = Some(crate::audit::duration_millis(started.elapsed()));
-    s.audit.record(end_event);
-    response
+    Ok(Prepared {
+        request,
+        payload,
+        dir,
+        timeout,
+        def_hash,
+        job_id,
+    })
+}
+
+async fn run_job(
+    state: AppState,
+    prepared: Prepared,
+    requester_ip: Option<String>,
+    control: Arc<JobControl>,
+    reply: tokio::sync::oneshot::Sender<Result<(Vec<u8>, i32), String>>,
+) {
+    let Prepared {
+        request,
+        payload,
+        dir,
+        timeout,
+        def_hash,
+        job_id,
+    } = prepared;
+    let started = Instant::now();
+    let mut start = crate::audit::AuditEvent::new(crate::audit::AuditEventKind::Start)
+        .target(&request.name, &def_hash)
+        .requester(requester_ip.clone());
+    start.job_id = Some(job_id.clone());
+    start.args = Some(request.timeout.into_iter().collect());
+    state.audit.record(start);
+
+    let cancel = control.cancelled();
+    let deadline_cancel = Arc::clone(&cancel);
+    let deadline = tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        deadline_cancel.store(true, Ordering::Release);
+    });
+    let registry = state.jobs.clone();
+    let running_id = job_id.clone();
+    let result = tokio::task::spawn_blocking(move || match payload {
+        ExecPayload::Steps { steps, env } => {
+            let (output, relay) = OrderedOutput::new().map_err(|e| e.to_string())?;
+            let runner =
+                Runner::with_output(std::env::temp_dir().join("clipwire-runner"), output.clone());
+            let mut exit_code = 0;
+            for args in steps.into_argv() {
+                if cancel.load(Ordering::Acquire) {
+                    exit_code = 124;
+                    break;
+                }
+                if args.is_empty() {
+                    continue;
+                }
+                let mut spec = JobSpec::new(&args[0], "http");
+                spec.args = args[1..].iter().map(Into::into).collect();
+                spec.cwd = dir.as_ref().map(Into::into);
+                spec.env = env.iter().map(|(k, v)| (k.into(), v.into())).collect();
+                let mut job = runner.spawn(spec).map_err(|e| e.to_string())?;
+                if let Some(error) = job.spawn_error() {
+                    return Err(format!("実行エラー: {error}"));
+                }
+                registry.set_child(
+                    &running_id,
+                    job.child_identity().map_err(|e| e.to_string())?,
+                );
+                job.wait_cancelable(&cancel).map_err(|e| e.to_string())?;
+                registry.set_child(&running_id, None);
+                exit_code = job.exit_code().unwrap_or(-1);
+                if exit_code != 0 {
+                    break;
+                }
+            }
+            drop(runner);
+            output
+                .finish(relay)
+                .map(|bytes| (bytes, exit_code))
+                .map_err(|e| e.to_string())
+        }
+        ExecPayload::Script { script } => {
+            let callback_registry = registry.clone();
+            let callback_id = running_id.clone();
+            let child_changed =
+                Arc::new(move |child| callback_registry.set_child(&callback_id, child));
+            exec_rhai_with_deadline(&script, dir.as_deref(), cancel, child_changed)
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await;
+    deadline.abort();
+    let result = match result {
+        Ok(value) => value,
+        Err(error) => Err(format!("thread panic: {error}")),
+    };
+    let killed = control.was_killed();
+    let (output, code) = match &result {
+        Ok((output, code)) => (output.clone(), *code),
+        Err(message) => (format!("{message}\n").into_bytes(), -1),
+    };
+    if let Err(error) = state.jobs.write_log(&job_id, &output) {
+        tracing::error!(job_id = %job_id, "ジョブログの保存に失敗しました: {error}");
+    }
+    let final_state = if killed {
+        JobStatus::Killed
+    } else if code == 0 {
+        JobStatus::Succeeded
+    } else if code == 124 {
+        JobStatus::Timeout
+    } else {
+        JobStatus::Failed
+    };
+    state.jobs.finish(&job_id, final_state, Some(code));
+    if code == 124 && !killed {
+        record_event(
+            &state,
+            crate::audit::AuditEventKind::Timeout,
+            (&job_id, &request.name, &def_hash),
+            requester_ip.clone(),
+            code,
+            started.elapsed(),
+        );
+    }
+    record_event(
+        &state,
+        crate::audit::AuditEventKind::End,
+        (&job_id, &request.name, &def_hash),
+        requester_ip,
+        code,
+        started.elapsed(),
+    );
+    let _ = reply.send(result);
+}
+
+fn record_event(
+    state: &AppState,
+    kind: crate::audit::AuditEventKind,
+    job: (&str, &str, &str),
+    requester: Option<String>,
+    code: i32,
+    elapsed: Duration,
+) {
+    let (id, target, hash) = job;
+    let mut event = crate::audit::AuditEvent::new(kind)
+        .target(target, hash)
+        .requester(requester);
+    event.job_id = Some(id.to_string());
+    event.exit_code = Some(code);
+    event.duration_ms = Some(crate::audit::duration_millis(elapsed));
+    state.audit.record(event);
 }
 
 pub(crate) fn exec_response(body: Vec<u8>, exit_code: i32) -> Response {

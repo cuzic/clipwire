@@ -21,6 +21,7 @@ pub(crate) enum AuditEventKind {
     End,
     Kill,
     Timeout,
+    Lost,
     #[allow(dead_code)]
     AutoApprove,
     ServeStart,

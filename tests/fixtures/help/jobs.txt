@@ -1,0 +1,6 @@
+ジョブ一覧を表示
+
+Usage: clipwire jobs
+
+Options:
+  -h, --help  Print help

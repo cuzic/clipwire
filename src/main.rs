@@ -62,6 +62,12 @@ enum Cmd {
     Open(OpenArgs),
     /// 登録済みターゲットを Windows で実行して結果を取得
     Exec(ExecArgs),
+    /// ジョブ一覧を表示
+    Jobs,
+    /// ジョブのログを表示
+    Logs(JobIdArgs),
+    /// 実行中のジョブを終了
+    Kill(JobIdArgs),
     /// ターゲットの定義を Windows に送って承認待ちに追加
     Register(RegisterArgs),
     /// 承認待ちターゲットを承認して registered.toml に保存 (Windows ローカルで実行)
@@ -205,6 +211,15 @@ struct ExecArgs {
     /// ターゲット定義の上限より短い実行期限
     #[arg(long, value_name = "DURATION")]
     timeout: Option<String>,
+    /// ジョブ ID を即座に返し、バックグラウンドで実行
+    #[arg(long)]
+    detach: bool,
+}
+
+#[derive(Args, Debug)]
+struct JobIdArgs {
+    /// ジョブ ID
+    id: String,
 }
 
 mod audit;
@@ -267,6 +282,18 @@ fn main() -> Result<()> {
         Cmd::Exec(args) => {
             let cfg = ClientConfig::from_env()?;
             cmd_exec(&cfg, &args)
+        }
+        Cmd::Jobs => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_jobs(&cfg)
+        }
+        Cmd::Logs(args) => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_logs(&cfg, &args)
+        }
+        Cmd::Kill(args) => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_kill(&cfg, &args)
         }
         Cmd::Register(args) => {
             let cfg = ClientConfig::from_env()?;
@@ -393,6 +420,10 @@ mod tests {
                     "/targets/check",
                     RouteClass::Protected,
                 ),
+                (RouteId::Jobs, "/jobs", RouteClass::Protected),
+                (RouteId::Job, "/jobs/:id", RouteClass::Protected),
+                (RouteId::JobLog, "/jobs/:id/log", RouteClass::Protected),
+                (RouteId::JobKill, "/jobs/:id/kill", RouteClass::Protected),
             ]
         );
     }
@@ -516,6 +547,14 @@ mod tests {
                     "/targets/check",
                     RegisteredMutation::Never,
                 ),
+                (RouteId::Jobs, "/jobs", RegisteredMutation::Never),
+                (RouteId::Job, "/jobs/:id", RegisteredMutation::Never),
+                (RouteId::JobLog, "/jobs/:id/log", RegisteredMutation::Never),
+                (
+                    RouteId::JobKill,
+                    "/jobs/:id/kill",
+                    RegisteredMutation::Never
+                ),
             ]
         );
     }
@@ -546,7 +585,9 @@ mod tests {
 
         for route in ROUTES {
             let method = match route.id {
-                RouteId::Exec | RouteId::Register | RouteId::TargetsCheck => "POST",
+                RouteId::Exec | RouteId::Register | RouteId::TargetsCheck | RouteId::JobKill => {
+                    "POST"
+                }
                 _ => "GET",
             };
             let request = axum::http::Request::builder()
@@ -1344,6 +1385,7 @@ mod tests {
             &ExecArgs {
                 target: "../bad".into(),
                 timeout: None,
+                detach: false,
             },
         )
         .unwrap_err()
@@ -1616,6 +1658,7 @@ mod tests {
                 &ExecArgs {
                     target: "valid".into(),
                     timeout: None,
+                    detach: false,
                 },
             )
             .unwrap_err()
@@ -1781,7 +1824,7 @@ mod tests {
         assert_eq!(value["proto"], 2);
         assert_eq!(
             value["features"],
-            serde_json::json!(["hash", "timeout", "concurrency"])
+            serde_json::json!(["hash", "timeout", "concurrency", "jobs"])
         );
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
     }
@@ -2371,5 +2414,279 @@ mod tests {
         assert!(elapsed < Duration::from_secs(60), "elapsed={elapsed:?}");
         let values = audit_values(dir.path());
         assert_eq!(values.len(), 1571 * 2);
+    }
+
+    #[tokio::test]
+    async fn ac_t6_2_1_detach_returns_id_and_job_completes() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        handle_register(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(
+                &serde_json::json!({"name":"detached","script":"sleep(150); print(\"done\");"}),
+            )
+            .unwrap()
+            .into(),
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let response = handle_exec(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"detached","detach":true}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let value = response_json(response).await;
+        let id = value["id"].as_str().unwrap();
+        assert_eq!(state.jobs.get(id).unwrap().state, jobs::JobStatus::Running);
+        for _ in 0..100 {
+            if state.jobs.get(id).unwrap().state == jobs::JobStatus::Succeeded {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("detached job did not finish");
+    }
+
+    #[tokio::test]
+    async fn ac_t6_2_2_logs_return_full_output_and_offset() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        let id = state
+            .jobs
+            .start("log", "hash", None, Concurrency::Allow)
+            .unwrap();
+        state.jobs.write_log(&id, b"abcdef").unwrap();
+        state.jobs.finish(&id, jobs::JobStatus::Succeeded, Some(0));
+        let full = server::jobs::log(
+            State(state.clone()),
+            axum::extract::Path(id.clone()),
+            Query(server::jobs::LogQuery { offset: 0 }),
+        )
+        .await;
+        let tail = server::jobs::log(
+            State(state),
+            axum::extract::Path(id),
+            Query(server::jobs::LogQuery { offset: 3 }),
+        )
+        .await;
+        assert_eq!(
+            axum::body::to_bytes(full.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "abcdef"
+        );
+        assert_eq!(
+            axum::body::to_bytes(tail.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "def"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ac_t6_2_3_kill_terminates_tree_changes_state_and_audits() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        register_exec_target(
+            &state,
+            "killable",
+            r#"run(["sh", "-c", "sleep 100 & sleep 100"]);"#,
+            None,
+        )
+        .await;
+        let response = handle_exec(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"killable","detach":true}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        let id = response_json(response).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for _ in 0..100 {
+            if state.jobs.get(&id).unwrap().child.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let killed = server::jobs::kill(
+            State(state.clone()),
+            axum::extract::Path(id.clone()),
+            "{}".into(),
+        )
+        .await;
+        assert_eq!(killed.status(), StatusCode::ACCEPTED);
+        for _ in 0..100 {
+            if state.jobs.get(&id).unwrap().state == jobs::JobStatus::Killed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.jobs.get(&id).unwrap().state, jobs::JobStatus::Killed);
+        assert!(audit_values(dir.path())
+            .iter()
+            .any(|event| event["event"] == "kill"));
+        let again = server::jobs::kill(State(state), axum::extract::Path(id), "{}".into()).await;
+        assert_eq!(again.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn ac_t6_2_4_dropped_normal_exec_request_does_not_cancel_job() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        handle_register(State(state.clone()), HeaderMap::new(), serde_json::to_vec(
+            &serde_json::json!({"name":"disconnected","script":"sleep(100); print(\"survived\");"})
+        ).unwrap().into()).await;
+        let request_state = state.clone();
+        let request = tokio::spawn(async move {
+            handle_exec(
+                State(request_state),
+                HeaderMap::new(),
+                serde_json::to_vec(&serde_json::json!({"name":"disconnected"}))
+                    .unwrap()
+                    .into(),
+            )
+            .await
+        });
+        let id = loop {
+            if let Some(job) = state
+                .jobs
+                .list(None)
+                .into_iter()
+                .find(|job| job.target == "disconnected")
+            {
+                break job.id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        request.abort();
+        for _ in 0..100 {
+            if state.jobs.get(&id).unwrap().state == jobs::JobStatus::Succeeded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.jobs.get(&id).unwrap().state,
+            jobs::JobStatus::Succeeded
+        );
+        assert_eq!(state.jobs.read_log(&id, 0).unwrap().unwrap(), b"survived\n");
+    }
+
+    #[tokio::test]
+    async fn ac_t6_2_5_jobs_routes_enforce_auth_origin_and_json() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), false);
+        let request = |method: &str, path: &str| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::HOST, "localhost")
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+        assert_eq!(
+            build_router(state.clone())
+                .oneshot(request("GET", "/jobs"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut token_state = state.clone();
+        token_state.token = Some("secret".into());
+        let wrong = axum::http::Request::builder()
+            .uri("/jobs")
+            .header(header::HOST, "localhost")
+            .header(header::AUTHORIZATION, "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            build_router(token_state)
+                .oneshot(wrong)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut open_state = state;
+        open_state.allow_no_token = true;
+        assert_eq!(
+            build_router(open_state.clone())
+                .oneshot(request("GET", "/jobs"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let origin = axum::http::Request::builder()
+            .uri("/jobs")
+            .header(header::HOST, "localhost")
+            .header(header::ORIGIN, "http://evil")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            build_router(open_state.clone())
+                .oneshot(origin)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let plain = axum::http::Request::builder()
+            .method("POST")
+            .uri("/jobs/nope/kill")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            build_router(open_state)
+                .oneshot(plain)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t6_2_6_unknown_job_ids_return_404() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.allow_no_token = true;
+        let app = build_router(state);
+        for path in ["/jobs/missing", "/jobs/missing/log"] {
+            let request = axum::http::Request::builder()
+                .uri(path)
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/jobs/missing/kill")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }

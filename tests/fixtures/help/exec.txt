@@ -7,4 +7,5 @@ Arguments:
 
 Options:
       --timeout <DURATION>  ターゲット定義の上限より短い実行期限
+      --detach              ジョブ ID を即座に返し、バックグラウンドで実行
   -h, --help                Print help

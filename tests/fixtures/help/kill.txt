@@ -1,0 +1,9 @@
+実行中のジョブを終了
+
+Usage: clipwire kill <ID>
+
+Arguments:
+  <ID>  ジョブ ID
+
+Options:
+  -h, --help  Print help

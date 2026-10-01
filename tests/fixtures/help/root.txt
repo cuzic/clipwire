@@ -8,6 +8,9 @@ Commands:
   put       stdin の内容を Windows クリップボードに書き込む
   open      Windows のデフォルトブラウザで Web サービスを開く
   exec      登録済みターゲットを Windows で実行して結果を取得
+  jobs      ジョブ一覧を表示
+  logs      ジョブのログを表示
+  kill      実行中のジョブを終了
   register  ターゲットの定義を Windows に送って承認待ちに追加
   approve   承認待ちターゲットを承認して registered.toml に保存 (Windows ローカルで実行)
   pending   承認待ちターゲットの一覧を表示 (Windows ローカルで実行)

@@ -260,15 +260,17 @@ pub(crate) fn cmd_put(cfg: &ClientConfig) -> Result<()> {
 pub(crate) fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
     validate_target_name(&args.target)?;
     let capabilities = discover_capabilities(cfg);
-    require_features(
-        &capabilities,
-        if args.timeout.is_some() {
-            &["timeout"]
-        } else {
-            &[]
-        },
-    )?;
-    let body = serde_json::json!({ "name": args.target, "timeout": args.timeout }).to_string();
+    let mut required = Vec::new();
+    if args.timeout.is_some() {
+        required.push("timeout");
+    }
+    if args.detach {
+        required.push("jobs");
+    }
+    require_features(&capabilities, &required)?;
+    let body =
+        serde_json::json!({ "name": args.target, "timeout": args.timeout, "detach": args.detach })
+            .to_string();
     let url = format!("{}/exec", cfg.base_url());
     let req = cfg.set_auth(
         ureq::post(&url)
@@ -293,6 +295,16 @@ pub(crate) fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
         }
         Err(e) => bail!("{} に接続できません: {}", cfg.base_url(), e),
     };
+    if args.detach {
+        let value: serde_json::Value = serde_json::from_reader(resp.into_reader())?;
+        println!(
+            "{}",
+            value["id"]
+                .as_str()
+                .context("応答にジョブ ID がありません")?
+        );
+        return Ok(());
+    }
     let exit_code: i32 = resp
         .header("X-Exit-Code")
         .and_then(|v| v.parse().ok())
@@ -303,6 +315,66 @@ pub(crate) fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
         bail!("exit code {exit_code}");
     }
     Ok(())
+}
+
+fn jobs_request(cfg: &ClientConfig, path: &str) -> Result<ureq::Response> {
+    require_features(&discover_capabilities(cfg), &["jobs"])?;
+    let url = format!("{}{}", cfg.base_url(), path);
+    match cfg
+        .set_auth(ureq::get(&url).timeout(Duration::from_secs(30)))
+        .call()
+    {
+        Ok(response) => Ok(response),
+        Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
+        Err(ureq::Error::Status(404, _)) => bail!("ジョブが見つかりません"),
+        Err(ureq::Error::Status(code, response)) => bail!(
+            "HTTP {}: {}",
+            code,
+            response.into_string().unwrap_or_default().trim()
+        ),
+        Err(error) => bail!("{} に接続できません: {}", cfg.base_url(), error),
+    }
+}
+
+pub(crate) fn cmd_jobs(cfg: &ClientConfig) -> Result<()> {
+    let response = jobs_request(cfg, "/jobs")?;
+    let jobs: Vec<crate::jobs::JobMeta> = serde_json::from_reader(response.into_reader())?;
+    for job in jobs {
+        println!("{}\t{:?}\t{}", job.id, job.state, job.target);
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_logs(cfg: &ClientConfig, args: &JobIdArgs) -> Result<()> {
+    let response = jobs_request(cfg, &format!("/jobs/{}/log", args.id))?;
+    io::copy(&mut response.into_reader(), &mut io::stdout())?;
+    Ok(())
+}
+
+pub(crate) fn cmd_kill(cfg: &ClientConfig, args: &JobIdArgs) -> Result<()> {
+    require_features(&discover_capabilities(cfg), &["jobs"])?;
+    let url = format!("{}/jobs/{}/kill", cfg.base_url(), args.id);
+    match cfg
+        .set_auth(
+            ureq::post(&url)
+                .set("Content-Type", "application/json")
+                .timeout(Duration::from_secs(30)),
+        )
+        .send_string("{}")
+    {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
+        Err(ureq::Error::Status(404, _)) => bail!("ジョブが見つかりません"),
+        Err(ureq::Error::Status(409, response)) => {
+            bail!("{}", response.into_string().unwrap_or_default().trim())
+        }
+        Err(ureq::Error::Status(code, response)) => bail!(
+            "HTTP {}: {}",
+            code,
+            response.into_string().unwrap_or_default().trim()
+        ),
+        Err(error) => bail!("{} に接続できません: {}", cfg.base_url(), error),
+    }
 }
 
 // ── Client: register ──────────────────────────────────────────────────────────

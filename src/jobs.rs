@@ -7,7 +7,10 @@ use std::{
     collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -88,6 +91,39 @@ pub(crate) struct JobMeta {
 pub(crate) struct JobRegistry {
     root: PathBuf,
     jobs: Arc<Mutex<HashMap<String, JobMeta>>>,
+    controls: Arc<Mutex<HashMap<String, Arc<JobControl>>>>,
+    lost_events: Arc<Mutex<Vec<JobMeta>>>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct JobControl {
+    cancelled: Arc<AtomicBool>,
+    killed: AtomicBool,
+}
+
+impl JobControl {
+    pub(crate) fn cancelled(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    pub(crate) fn was_killed(&self) -> bool {
+        self.killed.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum KillDecision {
+    Accepted,
+    Missing,
+    Finished,
+}
+
+fn decide_kill(status: Option<JobStatus>, has_control: bool) -> KillDecision {
+    match status {
+        None => KillDecision::Missing,
+        Some(status) if !status.active() || !has_control => KillDecision::Finished,
+        Some(_) => KillDecision::Accepted,
+    }
 }
 
 #[derive(Debug)]
@@ -98,6 +134,7 @@ impl JobRegistry {
         let root = config_dir.into().join("jobs");
         fs::create_dir_all(&root)?;
         let mut jobs = HashMap::new();
+        let mut lost_events = Vec::new();
         for entry in fs::read_dir(&root)? {
             let path = entry?.path().join("meta.json");
             let Ok(bytes) = fs::read(&path) else { continue };
@@ -113,6 +150,7 @@ impl JobRegistry {
                 meta.state = transition(meta.state, event).expect("recovery transition");
                 if meta.state == JobStatus::Lost {
                     meta.ended_at = Some(now_millis());
+                    lost_events.push(meta.clone());
                 }
                 write_meta(&root, &meta)?;
             }
@@ -121,6 +159,8 @@ impl JobRegistry {
         let registry = Self {
             root,
             jobs: Arc::new(Mutex::new(jobs)),
+            controls: Arc::new(Mutex::new(HashMap::new())),
+            lost_events: Arc::new(Mutex::new(lost_events)),
         };
         registry.prune();
         Ok(registry)
@@ -152,6 +192,7 @@ impl JobRegistry {
                     if let Err(error) = write_meta(&self.root, job) {
                         tracing::error!("lost ジョブの保存に失敗しました: {error:#}");
                     }
+                    self.lost_events.lock().unwrap().push(job.clone());
                 } else {
                     return Err(Conflict(id));
                 }
@@ -187,6 +228,26 @@ impl JobRegistry {
         }
     }
 
+    pub(crate) fn register_control(&self, id: &str, control: Arc<JobControl>) {
+        self.controls
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), control);
+    }
+
+    pub(crate) fn request_kill(&self, id: &str) -> KillDecision {
+        let jobs = self.jobs.lock().unwrap();
+        let control = self.controls.lock().unwrap().get(id).cloned();
+        let decision = decide_kill(jobs.get(id).map(|job| job.state), control.is_some());
+        if decision != KillDecision::Accepted {
+            return decision;
+        }
+        let control = control.expect("accepted kill has a control");
+        control.killed.store(true, Ordering::Release);
+        control.cancelled.store(true, Ordering::Release);
+        KillDecision::Accepted
+    }
+
     pub(crate) fn finish(&self, id: &str, status: JobStatus, exit_code: Option<i32>) {
         let event = match status {
             JobStatus::Succeeded => Event::Succeed,
@@ -207,12 +268,55 @@ impl JobRegistry {
             }
         }
         drop(jobs);
+        self.controls.lock().unwrap().remove(id);
         self.prune();
     }
 
-    #[cfg(test)]
     pub(crate) fn get(&self, id: &str) -> Option<JobMeta> {
         self.jobs.lock().unwrap().get(id).cloned()
+    }
+
+    pub(crate) fn list(&self, state: Option<JobStatus>) -> Vec<JobMeta> {
+        let mut jobs: Vec<_> = self
+            .jobs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|job| state.is_none_or(|state| job.state == state))
+            .cloned()
+            .collect();
+        jobs.sort_by_key(|job| std::cmp::Reverse(job.started_at));
+        jobs
+    }
+
+    pub(crate) fn take_lost_events(&self) -> Vec<JobMeta> {
+        std::mem::take(&mut *self.lost_events.lock().unwrap())
+    }
+
+    pub(crate) fn set_detached(&self, id: &str) {
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(job) = jobs.get_mut(id) {
+            job.detached = true;
+            if let Err(error) = write_meta(&self.root, job) {
+                tracing::error!("detach 情報の保存に失敗しました: {error:#}");
+            }
+        }
+    }
+
+    pub(crate) fn write_log(&self, id: &str, bytes: &[u8]) -> io::Result<()> {
+        fs::write(self.root.join(id).join("log"), bytes)
+    }
+
+    pub(crate) fn read_log(&self, id: &str, offset: usize) -> io::Result<Option<Vec<u8>>> {
+        if !self.jobs.lock().unwrap().contains_key(id) {
+            return Ok(None);
+        }
+        let bytes = match fs::read(self.root.join(id).join("log")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        Ok(Some(bytes.get(offset.min(bytes.len())..).unwrap().to_vec()))
     }
 
     fn prune(&self) {

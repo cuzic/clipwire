@@ -22,6 +22,10 @@ pub(crate) enum RouteId {
     Exec,
     Register,
     TargetsCheck,
+    Jobs,
+    Job,
+    JobLog,
+    JobKill,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,6 +97,30 @@ pub(crate) const ROUTES: &[RouteSpec] = &[
         class: RouteClass::Protected,
         registered_mutation: RegisteredMutation::Never,
     },
+    RouteSpec {
+        id: RouteId::Jobs,
+        path: "/jobs",
+        class: RouteClass::Protected,
+        registered_mutation: RegisteredMutation::Never,
+    },
+    RouteSpec {
+        id: RouteId::Job,
+        path: "/jobs/:id",
+        class: RouteClass::Protected,
+        registered_mutation: RegisteredMutation::Never,
+    },
+    RouteSpec {
+        id: RouteId::JobLog,
+        path: "/jobs/:id/log",
+        class: RouteClass::Protected,
+        registered_mutation: RegisteredMutation::Never,
+    },
+    RouteSpec {
+        id: RouteId::JobKill,
+        path: "/jobs/:id/kill",
+        class: RouteClass::Protected,
+        registered_mutation: RegisteredMutation::Never,
+    },
 ];
 
 pub(crate) fn build_router(state: AppState) -> Router {
@@ -119,6 +147,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
                 post(handle_targets_check)
                     .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
             ),
+            RouteId::Jobs => Router::new().route(route.path, get(super::jobs::list)),
+            RouteId::Job => Router::new().route(route.path, get(super::jobs::get_job)),
+            RouteId::JobLog => Router::new().route(route.path, get(super::jobs::log)),
+            RouteId::JobKill => Router::new().route(route.path, post(super::jobs::kill)),
         };
         match route.class {
             RouteClass::Common => common = common.merge(router),
@@ -193,6 +225,9 @@ async fn reject_origin(request: Request, next: Next) -> Response {
 }
 
 async fn require_json_content_type(request: Request, next: Next) -> Response {
+    if request.method() != axum::http::Method::POST {
+        return next.run(request).await;
+    }
     let is_json = request
         .headers()
         .get(header::CONTENT_TYPE)

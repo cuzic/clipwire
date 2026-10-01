@@ -3,6 +3,7 @@ use super::*;
 mod clip;
 mod exec;
 mod http_surface;
+pub(crate) mod jobs;
 mod register;
 
 use crate::audit::AuditLog;
@@ -343,7 +344,7 @@ pub(crate) fn unauthorized() -> Response {
 // ── HTTP handlers (serve) ─────────────────────────────────────────────────────
 
 pub(crate) const PROTOCOL_VERSION: u32 = 2;
-pub(crate) const PROTOCOL_FEATURES: &[&str] = &["hash", "timeout", "concurrency"];
+pub(crate) const PROTOCOL_FEATURES: &[&str] = &["hash", "timeout", "concurrency", "jobs"];
 
 pub(crate) async fn handle_health(headers: HeaderMap) -> Response {
     let wants_json = headers
@@ -524,6 +525,12 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let audit = AuditLog::new(config_dir.clone());
     let jobs = crate::jobs::JobRegistry::new(config_dir.clone())
         .context("ジョブレジストリを初期化できません")?;
+    for job in jobs.take_lost_events() {
+        let mut event = crate::audit::AuditEvent::new(crate::audit::AuditEventKind::Lost)
+            .target(&job.target, &job.def_hash);
+        event.job_id = Some(job.id);
+        audit.record(event);
+    }
     let state = AppState {
         clip_tx,
         token,
