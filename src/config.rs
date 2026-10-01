@@ -49,6 +49,10 @@ pub(crate) struct StoredTarget {
     pub(crate) steps: Option<StepsDef>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub(crate) env: std::collections::BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) approved_at: Option<u64>,
 }
 
 #[derive(serde::Serialize)]

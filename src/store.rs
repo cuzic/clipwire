@@ -19,6 +19,10 @@ pub(crate) struct Store {
 
 pub(crate) struct RegisterResult {
     pub(crate) reapproval: bool,
+    pub(crate) unchanged: bool,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) redisplay_required: bool,
+    pub(crate) hash: String,
 }
 
 impl Store {
@@ -42,17 +46,80 @@ impl Store {
                 let pending_path = root.join("pending.toml");
                 let registered_path = root.join("registered.toml");
                 let mut registered = load_for_update(&registered_path)?;
-                if auto_approve {
-                    registered.insert(name, target);
+                let canonical = canonical_json(&target);
+                let hash = definition_hash(&canonical);
+                let mut pending = load_for_update(&pending_path)?;
+
+                if registered
+                    .get(&name)
+                    .is_some_and(|entry| definition_hash(&canonical_json(entry)) == hash)
+                {
+                    let pending_changed = pending.remove(&name).is_some();
+                    if pending_changed {
+                        atomic_save_target_map(&pending_path, &pending)?;
+                    }
+                    return Ok(RegisterResult {
+                        reapproval: false,
+                        unchanged: true,
+                        redisplay_required: false,
+                        hash,
+                    });
+                }
+
+                // A registered -> B pending -> A registered again: the name is no
+                // longer in registered.toml, so use the immutable approval record
+                // to recognize the previously approved definition.
+                if pending.contains_key(&name) && approval_record_matches(&root, &hash, &canonical)?
+                {
+                    let approved = approve_target(&root, target, &canonical, &hash)?;
+                    registered.insert(name.clone(), approved);
+                    pending.remove(&name);
                     atomic_save_target_map(&registered_path, &registered)?;
-                    return Ok(RegisterResult { reapproval: false });
+                    atomic_save_target_map(&pending_path, &pending)?;
+                    return Ok(RegisterResult {
+                        reapproval: false,
+                        unchanged: true,
+                        redisplay_required: false,
+                        hash,
+                    });
+                }
+
+                if auto_approve {
+                    let approved = approve_target(&root, target, &canonical, &hash)?;
+                    registered.insert(name.clone(), approved);
+                    let pending_changed = pending.remove(&name).is_some();
+                    atomic_save_target_map(&registered_path, &registered)?;
+                    if pending_changed {
+                        atomic_save_target_map(&pending_path, &pending)?;
+                    }
+                    return Ok(RegisterResult {
+                        reapproval: false,
+                        unchanged: false,
+                        redisplay_required: false,
+                        hash,
+                    });
                 }
                 let reapproval = registered.remove(&name).is_some();
-                let mut pending = load_for_update(&pending_path)?;
+                let pending_same = pending
+                    .get(&name)
+                    .is_some_and(|entry| definition_hash(&canonical_json(entry)) == hash);
+                if pending_same {
+                    return Ok(RegisterResult {
+                        reapproval,
+                        unchanged: true,
+                        redisplay_required: false,
+                        hash,
+                    });
+                }
                 pending.insert(name, target);
                 atomic_save_target_map(&pending_path, &pending)?;
                 atomic_save_target_map(&registered_path, &registered)?;
-                Ok(RegisterResult { reapproval })
+                Ok(RegisterResult {
+                    reapproval,
+                    unchanged: false,
+                    redisplay_required: true,
+                    hash,
+                })
             })
         })
         .await
@@ -70,12 +137,152 @@ impl Store {
             if let Some(dir) = dir {
                 entry.dir = Some(dir.to_owned());
             }
+            let canonical = canonical_json(&entry);
+            let hash = definition_hash(&canonical);
+            let entry = approve_target(&self.root, entry, &canonical, &hash)?;
             let mut registered = load_for_update(&registered_path)?;
             registered.insert(name.to_owned(), entry);
             atomic_save_target_map(&registered_path, &registered)?;
             atomic_save_target_map(&pending_path, &pending)
         })
     }
+
+    pub(crate) async fn migrate(&self) -> Result<()> {
+        let _serial = self.serial.lock().await;
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || {
+            with_store_lock(&root, LOCK_TIMEOUT, || migrate_locked(&root))
+        })
+        .await
+        .context("store migration worker panicked")?
+    }
+
+    pub(crate) fn verified_target(&self, name: &str) -> Result<Option<StoredTarget>> {
+        let registered = load_target_map(&self.root.join("registered.toml"))?;
+        let Some(target) = registered.get(name) else {
+            return Ok(None);
+        };
+        verify_approval(&self.root, target)?;
+        Ok(Some(target.clone()))
+    }
+}
+
+fn approved_path(root: &Path, hash: &str) -> Result<PathBuf> {
+    let digest = hash
+        .strip_prefix("sha256:")
+        .context("承認ハッシュの形式が不正です")?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("承認ハッシュの形式が不正です");
+    }
+    Ok(root.join("approved").join(format!("{digest}.json")))
+}
+
+fn write_approval_record(root: &Path, hash: &str, canonical: &[u8]) -> Result<()> {
+    let path = approved_path(root, hash)?;
+    let parent = path.parent().context("approved path has no parent")?;
+    fs::create_dir_all(parent)?;
+    if path.exists() {
+        return verify_existing_approval(&path, canonical);
+    }
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(".approval.tmp.{}.{}", std::process::id(), sequence));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(canonical)?;
+        file.sync_all()?;
+        drop(file);
+        match fs::hard_link(&temp, &path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                verify_existing_approval(&path, canonical)
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("承認レコード {} を公開できません", path.display())),
+        }
+    })();
+    let _ = fs::remove_file(&temp);
+    result
+}
+
+fn verify_existing_approval(path: &Path, canonical: &[u8]) -> Result<()> {
+    let existing = fs::read(path)?;
+    if existing == canonical {
+        Ok(())
+    } else {
+        bail!("既存の承認レコード {} の内容が一致しません", path.display())
+    }
+}
+
+fn approval_record_matches(root: &Path, hash: &str, canonical: &[u8]) -> Result<bool> {
+    let path = approved_path(root, hash)?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    verify_existing_approval(&path, canonical)?;
+    Ok(true)
+}
+
+fn approval_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn approve_target(
+    root: &Path,
+    mut target: StoredTarget,
+    canonical: &[u8],
+    hash: &str,
+) -> Result<StoredTarget> {
+    write_approval_record(root, hash, canonical)?;
+    target.hash = Some(hash.to_owned());
+    target.approved_at = Some(approval_timestamp());
+    Ok(target)
+}
+
+fn migrate_locked(root: &Path) -> Result<()> {
+    let path = root.join("registered.toml");
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut registered = load_for_update(&path)?;
+    let needs_migration = registered
+        .values()
+        .any(|target| target.hash.is_none() || target.approved_at.is_none());
+    if !needs_migration {
+        return Ok(());
+    }
+    let backup = root.join("registered.toml.pre-migrate.bak");
+    if !backup.exists() {
+        fs::copy(&path, &backup)?;
+    }
+    for target in registered.values_mut() {
+        let canonical = canonical_json(target);
+        let hash = definition_hash(&canonical);
+        write_approval_record(root, &hash, &canonical)?;
+        target.hash = Some(hash);
+        target.approved_at.get_or_insert_with(approval_timestamp);
+    }
+    atomic_save_target_map(&path, &registered)
+}
+
+fn verify_approval(root: &Path, target: &StoredTarget) -> Result<()> {
+    let hash = target.hash.as_deref().context("承認ハッシュがありません")?;
+    let canonical = canonical_json(target);
+    if definition_hash(&canonical) != hash {
+        bail!("登録本文と承認ハッシュが一致しません");
+    }
+    let path = approved_path(root, hash)?;
+    let approved = fs::read(&path)
+        .with_context(|| format!("承認レコード {} を読み込めません", path.display()))?;
+    if definition_hash(&approved) != hash || approved != canonical {
+        bail!("承認レコードと登録本文が一致しません");
+    }
+    Ok(())
 }
 
 fn load_for_update(path: &Path) -> Result<TargetMap> {
@@ -239,6 +446,12 @@ fn with_store_lock<T>(
 mod tests {
     use super::*;
 
+    fn approval_count(root: &Path) -> usize {
+        fs::read_dir(root.join("approved"))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0)
+    }
+
     fn target(script: &str) -> StoredTarget {
         StoredTarget {
             script: Some(script.into()),
@@ -321,5 +534,214 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_target_map(&path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn ac_t3_4_1_2_and_4_legacy_store_migrates_idempotently_with_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registered.toml");
+        let legacy = TargetMap::from([
+            ("one".into(), target("let x = 1;")),
+            ("two".into(), target("let x = 2;")),
+        ]);
+        atomic_save_target_map(&path, &legacy).unwrap();
+        let before = fs::read(&path).unwrap();
+        let store = Store::new(dir.path().to_owned());
+
+        store.migrate().await.unwrap();
+        let first = fs::read(&path).unwrap();
+        assert_eq!(
+            fs::read(dir.path().join("registered.toml.pre-migrate.bak")).unwrap(),
+            before
+        );
+        assert_eq!(approval_count(dir.path()), 2);
+        for name in ["one", "two"] {
+            let migrated = store.verified_target(name).unwrap().unwrap();
+            assert!(migrated.hash.is_some());
+            assert!(migrated.approved_at.is_some());
+            assert_eq!(migrated.script, legacy[name].script);
+        }
+
+        store.migrate().await.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), first);
+        assert_eq!(approval_count(dir.path()), 2);
+
+        // A crash after writing one content-addressed record is resumable.
+        let mut interrupted = legacy.clone();
+        let canonical = canonical_json(&interrupted["one"]);
+        let hash = definition_hash(&canonical);
+        write_approval_record(dir.path(), &hash, &canonical).unwrap();
+        interrupted.get_mut("one").unwrap().hash = None;
+        interrupted.get_mut("one").unwrap().approved_at = None;
+        atomic_save_target_map(&path, &interrupted).unwrap();
+        store.migrate().await.unwrap();
+        assert!(store.verified_target("one").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn ac_t3_4_3_and_10_tampered_missing_or_mismatched_records_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        store
+            .register("item".into(), target("let x = 1;"), true)
+            .await
+            .unwrap();
+        let registered = load_target_map(&dir.path().join("registered.toml")).unwrap();
+        let path = approved_path(dir.path(), registered["item"].hash.as_deref().unwrap()).unwrap();
+
+        fs::write(&path, b"x").unwrap();
+        assert!(store.verified_target("item").is_err());
+        fs::remove_file(&path).unwrap();
+        assert!(store.verified_target("item").is_err());
+
+        let mut changed = registered;
+        changed.get_mut("item").unwrap().script = Some("let x = 2;".into());
+        atomic_save_target_map(&dir.path().join("registered.toml"), &changed).unwrap();
+        assert!(store.verified_target("item").is_err());
+    }
+
+    #[tokio::test]
+    async fn ac_t3_4_6_and_7_auto_approve_writes_one_idempotent_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        let first = store
+            .register("item".into(), target("let x = 1;"), true)
+            .await
+            .unwrap();
+        assert!(!first.unchanged);
+        assert_eq!(approval_count(dir.path()), 1);
+        let entry = store.verified_target("item").unwrap().unwrap();
+        assert_eq!(entry.hash.as_deref(), Some(first.hash.as_str()));
+        assert!(entry.approved_at.is_some());
+
+        let second = store
+            .register("item".into(), target("let x = 1;"), true)
+            .await
+            .unwrap();
+        assert!(second.unchanged);
+        assert_eq!(approval_count(dir.path()), 1);
+        assert!(store.verified_target("item").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn ac_t3_4_8_bulk_auto_approve_finishes_with_one_record_per_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        let started = Instant::now();
+        let fixture = std::env::var_os("CLIPWIRE_TARGETS_FIXTURE");
+        let targets = fixture
+            .map(|path| load_target_map(Path::new(&path)).unwrap())
+            .unwrap_or_else(|| {
+                (0..200)
+                    .map(|index| {
+                        (
+                            format!("target-{index}"),
+                            target(&format!("let x = {index};")),
+                        )
+                    })
+                    .collect()
+            });
+        let unique: std::collections::HashSet<_> = targets
+            .values()
+            .map(|target| definition_hash(&canonical_json(target)))
+            .collect();
+        for (name, target) in targets {
+            store.register(name, target, true).await.unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_secs(60));
+        assert_eq!(approval_count(dir.path()), unique.len());
+    }
+
+    #[tokio::test]
+    async fn ac_t3_4_9_p2_style_metadata_loss_is_repaired_without_losing_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        for (name, script) in [("old", "let x = 1;"), ("new", "let x = 2;")] {
+            store
+                .register(name.into(), target(script), true)
+                .await
+                .unwrap();
+        }
+        let mut p2_round_trip = load_target_map(&dir.path().join("registered.toml")).unwrap();
+        for entry in p2_round_trip.values_mut() {
+            entry.hash = None;
+            entry.approved_at = None;
+        }
+        atomic_save_target_map(&dir.path().join("registered.toml"), &p2_round_trip).unwrap();
+        store.migrate().await.unwrap();
+        for name in ["old", "new"] {
+            assert!(store.verified_target(name).unwrap().is_some());
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn ac_t3_4_9_c_windows_store_repairs_a_p2_style_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        store
+            .register("windows-round-trip".into(), target("let x = 1;"), true)
+            .await
+            .unwrap();
+        let path = dir.path().join("registered.toml");
+        let mut p2 = load_target_map(&path).unwrap();
+        p2.get_mut("windows-round-trip").unwrap().hash = None;
+        p2.get_mut("windows-round-trip").unwrap().approved_at = None;
+        atomic_save_target_map(&path, &p2).unwrap();
+        store.migrate().await.unwrap();
+        assert!(store
+            .verified_target("windows-round-trip")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn ac_t3_5_1_to_3_same_hash_is_noop_and_changed_hash_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        store
+            .register("item".into(), target("A"), true)
+            .await
+            .unwrap();
+        let same = store
+            .register("item".into(), target("A"), false)
+            .await
+            .unwrap();
+        assert!(same.unchanged);
+        assert!(load_target_map(&dir.path().join("pending.toml"))
+            .unwrap()
+            .is_empty());
+        assert!(store.verified_target("item").unwrap().is_some());
+
+        store
+            .register("item".into(), target("B"), false)
+            .await
+            .unwrap();
+        assert!(!load_target_map(&dir.path().join("pending.toml"))
+            .unwrap()
+            .is_empty());
+        assert!(load_target_map(&dir.path().join("registered.toml"))
+            .unwrap()
+            .is_empty());
+
+        // A was approved, B is pending, then returning to A restores the
+        // content-addressed approval and removes B without another approval.
+        store
+            .register("item".into(), target("A"), true)
+            .await
+            .unwrap();
+        store
+            .register("item".into(), target("B"), false)
+            .await
+            .unwrap();
+        let back_to_a = store
+            .register("item".into(), target("A"), false)
+            .await
+            .unwrap();
+        assert!(back_to_a.unchanged);
+        assert!(load_target_map(&dir.path().join("pending.toml"))
+            .unwrap()
+            .is_empty());
+        assert!(store.verified_target("item").unwrap().is_some());
     }
 }

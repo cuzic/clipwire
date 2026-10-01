@@ -26,10 +26,9 @@ pub(crate) async fn handle_exec(
         return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response();
     }
 
-    let registered = load_target_map_or_warn(&s.config_dir.join("registered.toml"));
-    let stored = match registered.get(&req.name) {
-        Some(t) => t.clone(),
-        None => {
+    let stored = match s.store.verified_target(&req.name) {
+        Ok(Some(target)) => target,
+        Ok(None) => {
             let pending = load_target_map_or_warn(&s.config_dir.join("pending.toml"));
             if pending.contains_key(&req.name) {
                 return (
@@ -42,6 +41,13 @@ pub(crate) async fn handle_exec(
                     .into_response();
             }
             return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("承認検証エラー: {e:#}\n"),
+            )
+                .into_response()
         }
     };
 

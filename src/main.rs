@@ -900,6 +900,66 @@ mod tests {
         assert!(!dir.path().join("registered.toml").exists());
     }
 
+    #[tokio::test]
+    async fn ac_t3_5_4_register_response_contains_server_definition_hash() {
+        let dir = tempdir().unwrap();
+        let target = script_target("let answer = 42;");
+        let expected = definition_hash(&canonical_json(&target));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "name": "hash-response",
+            "script": "let answer = 42;"
+        }))
+        .unwrap();
+        let response = handle_register(
+            State(test_state(dir.path().to_path_buf(), true)),
+            HeaderMap::new(),
+            body.into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains(&format!("hash: {expected}")));
+    }
+
+    #[tokio::test]
+    async fn ac_t3_4_1_and_3_exec_uses_migrated_record_and_rejects_tampering() {
+        let dir = tempdir().unwrap();
+        let registered = TargetMap::from([("safe".into(), script_target("let answer = 42;"))]);
+        save_target_map(&dir.path().join("registered.toml"), &registered).unwrap();
+        let state = test_state(dir.path().to_path_buf(), false);
+        state.store.migrate().await.unwrap();
+        let request = || {
+            serde_json::to_vec(&serde_json::json!({"name": "safe"}))
+                .unwrap()
+                .into()
+        };
+        let response = handle_exec(State(state.clone()), HeaderMap::new(), request()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let migrated = load_target_map(&dir.path().join("registered.toml")).unwrap();
+        let digest = migrated["safe"]
+            .hash
+            .as_deref()
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap();
+        std::fs::write(
+            dir.path().join("approved").join(format!("{digest}.json")),
+            b"tampered",
+        )
+        .unwrap();
+        let response = handle_exec(State(state), HeaderMap::new(), request()).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("承認検証エラー"));
+    }
+
     fn validate_targets_file(path: &Path) {
         let source = std::fs::read_to_string(path).unwrap();
         let file: TargetsFile = toml::from_str(&source).unwrap();

@@ -468,12 +468,17 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
 
     warn_invalid_stored_target_names(&config_dir);
 
+    let store = Store::new(config_dir.clone());
+    store
+        .migrate()
+        .await
+        .context("承認ストアを移行できません")?;
     let state = AppState {
         clip_tx,
         token,
         allow_no_token: args.allow_no_token,
         last_clip: Arc::new(Mutex::new(LastClip::default())),
-        store: Store::new(config_dir.clone()),
+        store,
         config_dir,
         auto_approve: args.auto_approve,
         host_policy: build_host_policy(args.host_check, args.allow_host),

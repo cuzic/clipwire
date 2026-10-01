@@ -48,8 +48,22 @@ pub(crate) async fn handle_register(
         }
     };
 
+    let hash_line = format!("hash: {}\n", result.hash);
+
+    if result.unchanged {
+        return (
+            StatusCode::OK,
+            format!("'{}' は変更なし\n{hash_line}", req.name),
+        )
+            .into_response();
+    }
+
     if s.auto_approve {
-        return (StatusCode::OK, format!("'{}' を登録しました\n", req.name)).into_response();
+        return (
+            StatusCode::OK,
+            format!("'{}' を登録しました\n{hash_line}", req.name),
+        )
+            .into_response();
     }
 
     let msg = if result.reapproval {
@@ -64,14 +78,16 @@ pub(crate) async fn handle_register(
         )
     };
     #[cfg(windows)]
-    win_clip::show_register_toast(
-        req.name.clone(),
-        entry_for_toast,
-        s.config_dir.clone(),
-        result.reapproval,
-    );
+    if result.redisplay_required {
+        win_clip::show_register_toast(
+            req.name.clone(),
+            entry_for_toast,
+            s.config_dir.clone(),
+            result.reapproval,
+        );
+    }
     #[cfg(not(windows))]
     eprintln!("{msg}");
 
-    (StatusCode::OK, format!("{msg}\n")).into_response()
+    (StatusCode::OK, format!("{msg}\n{hash_line}")).into_response()
 }

@@ -88,6 +88,13 @@ try { <# build → 停止 → 起動 #> } finally { Remove-Item $m -ErrorAction 
 
 ## 失敗時の復旧
 
+P3 の承認ストア移行に失敗した場合は、サーバを停止して
+`registered.toml.pre-migrate.bak` を `registered.toml` に戻し、P2 の
+`bin\good\clipwire.exe` を起動する。P3 移行後に追加した自動承認ターゲットは
+このバックアップに含まれないため、Linux 側の `targets.toml` から再度
+`clipwire register <name>` を実行する。`approved/` は内容アドレス方式なので
+残してよい。
+
 - サーバが上がらない: ウォッチドッグが 1〜2 分で good を起動する。`watchdog.log` を見る。
 - ウォッチドッグも動いていない: Windows で `clipwire.exe watchdog ...` を手で起動するか、タスクを手動実行する。
 - good が壊れている: 過去の動作版をビルドし直して `bin\good\` に置く。
