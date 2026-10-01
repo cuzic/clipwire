@@ -222,7 +222,7 @@ mod tests {
         #[test]
         fn cmd_output_exit_code_and_print_order() {
             let (output, code) = text(
-                r#"run(["cmd", "/d", "/c", "echo stdout& echo stderr 1>&2"]); print("done");"#,
+                r#"run(["cmd", "/d", "/c", "echo stdout& (echo stderr) 1>&2"]); print("done");"#,
             );
             assert_eq!(code, 0);
             assert_eq!(output, "stdout\nstderr\ndone\n");
