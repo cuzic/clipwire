@@ -1,0 +1,146 @@
+# 実装計画: clipwire ADR-0001〜0011
+
+対象: `docs/adr/` の ADR(README の「実装順」と「脅威モデル」が前提)。
+現状: `src/main.rs` 1 ファイル(約 1700 行)、**テストなし・CI なし**、Linux クライアントと Windows サーバが同一バイナリ。
+
+改訂履歴: 2026-09-30 初版 → Opus レビュー(Critical 2 / High 5 / Medium 8 / Low 6)を反映して改訂1。
+
+## 進捗(2026-10-01 時点)
+
+| タスク | 状態 | 備考 |
+|---|---|---|
+| T0.1 | 完了 (L) | `scripts/check.sh`(host + windows-gnu) |
+| T1.1 / T1.3 / T1.4 / T1.5 | 完了 (L) | コミット 8575a69。Opus レビュー指摘(H1, M1〜M5, L2, L3)反映済み |
+| T1.2 | L 完了 / W 未検証 | AC-T1.2.3〜1.2.5(Windows 実機の toast)が未検証 |
+| T0.2 | L 完了 / W 未検証 | AC-T0.2.1〜T0.2.3 完了。AC-T0.2.4(Windows 実機)は未検証 |
+| T0.3 | L 完了 | AC-T0.3.1〜T0.3.3 完了 |
+| T2.1 | L 完了 | AC-T2.1.1〜T2.1.2 完了。W/X AC なし |
+| T2.2 | L 完了 / X 未検証 | AC-T2.2.1 / 2.2.1b / 2.2.2 / 2.2.3 / 2.2.4 完了。AC-T2.2.5(実機の再起動ターゲット)は未検証 |
+| T2.3 | L 完了 / X 未検証 | AC-T2.3.1〜T2.3.4・T2.3.7 完了。AC-T2.3.5・T2.3.6・T2.3.8(Windows/Tailscale/実運用)は未検証 |
+| T2.4 | (b) コード側 L 完了 / W・X 未検証 | `serve` の `clipwire.pid` 作成・上書き・正常終了時削除を実装。(b) の実機再起動・トークン移行は未検証。(c) `remove_var` は出荷禁止のため未実装 |
+| T2.5 | 完了 (L) | ADR-0011 に `GET /open` を既知の許容事項として明記。POST 化は T7.7 に起票 |
+| T3.1 | 完了 (L) | AC-T3.1.1〜T3.1.4 完了。正規 JSON のゴールデン fixture と sha256 を固定 |
+| T3.2 | 完了 (L) | AC-T3.2.1〜T3.2.4 完了。CI 用合成データと `CLIPWIRE_TARGETS_FIXTURE` の実データ 1571 件を検証済み |
+| T3.3 | L 完了 / C・W 未検証 | AC-T3.3.1〜T3.3.4 の L テスト完了。AC-T3.3.1・T3.3.3 は Windows CI でも走る共通テスト、AC-T3.3.5 は `#[cfg(windows)]` の別プロセステストを実装済みだが Windows CI 未検証。AC-T3.3.6〜T3.3.8 は Windows 実機未検証 |
+| T3.4 | L 完了 / C・X 未検証 | AC-T3.4.1〜T3.4.4・T3.4.6〜T3.4.8・T3.4.10 の L テスト完了。AC-T3.4.9 は P2 互換のメタデータ欠落を合成テスト済みだが、旧実バイナリによる L/C 検証は T8.1 待ち。AC-T3.4.5 は Windows 実機との X 未検証 |
+| T3.5 | 完了 (L) | AC-T3.5.1〜T3.5.4 完了。同一ハッシュは no-op、別 pending の掃除、応答ハッシュをテスト済み |
+| T3.6 | L 完了 / X 未検証 | AC-T3.6.1〜T3.6.5 の L テスト完了。AC-T3.6.6・T3.6.7（旧/新バイナリと Windows 実機の相互接続）は未検証 |
+| T3.7 | 完了 (L) | AC-T3.7.1〜T3.7.4 完了。`/targets/check` の状態判定・本文非返却・認証・16 MiB 上限をテスト済み |
+| T3.8 | L 完了 / W 未検証 | AC-T3.8.1〜T3.8.5 の L テスト完了。`pending` / `show` / hash 束縛 `approve` / `deny` をローカル Store 経由で実装。AC-T3.8.6（稼働中 Windows サーバへの即時反映）は実機未検証 |
+| T1.6 | 未着手 | Windows での入れ替えが必要 |
+| T0.5 | 完了 (C) | `.github/workflows/ci.yml`(ubuntu: `scripts/check.sh` / windows-latest: gnu ターゲットで clippy + `cargo test`)。公開リポジトリなので課金なし。AC-T0.5.1〜T0.5.3 緑。`tests/windows_ci.rs` に AC-T0.5.2。Job Object・ミューテックス用の足場(`IsProcessInJob` 確認等)は該当タスク(T4.4/T4.7)で追加 |
+| T0.4 | L・C 完了 / W 未検証 | `clipwire watchdog` と `dev-loop.md` を追加。判断ロジックは単体テスト、実プロセスの復旧・保守ファイル・good 起動失敗は `tests/watchdog.rs`(Linux/Windows CI。AC-T0.4.1・0.4.2・0.4.4 の C 版)。実機の AC-T0.4.1〜0.4.4・0.4.6〜0.4.8(24 時間生存・Tailscale ACL など)と、`clipwire-stage` ターゲット、good.exe 配置、タスクスケジューラ登録は未実施 |
+| T0.6, T2.6 | 未着手 | T2.4 (b) の実機作業と (c) は未完了 |
+| T4.1 / T4.1b / T4.4 / T4.7 / T4.8 / T4.5.7 | 未着手(Windows 実機・実装待ち) | T4.1 の PoC 結果が T4.4(Job Object)以降の前提。Windows CI で PoC を自動化できるかは未検討 |
+| T4.2 | L 完了 / C 未検証 | `src/runner/`(Unix は setsid+killpg、Windows は Unsupported スタブ)。AC-T4.2.2 の Windows 版は未テスト |
+| T4.3 | 骨格 L 完了 / C・W 未検証 | ログリレー(単一パイプ・10 MiB 上限・EOF か 2 秒無通信で終了)。AC-T4.3.5・4.3.6 の残存プロセス部分と、AC-T4.3.1〜4.3.4 の Windows ストレス条件は未検証。`exec_rhai`/`handle_exec` はまだこのリレーに載せ替えていない |
+| T4.5 | L 完了(AC-T4.5.1〜4.5.6) / C 未検証 | Steps と Rhai の `run` を Runner 経由にし、Rhai の上限・キャンセル・`CLIPD_TOKEN` 除去を実装。AC-T4.5.6 の Windows 版と T4.5.7 は未検証。Rhai 上限値(operations 100 万、string 1 MiB、array 10 万、map 1 万、call levels 64)は ADR-0009 §5 に未記載(コード定数コメントのみ) |
+| T5.1 | L 完了(AC-T5.1.1〜5.1.5) / X 未検証 | `timeout` を追加(未設定は実行時のみ 30 分で、保存・ハッシュには補完しない)。`exec --timeout` は短縮のみ。期限超過は 124。AC-T5.1.6(旧サーバへの送信前拒否)は後方互換性を考慮しない方針により対象外。Windows のツリー kill は T4.4 待ち |
+| T5.2 | L 完了(AC-T5.2.1〜5.2.9) | `audit.jsonl`(10 MiB で 1 世代)、`clipwire audit --tail`、`serve-start`/`approve`(auto)の記録。`/audit` ルートなし。1571 件の連続 register は 1.63 秒(Linux debug) |
+| T5.3〜T5.5 | 未着手(5b・後回し) | 手動承認モードを使う判断をした時点で着手(OQ-0 (A)) |
+| T5.6 | L 完了(AC-T5.6.1・5.6.2) / X 未検証 | registered を変更できるルートを固定一覧で検証。**手動承認モードでは、承認レコードがあっても register で registered を自動復元しない**(HTTP の register だけで registered を変えられないようにするため。ADR-0006 §5 の「同一ハッシュの再 register は no-op」とは別の経路)。AC-T5.6.3(検証用インスタンス)は未検証 |
+| T5.7 | L 完了(AC-T5.7.1〜5.7.3) | `approved/` の mtime を register・承認で更新し、90 日超かつ未参照のものを起動時と 24 時間ごとに、ストアのロック内で削除 |
+| T6.1 | L 完了 / C・X 未検証 | `jobs/<id>/meta.json`、状態遷移、`concurrency`(reject/allow)、起動時整合、保持 50 件(失敗を長く残す)。AC-T6.1.3 の Windows 生存確認(PID + 作成時刻。現在はスタブ)、AC-T6.1.6(C)は未検証。AC-T6.1.7(旧サーバへの送信前拒否)は互換性方針により対象外。ジョブ ID は `ulid` crate を使わず自前生成(`getrandom`) |
+| T6.2 | L 完了(AC-T6.2.1〜6.2.6) | `/jobs*`、`exec --detach`、`jobs`/`logs`/`kill`。exec の実行をリクエストの寿命から切り離した。Windows でのツリー kill は T4.4 待ち |
+| T6.3 | L 完了(AC-T6.3.1〜6.3.6) | NDJSON ストリーム(`out`/`ping`/`exit`/`err`)。AC-T6.3.2 は純粋関数のテストで確認 |
+| T6.4 | L 完了(AC-T6.4.1〜6.4.5) / X 未検証 | 接続 10 秒・ストリーム read 120 秒・バッファ read 31 分。`--no-stream`(旧サーバ向けの自動フォールバックは 2026-10-01 に削除。サーバ側の `text/plain` + `X-Exit-Code` 形式は残す)。AC-T6.4.6(実機の `awase-build`)は未検証 |
+| T6.5 | 未着手 | 実機検証(X)のみ |
+| T7.1 | L 完了(AC-T7.1.1〜7.1.5) / X 未検証 | `exec --copy`/`--copy-on-fail`/`--raw`。AC-T7.1.6(実機)は未検証 |
+| T7.2 | L 完了(AC-T7.2.1・7.2.2) / X 未検証 | `list [--json]`。AC-T7.2.3(旧サーバ判定)は互換性方針により削除し、404 は通常のエラー。AC-T7.2.4・7.2.5(実機。T7.2.5 で `changed` が出たら T3.1 の互換性バグ)は未検証 |
+| T7.3 | L 完了(AC-T7.3.1) | `status`(実行中ジョブとサーバの version)。`proto`/`features` の表示は互換ネゴシエーションの削除に伴い廃止(AC-T7.3.2 の旧サーバ `proto=1` 表示は対象外) |
+| T7.4 | L 完了(AC-T7.4.1・7.4.2・7.4.4、7.4.3 の L 部分) / C・W 未検証 | `sleep`(60 秒上限・100ms 刻み)、`start_detached`(Unix は setsid。**Windows は T4.4 待ちの未実装エラーを返すスタブ**)、`notify`(XML エスケープは純粋関数)。AC-T7.4.3 の C 部分、7.4.5〜7.4.8 は未検証 |
+| T7.5 | Deferred | 運用モード (A) では価値が低い(OQ-0) |
+| T7.6 | 完了 | `docs/tasks/backlog.md`(AC-T7.6.1) |
+| T7.7 | L 完了(AC-T7.7.1) / X 未検証 | `clipwire open` は `POST /open` を使う。**旧 `GET /open` とフォールバックは 2026-10-01 に削除**(互換性方針)。AC-T7.7.2(互換期間中の新旧組み合わせ)は対象外 |
+
+## 運用の実態(計画の前提)
+
+実データ(`~/.config/clipwire/targets.toml`、`clipwire-exec` スキル)から確認した事実。**以降の優先度はこれに基づく。**
+
+- **運用は `--auto-approve`**。スキルに「このユーザーは自動承認運用にしている」と明記され、`register` 後は承認を待たず `exec` する。
+- ターゲットは **1571 件、すべて script 形式**。大半は `fb-brave-inspect2〜14` のような**使い捨て**。156 件が `-EncodedCommand`/`FromBase64String`、3 件が `Get-Clipboard` の内容を `.ps1` に書いて `-File` で実行。最長の script は約 34,000 文字。全名・全 script が T1.1/T3.2 の規則を満たす(違反 0 件)。
+- **開発ループの実体は `clipwire-rebuild-restart`**(msys2 側の別 checkout `C:\Users\cuzic\scoop\persist\msys2\home\cuzic\clipwire`)。`Get-Process clipwire | Stop-Process -Force` → `git pull; cargo build` → `Start-Process target\debug\clipwire.exe -ArgumentList 'serve','--auto-approve'`。**トークンは起動引数でなく、子が継承する環境変数 `CLIPD_TOKEN`** で渡っている。`clipwire-build`(`C:\Users\cuzic\clipwire`)は別 checkout でビルドするだけで再起動しない。**2 つの checkout がある**。
+- 常駐アプリ(`awase.exe`)は `cmd /c start "" /b` で起動され、標準ハンドルを継承する。
+
+### 運用モードの決定(OQ-0)
+
+- **(A) 自動承認を正式な運用モードとする【採用】**。優先するのは、自動承認でも効く対策: 0011(HTTP 面)、監査、`serve` 起動時の警告、**自動承認でも承認レコードを書く**(T3.4)、ストアの堅牢化、ランナー、timeout、ストリーミング/ジョブ。
+- **手動承認 UI**(2 段階 toast、レビュー画面、`approve --hash` の仕上げ = T5.3〜T5.5)は **「手動承認モード用」として後回し**(Phase 5b)。自動承認運用では一度も使われないため。`--auto-approve` なしで起動したときの安全な動作(= 承認待ちに入り、`approve --hash` で承認できる最小限)だけは、P3 で保証する。
+- **(B) 手動承認へ移行する**場合は、「使い捨て実行」の代替設計が要る(汎用ターゲット + params など)。その場合は 5b と T7.5 を前倒しする。この計画は (A) を前提とし、(B) へ切り替えるときは README のこの節を更新する。
+- 脅威モデル(`docs/adr/README.md`)には、**自動承認モードでは「トークン = Windows ユーザー権限でのコード実行」**であることを明記した(ADR 側も更新済み)。
+
+## フェーズ一覧と依存
+
+| Phase | ファイル | 内容 | ADR | 規模(幅) | 依存 |
+|---|---|---|---|---|---|
+| 0 | [00-foundation.md](00-foundation.md) | テスト・Windows CI・モジュール分割・ウォッチドッグ・toast PoC | — | M〜L | — |
+| 1 | [01-immediate-fixes.md](01-immediate-fixes.md) | 即時修正 + `get` のトークン非展開 + `--token-file` | 0011 §A, §B-10 | S | **T0.1 のみ**(T0.2 を待たない) |
+| 2 | [02-http-surface.md](02-http-surface.md) | トークン必須化、Origin/Host、`--token-file`(段階出荷) | 0011 §B | M〜L | P1, T0.4 |
+| 3 | [03-definition-and-store.md](03-definition-and-store.md) | 正規形・ストア・承認レコード・プロトコル版 | 0010 | L | P0, P2 |
+| 4 | [04-runner.md](04-runner.md) | Windows PoC → ランナー → 自己更新 | 0009 | **XL**(PoC 結果で +1 段階) | P3, T0.5, T0.6 |
+| 5a | [05-timeout-audit-approval.md](05-timeout-audit-approval.md) | timeout・監査ログ・自動承認の記録 | 0003, 0011 §12 | M | P3, P4 |
+| 5b | (同上の後半) | 手動承認 UI(toast・レビュー画面) | 0006 | **L**(T5.3 単独で L) | P5a。**後回し** |
+| 6 | [06-streaming-and-jobs.md](06-streaming-and-jobs.md) | ストリーミング・ジョブ管理 | 0001, 0002 | L | P4, P5a |
+| 7 | [07-features.md](07-features.md) | `list`/`status`、Rhai API、`exec --copy`(params は Deferred) | 0005, 0007, 0008 | M | P3〜P6(個別) |
+| 8 | [08-release.md](08-release.md) | 互換性検証・移行・リリース | 全 | M | 全 |
+
+```
+T0.1 → P1(T1.1〜1.5 は T0.2 を待たない。T1.5 = `--token-file`)
+T1.5 → T0.4(ウォッチドッグ)→ P2(段階出荷。T2.4 (b)(c))→ P3 → P4 → P5a → P6 → P7(個別)→ P8
+T0.5(Windows CI)/ T0.6(toast PoC)は P3 着手前に完了
+P5b(手動承認 UI)は P5a 以降、必要になった時点
+```
+
+規模の目安: S=半日以内、M=1〜2 日、L=3〜5 日、XL=1〜2 週間(1 人・AI 支援前提のおおまかな目安。確度は低い。「幅」は PoC・実機検証の結果で +1 段階ぶれうる)。
+
+## 共通規約
+
+### タスクの書式
+
+各タスクは次の項目を持つ: **ID** / **ADR** / **内容** / **受入条件 (AC)**(`AC-<ID>.<k>`)/ **リスク・ロールバック**。
+
+### 検証環境(区分)
+
+| 区分 | 環境 | 用途 |
+|---|---|---|
+| **L** | Linux(`cargo test`) | 純粋ロジック。**Windows 固有実装の代わりのスタブしか検証できない**ので、Windows 固有の主張(順序保証・デッドロックしないこと・ファイルの削除可否・ツリー kill・ミューテックス)は L の AC としない |
+| **C** | Windows CI(非対話。T0.5) | Job Object、名前付きパイプ、名前付きミューテックス、ファイルロック、`CreateProcess` フラグなど、**対話デスクトップを要しない Windows 固有挙動**を `#[cfg(windows)]` テストで自動検証 |
+| **W** | Windows 実機 | toast、対話デスクトップ、Tailscale、ファイアウォール、常駐アプリなど |
+| **X** | Linux ⇔ Windows の結合(実機) | 旧/新バイナリの組み合わせ、実ターゲットでの実行 |
+
+AC には区分を括弧で付ける。**W と X の AC は、結果を `docs/tasks/evidence/<task>.md` に記録する**(日時・コミット・結果)。
+
+### Definition of Done(全タスク共通)
+
+1. AC がすべて満たされ、L と C の AC は CI(`scripts/check.sh` + Windows CI)で緑。
+2. `cargo fmt --check` / `cargo clippy -- -D warnings` が、**ホスト(Linux)と `--target x86_64-pc-windows-gnu` の両方**で通る(T0.1。ツールチェーンは導入済み。逃げ道なし)。
+3. 挙動を変える場合は ADR が実装と一致している(ズレたら ADR を先に直し、Opus レビューの対象にする)。
+4. 互換性に影響する変更は `08-release.md` のリリースノート項目に追記。
+5. 1 タスク 1 コミット以上、`feat(...)` / `fix(...)` 形式。
+
+### 開発ループの安全網(重要)
+
+- サーバの更新は **`clipwire-rebuild-restart`**(msys2 側 checkout)で行われ、**新サーバにトークンを渡すのは環境変数 `CLIPD_TOKEN`**。新サーバが起動しないと、旧サーバは既に殺されているためリモートから復旧できない。
+- ウォッチドッグと再起動ターゲットの競合を避けるため、(1) 再起動ターゲットは**先にビルドし、成功したら停止して起動**する、(2) 更新中は `maintenance` ファイル(有効期限つき)でウォッチドッグを抑止する、(3) good.exe は `bin\good\clipwire.exe`(ファイル名を変えない)に置く、(4) 停止対象は PID ファイルで決める(T0.4、T2.4 (b))。P3 でストアを移行しても、P3 より前の good.exe が壊さないよう、移行は**追加だけ**(T3.4)。
+- **自動承認では、トークン = コード実行権限**。トークンは会話ログに残さない(T1.4)、ローテーションする(T2.4 (b))、Tailscale ACL で接続元を制限する(T0.4)。
+- したがって、**サーバ起動条件を厳しくする変更(T2.2 のトークン必須化、T2.4 の環境変数除去、T4.7 のミューテックス変更)を出荷する前に**、T0.4 の**ウォッチドッグ**(タスクスケジューラで `/health` を定期確認し、失敗したら `bin\clipwire.good.exe` を起動)が稼働していること、かつ再起動ターゲットが新しい起動条件を満たす形に書き換えられて実機で成功していること、を出荷の前提とする。
+
+### 互換性方針
+
+**【2026-10-01 改訂】後方互換性は考慮しない**(ユーザー指示。利用者は本人のみで、サーバとクライアントを同時に入れ替えられる)。以下の旧方針のうち、旧クライアント/旧サーバとの相互接続、旧形式の受理、フォールバック、T8.1 の旧バイナリ検証は**新規には作らない**。既存の互換コードを削除するかは別途判断する。判断ロジックは極力純粋関数にして Linux でテストする。
+
+(以下は改訂前の方針。履歴として残す)
+
+- **先にサーバ、後にクライアント**。新サーバは旧クライアントを受理する。旧サーバに対する新クライアントは、新機能の使用を送信前に拒否する(feature 確認。ADR-0010 §2)。**新クライアントは `proto < 2` のサーバには旧フラット形式で `register` する**(T3.6)。
+- `proto` は T3.6 で 2 から始める(現行を 1 とみなす)。旧フラット形式は `proto=2` の間のみ受理。
+- 互換性の検証は、過去のコミットを `git worktree` でビルドして L/C で自動化する(T8.1)。
+
+### 実データ入力のテスト
+
+`targets.toml`(1571 件、約 1.4 MB)はリポジトリ外(git 管理外)。テストは、環境変数 `CLIPWIRE_TARGETS_FIXTURE` でパスを指定されたときに実データを使い、未設定ならスキップする(CI は合成データで代替。実データでの検証は手元・実機で実施)。
+
+### 未解決事項
+
+- **OQ-1(解決)**: Windows でも `cargo test` を回す → T0.5 の Windows CI(GitHub Actions `windows-latest` または既存の GCP Windows spot runner)。
+- **OQ-2**: ADR-0009 の PoC 結果(crate 採用可否、パイプ方式の (a)/(b))による ADR 更新のタイミング → T4.1 の完了条件。
+- **OQ-3**: GitHub にリモートがあるか(Actions を使えるか)。なければ GCP Windows spot runner(`cargo-ci-gcp-spot-instance` スキル)。T0.5 の冒頭で確認する。

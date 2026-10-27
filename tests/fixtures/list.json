@@ -1,0 +1,27 @@
+[
+  {
+    "name": "changed-target",
+    "state": "changed",
+    "hash": "sha256:changed"
+  },
+  {
+    "name": "ok-target",
+    "state": "ok",
+    "hash": "sha256:ok"
+  },
+  {
+    "name": "pending-target",
+    "state": "pending",
+    "hash": "sha256:pending"
+  },
+  {
+    "name": "remote-target",
+    "state": "remote-only",
+    "hash": "sha256:remote"
+  },
+  {
+    "name": "unregistered-target",
+    "state": "unregistered",
+    "hash": "sha256:unregistered"
+  }
+]

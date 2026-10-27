@@ -1,0 +1,10 @@
+承認待ちターゲットを承認して registered.toml に保存 (Windows ローカルで実行)
+
+Usage: clipwire approve --hash <PREFIX> <TARGET>
+
+Arguments:
+  <TARGET>  承認するターゲット名
+
+Options:
+      --hash <PREFIX>  現在の pending 定義の sha256 ハッシュ (prefix 可)
+  -h, --help           Print help

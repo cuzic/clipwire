@@ -1,0 +1,10 @@
+承認待ちターゲットを拒否 (Windows ローカルで実行)
+
+Usage: clipwire deny [OPTIONS] <TARGET>
+
+Arguments:
+  <TARGET>  拒否するターゲット名
+
+Options:
+      --hash <PREFIX>  現在の pending 定義の sha256 ハッシュ (prefix 可)
+  -h, --help           Print help

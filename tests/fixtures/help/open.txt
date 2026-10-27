@@ -1,0 +1,16 @@
+Windows のデフォルトブラウザで Web サービスを開く
+
+Usage: clipwire open <TARGET>
+
+Arguments:
+  <TARGET>
+          開くサービス
+
+          Possible values:
+          - chatgpt:   ChatGPT (https://chatgpt.com)
+          - claude:    Claude AI (https://claude.ai)
+          - tailscale: Tailscale 管理画面 (https://login.tailscale.com/admin)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')

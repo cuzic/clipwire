@@ -1,0 +1,7 @@
+ローカルの監査ログを末尾から表示
+
+Usage: clipwire audit [OPTIONS]
+
+Options:
+      --tail <TAIL>  表示する末尾の行数 [default: 50]
+  -h, --help         Print help

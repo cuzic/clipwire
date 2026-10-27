@@ -67,8 +67,8 @@ netsh http add urlacl url=http://100.x.y.z:9999/ user="DESKTOP-XXXXX\username"
 
 ```bat
 @echo off
-set CLIPD_TOKEN=mySecretToken42
-start "" /B "C:\path\to\clipwire.exe" --token %CLIPD_TOKEN%
+rem トークンは %USERPROFILE%\.clipwire-token に 1 行で保存しておく
+start "" /B "C:\path\to\clipwire.exe" --token-file "%USERPROFILE%\.clipwire-token"
 ```
 
 手動で試す場合:
@@ -185,13 +185,22 @@ tmux source ~/.tmux.conf
 | オプション | 既定 | 説明 |
 |---|---|---|
 | `--port` | `9999` | 待ち受けポート |
-| `--token` | `$CLIPD_TOKEN` | Bearer トークン |
+| `--token-file` | — | トークンを書いたファイル (前後の空白・BOM は除去、空ファイルはエラー)。優先順位: `--token` > `--token-file` > `$CLIPD_TOKEN` |
+| `--token` | `$CLIPD_TOKEN` | Bearer トークン (コマンドラインでの指定は非推奨。プロセス一覧に残るため `--token-file` か環境変数を推奨) |
 | `--bind-localhost-only` | off | localhost のみバインド |
-| `--allow-no-token` | off | token なし tailnet 公開を明示許可 |
+| `--allow-no-token` | off | 保護ルートを含め、token なしで到達可能な範囲への公開を明示許可 |
+| `--host-check` | `log` | Host 許可リスト不一致時の動作 (`log` は警告のみ、`enforce` は 421) |
+| `--allow-host HOST` | — | Host 許可リストへ名前を追加 (複数指定可) |
 
 ### セキュリティ
 
-- token なし & tailnet 公開はデフォルトで拒否 (`--allow-no-token` で上書き可)
+- token なしでは `/exec`・`/register` は 403。`--token-file` を設定するか、`--allow-no-token` で認証なしの利用を明示許可する (`--bind-localhost-only` だけでは許可されない)
+- `--auto-approve` には token または `--allow-no-token` が必要。後者は、到達できる者すべてに承認なしの任意コード実行を許すため、Tailscale ACL で接続元を制限する
+- `Origin` ヘッダ付きリクエストは拒否。Host は初回出荷では不一致をログへ記録し、`--host-check=enforce` で厳格拒否
+- `/exec` と `/register` の POST は `Content-Type: application/json` が必須
+- ターゲット名は `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` のみ許可 (register/exec)
+- `get` が出力する curl 行はトークンを展開せず `$CLIPD_TOKEN` を参照する (会話ログにトークンを残さない)
+- toast 通知は WinRT のみ (PowerShell 経由の通知は廃止)
 - 多重起動防止に名前付き Mutex を使用
 - Tailscale IP は `tailscale ip -4` または CGNAT 帯 (`100.64.0.0/10`) で自動検出
 
@@ -279,6 +288,34 @@ clipwire get -q | wl-copy
 wl-paste | clipwire put
 wl-paste --type image/png | clipwire put   # 画像の場合
 ```
+
+### 画像 (PNG / SVG) を Windows クリップボードへ送る
+
+`clipwire put` は stdin の内容から種別を自動判別する (PNG シグネチャ / ルート要素が `<svg>`)。`-t text|png|svg` で明示指定もできる。
+
+```bash
+clipwire put < diagram.png
+clipwire put < diagram.svg
+clipwire put -t text < diagram.svg   # SVG ソースをテキストとして送りたいとき
+```
+
+| 種別 | 設定されるクリップボード形式 |
+|---|---|
+| PNG | `PNG` (アルファ保持) + `CF_DIB` (互換用) |
+| SVG | `image/svg+xml` + `CF_UNICODETEXT` (SVG 非対応アプリにはソースが貼られる) |
+
+#### 複数の表現を同時に載せる
+
+貼り付け先アプリは自分が読める形式を選ぶので、ラスター・ベクター・テキストを 1 回で全部載せられる。`-` は stdin。
+
+```bash
+rsvg-convert diagram.svg -o diagram.png
+clipwire put --svg diagram.svg --png diagram.png --text alt.txt
+```
+
+`--png` / `--svg` / `--text` は任意の組み合わせで指定できる (`-t` とは併用不可)。HTTP では `application/json` (`{"text": "...", "svg": "...", "png": "<base64>"}`) で送る。
+
+HTTP では `POST /clip` の `Content-Type` (`text/plain` / `image/png` / `image/svg+xml`) で切り替わる。本文は検証され、不正な PNG / SVG は 400 になる。
 
 tmux キーバインドとして登録しておくと便利（`contrib/tmux.conf.snippet` 参照）。
 

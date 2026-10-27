@@ -1,0 +1,9 @@
+ターゲットの定義を Windows に送って承認待ちに追加
+
+Usage: clipwire register <TARGET>
+
+Arguments:
+  <TARGET>  登録するターゲット名 (~/.config/clipwire/targets.toml で定義)
+
+Options:
+  -h, --help  Print help

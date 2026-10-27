@@ -1,0 +1,9 @@
+ジョブのログを表示
+
+Usage: clipwire logs <ID>
+
+Arguments:
+  <ID>  ジョブ ID
+
+Options:
+  -h, --help  Print help

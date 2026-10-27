@@ -17,29 +17,34 @@ use std::{
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, Context, Result};
 use axum::{
-    Router,
     body::Body,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
+    Router,
 };
 use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
+use store::Store;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "clipwire", about = "Tailscale 越しに Windows クリップボードを操作する")]
+#[command(
+    name = "clipwire",
+    about = "Tailscale 越しに Windows クリップボードを操作する"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -57,10 +62,30 @@ enum Cmd {
     Open(OpenArgs),
     /// 登録済みターゲットを Windows で実行して結果を取得
     Exec(ExecArgs),
+    /// ジョブ一覧を表示
+    Jobs,
+    /// ローカルと Windows のターゲット状態を表示
+    List(ListArgs),
+    /// ターゲット状態、実行中ジョブ、サーバー情報を表示
+    Status,
+    /// ジョブのログを表示
+    Logs(JobIdArgs),
+    /// 実行中のジョブを終了
+    Kill(JobIdArgs),
     /// ターゲットの定義を Windows に送って承認待ちに追加
     Register(RegisterArgs),
     /// 承認待ちターゲットを承認して registered.toml に保存 (Windows ローカルで実行)
     Approve(ApproveArgs),
+    /// 承認待ちターゲットの一覧を表示 (Windows ローカルで実行)
+    Pending,
+    /// 承認待ちターゲットの定義全文を表示 (Windows ローカルで実行)
+    Show(LocalTargetArgs),
+    /// 承認待ちターゲットを拒否 (Windows ローカルで実行)
+    Deny(DenyArgs),
+    /// ローカルの監査ログを末尾から表示
+    Audit(AuditArgs),
+    /// /health を監視し、連続失敗時に動作確認済みの serve で復旧する (Windows)
+    Watchdog(watchdog::WatchdogArgs),
 }
 
 #[derive(Args, Debug)]
@@ -70,12 +95,41 @@ struct RegisterArgs {
 }
 
 #[derive(Args, Debug)]
+struct ListArgs {
+    /// 安定した JSON 形式で表示
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
 struct ApproveArgs {
-    /// 承認するターゲット名 (省略時は pending 一覧を表示)
-    target: Option<String>,
-    /// 実行ディレクトリ (Windows パス)
-    #[arg(long, short)]
-    dir: Option<String>,
+    /// 承認するターゲット名
+    target: String,
+    /// 現在の pending 定義の sha256 ハッシュ (prefix 可)
+    #[arg(long, value_name = "PREFIX", required = true)]
+    hash: String,
+}
+
+#[derive(Args, Debug)]
+struct LocalTargetArgs {
+    /// 承認待ちターゲット名
+    target: String,
+}
+
+#[derive(Args, Debug)]
+struct DenyArgs {
+    /// 拒否するターゲット名
+    target: String,
+    /// 現在の pending 定義の sha256 ハッシュ (prefix 可)
+    #[arg(long, value_name = "PREFIX")]
+    hash: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct AuditArgs {
+    /// 表示する末尾の行数
+    #[arg(long, default_value = "50")]
+    tail: usize,
 }
 
 #[derive(Args, Debug)]
@@ -84,21 +138,33 @@ struct ServeArgs {
     #[arg(long, default_value = "9999")]
     port: u16,
 
-    /// Bearer トークン (または CLIPD_TOKEN 環境変数)
-    #[arg(long, env = "CLIPD_TOKEN")]
+    /// Bearer トークン (コマンドラインへの指定は非推奨)
+    #[arg(long)]
     token: Option<String>,
+
+    /// Bearer トークンを読み込むファイル
+    #[arg(long, value_name = "PATH")]
+    token_file: Option<PathBuf>,
 
     /// localhost のみにバインド (Tailscale IP をスキップ)
     #[arg(long)]
     bind_localhost_only: bool,
 
-    /// トークンなしで tailnet に公開することを明示許可
+    /// 保護ルートを含め、トークンなしでの利用を明示許可
     #[arg(long)]
     allow_no_token: bool,
 
     /// register リクエストを自動承認する (approve 不要)
     #[arg(long)]
     auto_approve: bool,
+
+    /// Host ヘッダ不一致時の動作 (初回出荷はログのみ)
+    #[arg(long, value_enum, default_value_t = HostCheckMode::Log)]
+    host_check: HostCheckMode,
+
+    /// Host ヘッダで追加許可する名前 (複数指定可)
+    #[arg(long, value_name = "HOST", action = clap::ArgAction::Append)]
+    allow_host: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -113,7 +179,43 @@ struct GetArgs {
 }
 
 #[derive(Args, Debug)]
-struct PutArgs;
+struct PutArgs {
+    /// stdin の種別を指定 (既定: 内容から自動判別。PNG / SVG 以外はテキスト)
+    #[arg(short = 't', long = "type", value_enum)]
+    kind: Option<PutKind>,
+
+    /// PNG ファイル (`-` で stdin)。--svg / --text と併用すると全て同時にクリップボードへ載せる
+    #[arg(long, value_name = "FILE", conflicts_with = "kind")]
+    png: Option<String>,
+
+    /// SVG ファイル (`-` で stdin)
+    #[arg(long, value_name = "FILE", conflicts_with = "kind")]
+    svg: Option<String>,
+
+    /// テキストファイル (`-` で stdin)。SVG 非対応アプリ向けの代替表現など
+    #[arg(long, value_name = "FILE", conflicts_with = "kind")]
+    text: Option<String>,
+}
+
+impl PutArgs {
+    fn bundle_sources(&self) -> Option<PutBundleSources<'_>> {
+        if self.png.is_none() && self.svg.is_none() && self.text.is_none() {
+            return None;
+        }
+        Some(PutBundleSources {
+            png: self.png.as_deref(),
+            svg: self.svg.as_deref(),
+            text: self.text.as_deref(),
+        })
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum PutKind {
+    Text,
+    Png,
+    Svg,
+}
 
 #[derive(Args, Debug)]
 struct OpenArgs {
@@ -135,15 +237,15 @@ enum OpenTarget {
 impl OpenTarget {
     fn url(&self) -> &'static str {
         match self {
-            Self::Chatgpt   => "https://chatgpt.com",
-            Self::Claude    => "https://claude.ai",
+            Self::Chatgpt => "https://chatgpt.com",
+            Self::Claude => "https://claude.ai",
             Self::Tailscale => "https://login.tailscale.com/admin",
         }
     }
     fn as_str(&self) -> &'static str {
         match self {
-            Self::Chatgpt   => "chatgpt",
-            Self::Claude    => "claude",
+            Self::Chatgpt => "chatgpt",
+            Self::Claude => "claude",
             Self::Tailscale => "tailscale",
         }
     }
@@ -153,1491 +255,56 @@ impl OpenTarget {
 struct ExecArgs {
     /// 実行するターゲット名 (~/.config/clipwire/targets.toml で定義)
     target: String,
+    /// ターゲット定義の上限より短い実行期限
+    #[arg(long, value_name = "DURATION")]
+    timeout: Option<String>,
+    /// ストリーミングせず、完了後に出力をまとめて取得
+    #[arg(long)]
+    no_stream: bool,
+    /// ジョブ ID を即座に返し、バックグラウンドで実行
+    #[arg(long)]
+    detach: bool,
+    /// 実行結果を Windows クリップボードへコピー
+    /// 注意: ビルドログにはトークン等が含まれることがあり、コピー内容は他アプリや
+    /// クリップボード履歴から参照される可能性があります。
+    #[arg(long, conflicts_with = "detach")]
+    copy: bool,
+    /// 終了コードが 0 でない場合だけ実行結果を Windows クリップボードへコピー
+    /// 注意: ビルドログにはトークン等が含まれることがあり、コピー内容は他アプリや
+    /// クリップボード履歴から参照される可能性があります。
+    #[arg(long, conflicts_with = "detach")]
+    copy_on_fail: bool,
+    /// クリップボードへのコピー時に ANSI エスケープを維持
+    #[arg(long)]
+    raw: bool,
 }
 
-// ── Exec target config ────────────────────────────────────────────────────────
-
-/// `steps` フィールドの値: 構造化配列 or 1行1コマンドの文字列
-#[derive(serde::Deserialize, serde::Serialize, Clone)]
-#[serde(untagged)]
-enum StepsDef {
-    Text(String),
-    Argv(Vec<Vec<String>>),
+#[derive(Args, Debug)]
+struct JobIdArgs {
+    /// ジョブ ID
+    id: String,
 }
 
-impl StepsDef {
-    fn into_argv(self) -> Vec<Vec<String>> {
-        match self {
-            StepsDef::Argv(v) => v,
-            StepsDef::Text(s) => s
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .filter_map(|l| shlex::split(l))
-                .collect(),
-        }
-    }
-}
-
-/// Linux 側 targets.toml のエントリ兼 HTTP 登録ペイロード (dir なし)
-#[derive(serde::Deserialize, serde::Serialize, Clone)]
-#[serde(untagged)]
-enum ExecPayload {
-    Script { script: String },
-    Steps  { steps: StepsDef, #[serde(default)] env: std::collections::HashMap<String, String> },
-}
-
-/// Windows 側 pending.toml / registered.toml のエントリ (dir あり)
-#[derive(serde::Deserialize, serde::Serialize, Clone, Default)]
-struct StoredTarget {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dir:    Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    script: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    steps:  Option<StepsDef>,
-    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    env:    std::collections::HashMap<String, String>,
-}
-
-impl StoredTarget {
-    fn into_exec(self) -> Result<(Option<String>, ExecPayload)> {
-        if let Some(s) = self.script {
-            Ok((self.dir, ExecPayload::Script { script: s }))
-        } else if let Some(steps) = self.steps {
-            Ok((self.dir, ExecPayload::Steps { steps, env: self.env }))
-        } else {
-            bail!("ターゲットに script も steps もありません")
-        }
-    }
-}
-
-type TargetMap = std::collections::HashMap<String, StoredTarget>;
-
-fn clipwire_config_dir() -> PathBuf {
-    dirs_next::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join("clipwire")
-}
-
-fn load_target_map(path: &Path) -> Result<TargetMap> {
-    if !path.exists() { return Ok(TargetMap::default()); }
-    Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
-}
-
-/// `load_target_map` を呼び、失敗（ファイルは存在するが読めない/壊れている）
-/// 場合は空マップにフォールバックしつつ**必ず警告ログを残す**。
-/// 黙って空マップ扱いにすると、破損に気づかないまま
-/// 「登録した全ターゲットが消えた」ように見えてしまう
-/// （サーバー側呼び出し元専用。`unwrap_or_default()` を直接使わないこと）。
-fn load_target_map_or_warn(path: &Path) -> TargetMap {
-    match load_target_map(path) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("{} の読み込みに失敗しました（空として扱います）: {e:#}", path.display());
-            TargetMap::default()
-        }
-    }
-}
-
-fn save_target_map(path: &Path, map: &TargetMap) -> Result<()> {
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    std::fs::write(path, toml::to_string(map)?)?;
-    Ok(())
-}
-
-#[derive(serde::Deserialize)]
-struct TargetsFile {
-    targets: std::collections::HashMap<String, StoredTarget>,
-}
-
-fn load_exec_target(name: &str) -> Result<StoredTarget> {
-    let path = clipwire_config_dir().join("targets.toml");
-    let src = std::fs::read_to_string(&path)
-        .with_context(|| format!("設定ファイルが見つかりません: {}", path.display()))?;
-    let file: TargetsFile = toml::from_str(&src)?;
-    file.targets.into_iter()
-        .find(|(k, _)| k == name)
-        .map(|(_, v)| v)
-        .with_context(|| format!("ターゲット '{}' が定義されていません", name))
-}
-
-// ── Client config ─────────────────────────────────────────────────────────────
-
-struct ClientConfig {
-    host:  String,
-    port:  u16,
-    token: Option<String>,
-}
-
-impl ClientConfig {
-    fn from_env() -> Result<Self> {
-        let host = std::env::var("CLIPD_HOST")
-            .context("CLIPD_HOST が設定されていません (例: export CLIPD_HOST=my-windows)")?;
-        let port = std::env::var("CLIPD_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(9999u16);
-        let token = std::env::var("CLIPD_TOKEN").ok();
-        Ok(Self { host, port, token })
-    }
-
-    fn base_url(&self) -> String {
-        format!("http://{}:{}", self.host, self.port)
-    }
-
-    fn set_auth<'a>(&self, req: ureq::Request) -> ureq::Request {
-        if let Some(token) = &self.token {
-            req.set("Authorization", &format!("Bearer {}", token))
-        } else {
-            req
-        }
-    }
-}
-
-// ── Client: get ───────────────────────────────────────────────────────────────
-
-fn cmd_get(cfg: &ClientConfig, args: &GetArgs) -> Result<()> {
-    let url  = format!("{}/clip", cfg.base_url());
-    let req  = cfg.set_auth(ureq::get(&url).timeout(Duration::from_secs(10)));
-
-    let resp = match req.call() {
-        Ok(r) => r,
-        Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
-        Err(ureq::Error::Status(code, r)) => {
-            bail!("HTTP {}: {}", code, r.into_string().unwrap_or_default().trim().to_string())
-        }
-        Err(e) => bail!("{} に接続できません: {}", cfg.base_url(), e),
-    };
-
-    let kind = resp.header("X-Clip-Kind").unwrap_or("").to_string();
-    let mut body = Vec::new();
-    resp.into_reader().read_to_end(&mut body)?;
-
-    match kind.as_str() {
-        "image" => {
-            let path = save_file(&body, ".png", args.dir.as_deref())?;
-            if args.quiet { println!("{}", path.display()); }
-            else          { println!("画像を保存しました: {}", path.display()); }
-        }
-
-        "text" | "html" | "rtf" => {
-            let (suffix, label) = match kind.as_str() {
-                "html" => (".html", "HTML"),
-                "rtf"  => (".rtf",  "RTF"),
-                _      => (".txt",  "テキスト"),
-            };
-            if body.len() > 1024 {
-                let path = save_file(&body, suffix, args.dir.as_deref())?;
-                if args.quiet { println!("{}", path.display()); }
-                else          { println!("{} を保存しました (大容量): {}", label, path.display()); }
-            } else {
-                io::stdout().write_all(&body)?;
-                if !args.quiet { println!(); }
-            }
-        }
-
-        "url" => {
-            io::stdout().write_all(&body)?;
-            if !args.quiet { println!(); }
-        }
-
-        "audio" => {
-            let path = save_file(&body, ".wav", args.dir.as_deref())?;
-            if args.quiet { println!("{}", path.display()); }
-            else          { println!("音声を保存しました: {}", path.display()); }
-        }
-
-        "files" => {
-            let paths: Vec<String> = serde_json::from_slice(&body)?;
-            if paths.is_empty() {
-                if !args.quiet { println!("クリップボードにファイルがありません。"); }
-                return Ok(());
-            }
-            let auth = cfg.token.as_ref()
-                .map(|t| format!("-H 'Authorization: Bearer {}' ", t))
-                .unwrap_or_default();
-            if !args.quiet { println!("クリップボード: ファイル {}件\n", paths.len()); }
-            for win_path in &paths {
-                let enc   = percent_encode(win_path);
-                let fname = win_fname(win_path);
-                let cmd   = format!("curl -fsSL {}'{}/file?path={}' -o '{}'",
-                                    auth, cfg.base_url(), enc, fname);
-                if args.quiet { println!("{cmd}"); }
-                else          { println!("  {win_path}\n  → {cmd}\n"); }
-            }
-        }
-
-        "vfiles" => {
-            let names: Vec<String> = serde_json::from_slice(&body)?;
-            if names.is_empty() {
-                if !args.quiet { println!("仮想ファイルがありません。"); }
-                return Ok(());
-            }
-            let auth = cfg.token.as_ref()
-                .map(|t| format!("-H 'Authorization: Bearer {}' ", t))
-                .unwrap_or_default();
-            if !args.quiet { println!("クリップボード: 仮想ファイル {}件 (Outlook 添付等)\n", names.len()); }
-            for (i, name) in names.iter().enumerate() {
-                let cmd = format!("curl -fsSL {}'{}/vfile?i={}' -o '{}'",
-                                  auth, cfg.base_url(), i, name);
-                if args.quiet { println!("{cmd}"); }
-                else          { println!("  [{i}] {name}\n  → {cmd}\n"); }
-            }
-        }
-
-        "empty" | "" => { /* サイレント */ }
-
-        "error" => bail!("clipwire error: {}", String::from_utf8_lossy(&body).trim()),
-
-        other => {
-            eprintln!("unknown kind: {other}");
-            io::stdout().write_all(&body)?;
-        }
-    }
-
-    Ok(())
-}
-
-// ── Client: put ───────────────────────────────────────────────────────────────
-
-fn cmd_put(cfg: &ClientConfig) -> Result<()> {
-    let mut body = Vec::new();
-    io::stdin().read_to_end(&mut body)?;
-
-    let url = format!("{}/clip", cfg.base_url());
-    let req = cfg.set_auth(
-        ureq::post(&url)
-            .set("Content-Type", "text/plain; charset=utf-8")
-            .timeout(Duration::from_secs(30)),
-    );
-
-    match req.send_bytes(&body) {
-        Ok(_) => Ok(()),
-        Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
-        Err(ureq::Error::Status(code, r)) => {
-            bail!("HTTP {}: {}", code, r.into_string().unwrap_or_default().trim().to_string())
-        }
-        Err(e) => bail!("{} への送信に失敗: {}", cfg.base_url(), e),
-    }
-}
-
-// ── Client: exec ──────────────────────────────────────────────────────────────
-
-fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
-    let body = serde_json::json!({ "name": args.target }).to_string();
-    let url  = format!("{}/exec", cfg.base_url());
-    let req  = cfg.set_auth(
-        ureq::post(&url)
-            .set("Content-Type", "application/json")
-            .timeout(Duration::from_secs(600)),
-    );
-    let resp = match req.send_string(&body) {
-        Ok(r) => r,
-        Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
-        Err(ureq::Error::Status(404, _)) => bail!("'{}' は Windows 側に登録されていません。先に clipwire register を実行してください", args.target),
-        Err(ureq::Error::Status(409, r)) => bail!("{}", r.into_string().unwrap_or_default().trim()),
-        Err(ureq::Error::Status(503, r)) => bail!("{}", r.into_string().unwrap_or_default().trim()),
-        Err(e) => bail!("{} に接続できません: {}", cfg.base_url(), e),
-    };
-    let exit_code: i32 = resp.header("X-Exit-Code").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let output = resp.into_string()?;
-    print!("{output}");
-    if exit_code != 0 { bail!("exit code {exit_code}"); }
-    Ok(())
-}
-
-// ── Client: register ──────────────────────────────────────────────────────────
-
-fn cmd_register(cfg: &ClientConfig, args: &RegisterArgs) -> Result<()> {
-    let target = load_exec_target(&args.target)?;
-    let mut body = serde_json::to_value(&target)?;
-    let obj = body.as_object_mut().unwrap();
-    obj.insert("name".into(), args.target.clone().into());
-    let url = format!("{}/register", cfg.base_url());
-    let req = cfg.set_auth(
-        ureq::post(&url)
-            .set("Content-Type", "application/json")
-            .timeout(Duration::from_secs(30)),
-    );
-    match req.send_string(&body.to_string()) {
-        Ok(r) => { print!("{}", r.into_string().unwrap_or_default()); Ok(()) }
-        Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
-        Err(e) => bail!("{} に接続できません: {}", cfg.base_url(), e),
-    }
-}
-
-// ── Local: approve (Windows 側で実行) ────────────────────────────────────────
-
-fn cmd_approve(args: &ApproveArgs) -> Result<()> {
-    let config_dir   = clipwire_config_dir();
-    let pending_path = config_dir.join("pending.toml");
-    let mut pending  = load_target_map(&pending_path)?;
-
-    if args.target.is_none() {
-        if pending.is_empty() { println!("承認待ちのターゲットはありません"); }
-        else { for name in pending.keys() { println!("{name}"); } }
-        return Ok(());
-    }
-
-    let name = args.target.as_ref().unwrap();
-    let mut entry = pending.remove(name)
-        .with_context(|| format!("'{}' は pending にありません", name))?;
-
-    if let Some(ref d) = args.dir { entry.dir = Some(d.clone()); }
-
-    // 承認内容を表示
-    println!("=== {} ===", name);
-    if let Some(ref d) = entry.dir { println!("dir:    {}", d); }
-    if let Some(ref s) = entry.script {
-        println!("script:\n{}", s.trim());
-    } else if let Some(ref steps) = entry.steps {
-        let lines = match steps {
-            StepsDef::Text(s) => s.trim().to_string(),
-            StepsDef::Argv(v) => v.iter().map(|a| a.join(" ")).collect::<Vec<_>>().join("\n"),
-        };
-        println!("steps:\n{}", lines);
-    }
-
-    let registered_path = config_dir.join("registered.toml");
-    let mut registered  = load_target_map(&registered_path).unwrap_or_default();
-    registered.insert(name.clone(), entry);
-    save_target_map(&registered_path, &registered)?;
-    save_target_map(&pending_path, &pending)?;
-    println!("承認しました");
-    Ok(())
-}
-
-// ── Client: open ──────────────────────────────────────────────────────────────
-
-fn cmd_open(cfg: &ClientConfig, args: &OpenArgs) -> Result<()> {
-    let url = format!("{}/open?name={}", cfg.base_url(), args.target.as_str());
-    let req = cfg.set_auth(ureq::get(&url).timeout(Duration::from_secs(10)));
-    match req.call() {
-        Ok(_) => { println!("Windows ブラウザで {} を開きました", args.target.url()); Ok(()) }
-        Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
-        Err(ureq::Error::Status(code, r)) => {
-            bail!("HTTP {}: {}", code, r.into_string().unwrap_or_default().trim().to_string())
-        }
-        Err(e) => bail!("{} に接続できません: {}", cfg.base_url(), e),
-    }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn save_file(data: &[u8], suffix: &str, dir: Option<&Path>) -> Result<PathBuf> {
-    let ts   = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let name = format!("clipwire_{}{}", ts, suffix);
-    let path = match dir {
-        Some(d) => { std::fs::create_dir_all(d)?; d.join(&name) }
-        None    => std::env::temp_dir().join(&name),
-    };
-    std::fs::write(&path, data)?;
-    Ok(path)
-}
-
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-fn win_fname(win_path: &str) -> String {
-    let norm = win_path.replace('\\', "/");
-    Path::new(&norm)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_string())
-}
-
-// ── Domain types (serve) ──────────────────────────────────────────────────────
-
-#[derive(Debug)]
+mod audit;
+mod client;
+mod config;
+mod exec_rhai;
+mod jobs;
+// T4.5 now uses Runner, while some T4.2 API surface remains reserved for the
+// timeout/job lifecycle tasks and is intentionally not called yet.
 #[allow(dead_code)]
-enum ClipKind {
-    Image(Vec<u8>),
-    Files(Vec<String>),
-    VFiles(Vec<String>),
-    Audio(Vec<u8>),
-    Html(String),
-    Url(String),
-    Rtf(String),
-    Text(String),
-    Empty,
-}
-
-#[allow(dead_code)]
-enum ClipRequest {
-    GetClip  { reply: oneshot::Sender<ClipKind> },
-    SetClip  { text: String,  reply: oneshot::Sender<Result<()>> },
-    GetFile  { path: String,  reply: oneshot::Sender<Option<Vec<u8>>> },
-    GetVFile { index: usize,  reply: oneshot::Sender<Option<Vec<u8>>> },
-}
-
-#[derive(Clone, Default)]
-struct LastClip {
-    files:  Vec<String>,
-    vfiles: Vec<String>,
-}
-
-#[derive(Clone)]
-struct AppState {
-    clip_tx:      mpsc::SyncSender<ClipRequest>,
-    token:        Option<String>,
-    last_clip:    Arc<Mutex<LastClip>>,
-    config_dir:   PathBuf,
-    auto_approve: bool,
-}
-
-// ── Windows clipboard implementation ──────────────────────────────────────────
-
+mod runner;
+mod server;
+mod store;
+mod watchdog;
 #[cfg(windows)]
-mod win_clip {
-    use super::ClipKind;
-    use anyhow::{bail, Context, Result};
-    use windows::{
-        Win32::{
-            Foundation::{GetLastError, HANDLE, HGLOBAL, WIN32_ERROR},
-            System::{
-                Com::{
-                    CoInitializeEx, CoUninitialize, IStream,
-                    COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED,
-                    DVASPECT_CONTENT, FORMATETC,
-                    TYMED_HGLOBAL, TYMED_ISTREAM,
-                },
-                DataExchange::{
-                    CloseClipboard, EmptyClipboard, GetClipboardData,
-                    IsClipboardFormatAvailable, OpenClipboard,
-                    RegisterClipboardFormatW, SetClipboardData,
-                },
-                Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
-                Ole::{OleGetClipboard, OleInitialize, ReleaseStgMedium},
-                Threading::CreateMutexW,
-            },
-            UI::Shell::{DragQueryFileW, HDROP},
-        },
-        core::w,
-    };
-
-    const CF_DIB:         u32 = 8;
-    const CF_WAVE:        u32 = 12;
-    const CF_UNICODETEXT: u32 = 13;
-    const CF_HDROP:       u32 = 15;
-
-    struct ClipGuard;
-    impl ClipGuard {
-        fn open() -> Result<Self> {
-            unsafe { OpenClipboard(None)? };
-            Ok(ClipGuard)
-        }
-    }
-    impl Drop for ClipGuard {
-        fn drop(&mut self) { unsafe { let _ = CloseClipboard(); } }
-    }
-
-    unsafe fn fmt_avail(fmt: u32) -> bool {
-        IsClipboardFormatAvailable(fmt).is_ok()
-    }
-
-    unsafe fn reg_fmt(name: windows::core::PCWSTR) -> u32 {
-        RegisterClipboardFormatW(name)
-    }
-
-    /// `GlobalLock` が失敗（null 返却）した場合、null ポインタから
-    /// `from_raw_parts` するのは未定義動作（Rust の panic にはならず、
-    /// catch_unwind でも panic hook でも捕まえられない segfault 相当の
-    /// クラッシュになりうる）。ここで明示的に弾く。
-    unsafe fn hglobal_bytes(h: HANDLE) -> Vec<u8> {
-        let hg   = HGLOBAL(h.0);
-        let size = GlobalSize(hg);
-        let ptr  = GlobalLock(hg);
-        if ptr.is_null() {
-            tracing::warn!("hglobal_bytes: GlobalLock が null を返しました (size={size})");
-            return Vec::new();
-        }
-        let data = std::slice::from_raw_parts(ptr as *const u8, size).to_vec();
-        let _    = GlobalUnlock(hg);
-        data
-    }
-
-    pub unsafe fn read_clipboard() -> ClipKind {
-        let fmt_fgd  = reg_fmt(w!("FileGroupDescriptorW"));
-        let fmt_fc   = reg_fmt(w!("FileContents"));
-        let fmt_html = reg_fmt(w!("HTML Format"));
-        let fmt_url  = reg_fmt(w!("UniformResourceLocatorW"));
-        let fmt_rtf  = reg_fmt(w!("Rich Text Format"));
-
-        if fmt_avail(CF_DIB)  { if let Ok(d) = read_image()            { return ClipKind::Image(d); } }
-        if fmt_avail(CF_HDROP){ if let Ok(v) = read_files() { if !v.is_empty() { return ClipKind::Files(v); } } }
-        if fmt_avail(fmt_fgd) && fmt_avail(fmt_fc) {
-            if let Ok(v) = read_vfile_names() { if !v.is_empty() { return ClipKind::VFiles(v); } }
-        }
-        if fmt_avail(CF_WAVE)   { if let Ok(d) = read_wave()            { return ClipKind::Audio(d); } }
-        if fmt_avail(fmt_url)   { if let Ok(u) = read_url(fmt_url)      { return ClipKind::Url(u);   } }
-        if fmt_avail(fmt_html)  { if let Ok(h) = read_html(fmt_html)    { return ClipKind::Html(h);  } }
-        if fmt_avail(fmt_rtf)   { if let Ok(r) = read_rtf(fmt_rtf)      { return ClipKind::Rtf(r);   } }
-        if fmt_avail(CF_UNICODETEXT) {
-            if let Ok(t) = read_text() { if !t.is_empty() { return ClipKind::Text(t); } }
-        }
-        ClipKind::Empty
-    }
-
-    unsafe fn read_image() -> Result<Vec<u8>> {
-        let _g = ClipGuard::open()?;
-        let h  = GetClipboardData(CF_DIB).context("CF_DIB")?;
-        dib_to_png(&hglobal_bytes(h))
-    }
-
-    fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>> {
-        if dib.len() < 40 { bail!("DIB too short"); }
-        let info_size  = u32::from_le_bytes(dib[0..4].try_into()?) as usize;
-        let bpp        = u16::from_le_bytes(dib[14..16].try_into()?) as usize;
-        let clr_count  = if bpp <= 8 { 1usize << bpp } else { 0 };
-        let pix_offset = 14 + info_size + clr_count * 4;
-        let file_size  = 14 + dib.len();
-
-        let mut bmp = Vec::with_capacity(file_size);
-        bmp.extend_from_slice(b"BM");
-        bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
-        bmp.extend_from_slice(&0u32.to_le_bytes());
-        bmp.extend_from_slice(&(pix_offset as u32).to_le_bytes());
-        bmp.extend_from_slice(dib);
-
-        let img = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp)?;
-        let mut png = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
-        Ok(png)
-    }
-
-    unsafe fn read_files() -> Result<Vec<String>> {
-        let _g    = ClipGuard::open()?;
-        let h     = GetClipboardData(CF_HDROP).context("CF_HDROP")?;
-        let hdrop = HDROP(h.0);
-        let count = DragQueryFileW(hdrop, u32::MAX, None);
-        let mut paths = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            let len = DragQueryFileW(hdrop, i, None) as usize;
-            let mut buf = vec![0u16; len + 1];
-            DragQueryFileW(hdrop, i, Some(&mut buf));
-            paths.push(String::from_utf16_lossy(&buf[..len]));
-        }
-        Ok(paths)
-    }
-
-    unsafe fn read_vfile_names() -> Result<Vec<String>> {
-        let fmt = reg_fmt(w!("FileGroupDescriptorW"));
-        let _g  = ClipGuard::open()?;
-        let h   = GetClipboardData(fmt).context("FileGroupDescriptorW")?;
-        parse_fgd(&hglobal_bytes(h))
-    }
-
-    fn parse_fgd(data: &[u8]) -> Result<Vec<String>> {
-        if data.len() < 4 { bail!("FGD too short"); }
-        let count = u32::from_le_bytes(data[0..4].try_into()?) as usize;
-        const ENTRY: usize = 592;
-        const NAME:  usize = 72;
-        let mut names = Vec::with_capacity(count);
-        for i in 0..count {
-            let base = 4 + i * ENTRY;
-            if base + ENTRY > data.len() { break; }
-            let wdata: &[u8] = &data[base + NAME .. base + NAME + 520];
-            let words: Vec<u16> = wdata.chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            let end = words.iter().position(|&w| w == 0).unwrap_or(words.len());
-            names.push(String::from_utf16_lossy(&words[..end]));
-        }
-        Ok(names)
-    }
-
-    pub unsafe fn get_vfile_contents(index: usize) -> Result<Vec<u8>> {
-        let fmt_fc = reg_fmt(w!("FileContents"));
-        let _ = OleInitialize(None);
-
-        let data_obj = OleGetClipboard()?;
-
-        let mut fetc = FORMATETC {
-            cfFormat: fmt_fc as u16,
-            ptd:      std::ptr::null_mut(),
-            dwAspect: DVASPECT_CONTENT.0 as u32,
-            lindex:   index as i32,
-            tymed:    TYMED_ISTREAM.0 as u32,
-        };
-
-        if let Ok(mut stgm) = data_obj.GetData(&fetc) {
-            if stgm.tymed == TYMED_ISTREAM.0 as u32 {
-                let data = {
-                    let stream: &Option<IStream> = &*stgm.u.pstm;
-                    if let Some(s) = stream { drain_istream(s)? } else { bail!("null IStream") }
-                };
-                ReleaseStgMedium(&mut stgm);
-                return Ok(data);
-            }
-            ReleaseStgMedium(&mut stgm);
-        }
-
-        fetc.tymed = TYMED_HGLOBAL.0 as u32;
-        let mut stgm = data_obj.GetData(&fetc)?;
-        let hg   = stgm.u.hGlobal;
-        let size = GlobalSize(hg);
-        let ptr  = GlobalLock(hg);
-        if ptr.is_null() {
-            ReleaseStgMedium(&mut stgm);
-            bail!("get_vfile_contents: GlobalLock が null を返しました (size={size})");
-        }
-        let data = std::slice::from_raw_parts(ptr as *const u8, size).to_vec();
-        let _    = GlobalUnlock(hg);
-        ReleaseStgMedium(&mut stgm);
-        Ok(data)
-    }
-
-    unsafe fn drain_istream(stream: &IStream) -> Result<Vec<u8>> {
-        let mut buf   = Vec::new();
-        let mut chunk = [0u8; 65536];
-        loop {
-            let mut read = 0u32;
-            let _ = stream.Read(chunk.as_mut_ptr() as *mut _, chunk.len() as u32, Some(&mut read));
-            if read == 0 { break; }
-            buf.extend_from_slice(&chunk[..read as usize]);
-        }
-        Ok(buf)
-    }
-
-    unsafe fn read_wave() -> Result<Vec<u8>> {
-        let _g = ClipGuard::open()?;
-        let h  = GetClipboardData(CF_WAVE).context("CF_WAVE")?;
-        Ok(hglobal_bytes(h))
-    }
-
-    unsafe fn read_html(fmt: u32) -> Result<String> {
-        let _g   = ClipGuard::open()?;
-        let h    = GetClipboardData(fmt).context("HTML Format")?;
-        let data = hglobal_bytes(h);
-        let hdr  = String::from_utf8_lossy(&data[..data.len().min(512)]);
-        let start = hdr.lines()
-            .find(|l| l.starts_with("StartHTML:"))
-            .and_then(|l| l[10..].trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        Ok(String::from_utf8_lossy(if start < data.len() { &data[start..] } else { &data }).into_owned())
-    }
-
-    unsafe fn read_url(fmt: u32) -> Result<String> {
-        let _g   = ClipGuard::open()?;
-        let h    = GetClipboardData(fmt).context("URL format")?;
-        let data = hglobal_bytes(h);
-        let words: Vec<u16> = data.chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        let end = words.iter().position(|&w| w == 0).unwrap_or(words.len());
-        Ok(String::from_utf16_lossy(&words[..end]).trim().to_string())
-    }
-
-    unsafe fn read_rtf(fmt: u32) -> Result<String> {
-        let _g = ClipGuard::open()?;
-        let h  = GetClipboardData(fmt).context("RTF")?;
-        Ok(String::from_utf8_lossy(&hglobal_bytes(h)).into_owned())
-    }
-
-    unsafe fn read_text() -> Result<String> {
-        let _g   = ClipGuard::open()?;
-        let h    = GetClipboardData(CF_UNICODETEXT).context("CF_UNICODETEXT")?;
-        let data = hglobal_bytes(h);
-        let words: Vec<u16> = data.chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        let end = words.iter().position(|&w| w == 0).unwrap_or(words.len());
-        Ok(String::from_utf16_lossy(&words[..end]))
-    }
-
-    pub unsafe fn write_clipboard_text(text: &str) -> Result<()> {
-        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-        let byte_len = wide.len() * 2;
-
-        let hg  = GlobalAlloc(GMEM_MOVEABLE, byte_len)?;
-        let ptr = GlobalLock(hg) as *mut u16;
-        if ptr.is_null() { bail!("GlobalLock failed"); }
-        std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
-        let _ = GlobalUnlock(hg);
-
-        OpenClipboard(None)?;
-        EmptyClipboard()?;
-        if let Err(e) = SetClipboardData(CF_UNICODETEXT, HANDLE(hg.0)) {
-            let _ = CloseClipboard();
-            bail!("SetClipboardData: {e}");
-        }
-        CloseClipboard()?;
-        Ok(())
-    }
-
-    pub fn show_balloon(msg: &str) {
-        let msg = msg.to_string();
-        std::thread::spawn(move || {
-            if let Err(e) = show_simple_toast(&msg) {
-                tracing::warn!("show_balloon: バルーン通知の表示に失敗しました: {e}");
-            }
-        });
-    }
-
-    #[allow(unused_variables)]
-    fn show_simple_toast(msg: &str) -> Result<()> {
-        std::process::Command::new("powershell")
-            .args([
-                "-NoProfile", "-WindowStyle", "Hidden", "-Command",
-                &format!(
-                    "[void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms');\
-                     $n=New-Object System.Windows.Forms.NotifyIcon;\
-                     $n.Icon=[System.Drawing.SystemIcons]::Information;\
-                     $n.Visible=$true;\
-                     $n.ShowBalloonTip(4000,'clipwire','{}',\
-                     [System.Windows.Forms.ToolTipIcon]::Info);\
-                     Start-Sleep 5;$n.Dispose()",
-                    msg.replace('\'', "")
-                ),
-            ])
-            .spawn()?;
-        Ok(())
-    }
-
-    /// `register` 要求到着時に WinRT toast（承認/拒否ボタン付き）を表示する。
-    /// 「承認」クリック → 同プロセス内の Activated ハンドラが registered.toml に直接書き込む。
-    pub fn show_register_toast(
-        name: String,
-        entry: super::StoredTarget,
-        config_dir: std::path::PathBuf,
-        reapproval: bool,
-    ) {
-        let log_path = config_dir.join("toast.log");
-        std::thread::spawn(move || {
-            if let Err(e) = show_register_toast_impl(name.clone(), entry, config_dir.clone(), reapproval) {
-                let msg = format!("[clipwire] register toast error for '{}': {e}\n", name);
-                eprintln!("{}", msg.trim());
-                let _ = std::fs::write(&log_path, &msg);
-                // フォールバック: バルーン通知 + 手動 approve 案内
-                show_balloon(&format!(
-                    "'{}' の登録要求。承認: clipwire approve {}", name, name
-                ));
-            }
-        });
-    }
-
-    fn show_register_toast_impl(
-        name: String,
-        entry: super::StoredTarget,
-        config_dir: std::path::PathBuf,
-        reapproval: bool,
-    ) -> Result<()> {
-        // 実行確認用: 関数が呼ばれたら必ずログに記録する
-        let log_path = config_dir.join("toast.log");
-        let _ = std::fs::write(&log_path, format!("[clipwire] show_register_toast_impl called for '{}'\n", name));
-
-        use windows::{
-            core::{Interface, HSTRING},
-            Data::Xml::Dom::XmlDocument,
-            Foundation::TypedEventHandler,
-            UI::Notifications::{
-                ToastActivatedEventArgs, ToastDismissedEventArgs,
-                ToastNotification, ToastNotificationManager,
-            },
-        };
-
-        // MTA で WinRT を初期化
-        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()?; }
-
-        let body = if reapproval {
-            format!("'{}' の設定が変更されました。再承認しますか？", name)
-        } else {
-            format!("'{}' を承認しますか？", name)
-        };
-        let xml_str = format!(
-            r#"<toast><visual><binding template="ToastGeneric"><text>clipwire: 登録要求</text><text>{body}</text></binding></visual><actions><action content="承認" arguments="approve"/><action content="拒否" arguments="deny"/></actions></toast>"#
-        );
-
-        let xml = XmlDocument::new()?;
-        xml.LoadXml(&HSTRING::from(xml_str.as_str()))?;
-        let toast = ToastNotification::CreateToastNotification(&xml)?;
-
-        let (tx, rx) = std::sync::mpsc::channel::<bool>();
-
-        {
-            let tx = tx.clone();
-            toast.Activated(&TypedEventHandler::<ToastNotification, windows::core::IInspectable>::new(
-                move |_, args| {
-                    let approved = args
-                        .as_ref()
-                        .and_then(|a| a.cast::<ToastActivatedEventArgs>().ok())
-                        .and_then(|a| a.Arguments().ok())
-                        .map(|s| s == "approve")
-                        .unwrap_or(false);
-                    let _ = tx.send(approved);
-                    Ok(())
-                },
-            ))?;
-        }
-        {
-            let tx = tx.clone();
-            toast.Dismissed(&TypedEventHandler::<ToastNotification, ToastDismissedEventArgs>::new(
-                move |_, _| { let _ = tx.send(false); Ok(()) },
-            ))?;
-        }
-
-        // スタートメニューのショートカットで登録済みの AUMID を使う
-        let notifier = ToastNotificationManager::CreateToastNotifierWithId(
-            &HSTRING::from(CLIPWIRE_AUMID),
-        )?;
-        let _ = std::fs::write(&log_path, format!("[clipwire] calling notifier.Show() for '{}'\n", name));
-        notifier.Show(&toast)?;
-        let _ = std::fs::write(&log_path, format!("[clipwire] notifier.Show() succeeded for '{}'\n", name));
-
-        // ユーザー操作を最大 10 分待機
-        if rx.recv_timeout(std::time::Duration::from_secs(600)).unwrap_or(false) {
-            let registered_path = config_dir.join("registered.toml");
-            let pending_path    = config_dir.join("pending.toml");
-            let mut registered = super::load_target_map_or_warn(&registered_path);
-            let mut pending    = super::load_target_map_or_warn(&pending_path);
-            registered.insert(name.clone(), entry);
-            pending.remove(&name);
-            super::save_target_map(&registered_path, &registered)?;
-            super::save_target_map(&pending_path, &pending)?;
-            eprintln!("[clipwire] '{}' 承認 → registered.toml", name);
-            show_balloon(&format!("'{}' を承認しました", name));
-        }
-
-        unsafe { CoUninitialize(); }
-        Ok(())
-    }
-
-    const CLIPWIRE_AUMID: &str = "cuzic.clipwire";
-
-    /// サーバー起動時に一度だけ呼ぶ。
-    /// プロセスに AUMID を設定することで CreateToastNotifierWithId が使えるようになる。
-    pub fn ensure_aumid_registered() {
-        unsafe {
-            if let Err(e) = windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
-                windows::core::w!("cuzic.clipwire"),
-            ) {
-                eprintln!("[clipwire] SetCurrentProcessExplicitAppUserModelID failed: {e}");
-            }
-        }
-    }
-
-    /// `-WindowStyle Hidden` では eprintln! はどこにも表示されないため、直接
-    /// ログファイルへ書く。`tracing::error!` は非同期（non-blocking writer）
-    /// で実際の書き込みはバックグラウンドスレッドが行うため、直後の
-    /// `std::process::exit`（デストラクタを一切走らせない）と組み合わせると
-    /// メッセージが失われうる——ここでは同期的にファイルへ書いてから終了する。
-    fn log_and_exit(msg: &str) -> ! {
-        eprintln!("{msg}");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(super::log_file_path())
-        {
-            use std::io::Write as _;
-            let _ = writeln!(f, "{msg}");
-        }
-        std::process::exit(1);
-    }
-
-    pub unsafe fn acquire_mutex() -> windows::Win32::Foundation::HANDLE {
-        match CreateMutexW(None, true, w!("Global\\clipwire_singleton")) {
-            Ok(h) => {
-                if GetLastError() == WIN32_ERROR(183) {
-                    log_and_exit("clipwire serve は既に起動中です。");
-                }
-                h
-            }
-            Err(e) => log_and_exit(&format!("CreateMutexW failed: {e}")),
-        }
-    }
-
-    pub fn sta_loop(rx: std::sync::mpsc::Receiver<super::ClipRequest>) {
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-            use super::ClipRequest;
-            for req in rx {
-                match req {
-                    ClipRequest::GetClip  { reply }       => { let _ = reply.send(read_clipboard()); }
-                    ClipRequest::SetClip  { text, reply } => { let _ = reply.send(write_clipboard_text(&text)); }
-                    ClipRequest::GetFile  { path, reply } => { let _ = reply.send(std::fs::read(&path).ok()); }
-                    ClipRequest::GetVFile { index, reply }=> { let _ = reply.send(get_vfile_contents(index).ok()); }
-                }
-            }
-            CoUninitialize();
-        }
-    }
-}
-
-// ── Logging / panic visibility (serve) ────────────────────────────────────────
-
-/// ログファイルのパス（`clipwire_config_dir()/clipd.log`）。
-fn log_file_path() -> PathBuf {
-    clipwire_config_dir().join("clipd.log")
-}
-
-/// panic 発生時にメッセージをログファイルへ直接追記する panic hook を設定する。
-/// tokio ランタイム起動前、`main()` の一番最初で一度だけ呼ぶこと
-/// （STA クリップボードスレッド等、tracing の非同期書き込みタスクとは別の
-/// スレッドで起きた panic も、tracing の初期化タイミングに関係なく捕まえる
-/// ため、tracing_subscriber::fmt().init() より前に独立して動く必要がある）。
-///
-/// これは Rust の catch_unwind 可能な panic のみを捕まえる。`GlobalLock` の
-/// null ポインタ参照のような未定義動作（segfault 相当）はそもそも Rust の
-/// panic ではないため、この hook でも捕まえられない
-/// （`win_clip::hglobal_bytes` 側で null チェックして防ぐ必要がある）。
-fn install_panic_hook() {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let thread = std::thread::current();
-        let msg = format!(
-            "[{ts}] PANIC on thread '{}': {info}\n",
-            thread.name().unwrap_or("<unnamed>")
-        );
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_file_path())
-        {
-            let _ = f.write_all(msg.as_bytes());
-        }
-        default_hook(info);
-    }));
-}
-
-// ── Network helpers (serve) ───────────────────────────────────────────────────
-
-fn find_tailscale_ip() -> Option<Ipv4Addr> {
-    if let Ok(out) = std::process::Command::new("tailscale").args(["ip", "-4"]).output() {
-        if out.status.success() {
-            if let Ok(ip) = String::from_utf8_lossy(&out.stdout).trim().parse::<Ipv4Addr>() {
-                return Some(ip);
-            }
-        } else {
-            warn!(
-                "tailscale ip -4 failed: status={:?} stderr={}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-    } else {
-        warn!("tailscale コマンドを実行できませんでした（PATH に無い可能性）");
-    }
-    if let Ok(out) = std::process::Command::new("ipconfig").output() {
-        let s = String::from_utf8_lossy(&out.stdout);
-        for line in s.lines() {
-            let line = line.trim();
-            if line.starts_with("IPv4") || line.contains("IP Address") {
-                if let Some(part) = line.split(':').nth(1) {
-                    if let Ok(ip) = part.trim().parse::<Ipv4Addr>() {
-                        if is_cgnat(ip) { return Some(ip); }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn is_cgnat(ip: Ipv4Addr) -> bool {
-    let o = ip.octets();
-    o[0] == 100 && (o[1] & 0xC0) == 0x40
-}
-
-// ── Auth (serve) ──────────────────────────────────────────────────────────────
-
-fn check_auth(token: &Option<String>, headers: &HeaderMap) -> bool {
-    let Some(expected) = token else { return true };
-    headers.get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s == format!("Bearer {expected}"))
-        .unwrap_or(false)
-}
-
-fn unauthorized() -> Response {
-    (StatusCode::UNAUTHORIZED, "Unauthorized\n").into_response()
-}
-
-// ── HTTP handlers (serve) ─────────────────────────────────────────────────────
-
-async fn handle_health() -> &'static str { "OK\n" }
-
-async fn handle_clip(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth(&s.token, &headers) { return unauthorized(); }
-
-    let (tx, rx) = oneshot::channel();
-    if s.clip_tx.send(ClipRequest::GetClip { reply: tx }).is_err() {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    let Ok(kind) = rx.await else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
-
-    match kind {
-        ClipKind::Image(data)  => { s.last_clip.lock().unwrap().files.clear(); clip_resp("image", "image/png", data) }
-        ClipKind::Files(paths) => { let j = serde_json::to_vec(&paths).unwrap(); s.last_clip.lock().unwrap().files = paths; clip_resp("files", "application/json", j) }
-        ClipKind::VFiles(names)=> { let j = serde_json::to_vec(&names).unwrap(); s.last_clip.lock().unwrap().vfiles = names; clip_resp("vfiles", "application/json", j) }
-        ClipKind::Audio(data)  => clip_resp("audio", "audio/wav",                  data),
-        ClipKind::Html(html)   => clip_resp("html",  "text/html; charset=utf-8",   html.into_bytes()),
-        ClipKind::Url(url)     => clip_resp("url",   "text/plain; charset=utf-8",  url.into_bytes()),
-        ClipKind::Rtf(rtf)     => clip_resp("rtf",   "text/rtf",                   rtf.into_bytes()),
-        ClipKind::Text(text)   => clip_resp("text",  "text/plain; charset=utf-8",  text.into_bytes()),
-        ClipKind::Empty => {
-            #[cfg(windows)] win_clip::show_balloon("クリップボードが空です");
-            clip_resp("empty", "text/plain; charset=utf-8", b"".to_vec())
-        }
-    }
-}
-
-fn clip_resp(kind: &str, ct: &str, body: Vec<u8>) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("X-Clip-Kind", kind)
-        .header(header::CONTENT_TYPE, ct)
-        .body(Body::from(body))
-        .unwrap()
-}
-
-async fn handle_clip_post(State(s): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
-    if !check_auth(&s.token, &headers) { return unauthorized(); }
-    let text = match String::from_utf8(body.to_vec()) {
-        Ok(t) => t,
-        Err(_) => return (StatusCode::BAD_REQUEST, "Body must be UTF-8\n").into_response(),
-    };
-    let (tx, rx) = oneshot::channel();
-    if s.clip_tx.send(ClipRequest::SetClip { text, reply: tx }).is_err() {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    match rx.await {
-        Ok(Ok(())) => (StatusCode::NO_CONTENT, "").into_response(),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
-        Err(_)     => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-
-#[derive(Deserialize)] struct FileQuery  { path: String }
-#[derive(Deserialize)] struct VFileQuery { i: usize }
-#[derive(Deserialize)] struct OpenQuery  { name: String }
-
-async fn handle_register(State(s): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
-    if !check_auth(&s.token, &headers) { return unauthorized(); }
-
-    #[derive(serde::Deserialize)]
-    struct Req { name: String, #[serde(flatten)] target: StoredTarget }
-
-    let req: Req = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("JSON parse error: {e}\n")).into_response(),
-    };
-
-    let entry           = req.target;
-    let pending_path    = s.config_dir.join("pending.toml");
-    let registered_path = s.config_dir.join("registered.toml");
-    let mut registered  = load_target_map_or_warn(&registered_path);
-
-    if s.auto_approve {
-        registered.insert(req.name.clone(), entry);
-        if let Err(e) = save_target_map(&registered_path, &registered) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("保存エラー: {e}\n")).into_response();
-        }
-        return (StatusCode::OK, format!("'{}' を登録しました\n", req.name)).into_response();
-    }
-
-    // 通常フロー: pending に追加、既承認分は取り消し
-    let reapproval = registered.remove(&req.name).is_some();
-    let mut pending = load_target_map_or_warn(&pending_path);
-    #[cfg(windows)]
-    let entry_for_toast = entry.clone();
-    pending.insert(req.name.clone(), entry);
-
-    if let Err(e) = save_target_map(&pending_path, &pending)
-        .and_then(|_| save_target_map(&registered_path, &registered))
-    {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("保存エラー: {e}\n")).into_response();
-    }
-
-    let msg = if reapproval {
-        format!("'{}' の設定が変更されました。Windows で clipwire approve {} を実行してください", req.name, req.name)
-    } else {
-        format!("'{}' を承認待ちに追加しました。Windows で clipwire approve {} を実行してください", req.name, req.name)
-    };
-    #[cfg(windows)]
-    win_clip::show_register_toast(req.name.clone(), entry_for_toast, s.config_dir.clone(), reapproval);
-    #[cfg(not(windows))]
-    eprintln!("{msg}");
-
-    (StatusCode::OK, format!("{msg}\n")).into_response()
-}
-
-async fn handle_exec(State(s): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
-    if !check_auth(&s.token, &headers) { return unauthorized(); }
-
-    #[derive(serde::Deserialize)]
-    struct Req { name: String }
-
-    let req: Req = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("JSON parse error: {e}\n")).into_response(),
-    };
-
-    let registered = load_target_map_or_warn(&s.config_dir.join("registered.toml"));
-    let stored = match registered.get(&req.name) {
-        Some(t) => t.clone(),
-        None => {
-            let pending = load_target_map_or_warn(&s.config_dir.join("pending.toml"));
-            if pending.contains_key(&req.name) {
-                return (StatusCode::CONFLICT, format!("'{}' は承認待ちです。Windows で clipwire approve {} を実行してください\n", req.name, req.name)).into_response();
-            }
-            return StatusCode::NOT_FOUND.into_response();
-        }
-    };
-
-    let (dir, payload) = match stored.into_exec() {
-        Ok(v)  => v,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
-    };
-
-    match payload {
-        ExecPayload::Steps { steps, env } => {
-            let mut combined = Vec::new();
-            for args in &steps.into_argv() {
-                if args.is_empty() { continue; }
-                let mut cmd = tokio::process::Command::new(&args[0]);
-                cmd.args(&args[1..]);
-                cmd.envs(&env);
-                cmd.stdout(std::process::Stdio::piped());
-                cmd.stderr(std::process::Stdio::piped());
-                if let Some(ref d) = dir { cmd.current_dir(d); }
-                let output = match cmd.output().await {
-                    Ok(o) => o,
-                    Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("実行エラー: {e}\n")).into_response(),
-                };
-                combined.extend_from_slice(&output.stderr);
-                combined.extend_from_slice(&output.stdout);
-                if !output.status.success() {
-                    return exec_response(combined, output.status.code().unwrap_or(-1));
-                }
-            }
-            exec_response(combined, 0)
-        }
-
-        ExecPayload::Script { script } => {
-            match tokio::task::spawn_blocking(move || exec_rhai(&script, dir.as_deref())).await {
-                Ok(Ok((out, code))) => exec_response(out, code),
-                Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
-                Err(e)     => (StatusCode::INTERNAL_SERVER_ERROR, format!("thread panic: {e}\n")).into_response(),
-            }
-        }
-    }
-}
-
-fn exec_response(body: Vec<u8>, exit_code: i32) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("X-Exit-Code", exit_code.to_string())
-        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Body::from(body))
-        .unwrap()
-}
-
-fn exec_rhai(script: &str, dir: Option<&str>) -> Result<(Vec<u8>, i32)> {
-    use std::sync::{Arc, Mutex};
-    let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let dir = dir.map(str::to_string);
-
-    let mut engine = rhai::Engine::new();
-
-    // run(["cmd", "arg", ...]) — 失敗したらスクリプトを停止
-    {
-        let out = out.clone(); let dir = dir.clone();
-        engine.register_fn("run", move |args: rhai::Array| -> Result<(), Box<rhai::EvalAltResult>> {
-            let args: Vec<String> = args.iter()
-                .map(|a| a.clone().try_cast::<String>().unwrap_or_else(|| a.to_string()))
-                .collect();
-            if args.is_empty() { return Ok(()); }
-            let mut cmd = std::process::Command::new(&args[0]);
-            cmd.args(&args[1..]);
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::piped());
-            if let Some(ref d) = dir { cmd.current_dir(d); }
-            let o = cmd.output().map_err(|e| e.to_string())?;
-            { let mut g = out.lock().unwrap(); g.extend_from_slice(&o.stderr); g.extend_from_slice(&o.stdout); }
-            if !o.status.success() {
-                return Err(format!("exit code {}", o.status.code().unwrap_or(-1)).into());
-            }
-            Ok(())
-        });
-    }
-
-    // run_ok(["cmd", ...]) — 失敗しても続行、成功なら true
-    {
-        let out = out.clone(); let dir = dir.clone();
-        engine.register_fn("run_ok", move |args: rhai::Array| -> bool {
-            let args: Vec<String> = args.iter()
-                .map(|a| a.clone().try_cast::<String>().unwrap_or_else(|| a.to_string()))
-                .collect();
-            if args.is_empty() { return true; }
-            let mut cmd = std::process::Command::new(&args[0]);
-            cmd.args(&args[1..]);
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::piped());
-            if let Some(ref d) = dir { cmd.current_dir(d); }
-            match cmd.output() {
-                Ok(o) => {
-                    let mut g = out.lock().unwrap();
-                    g.extend_from_slice(&o.stderr); g.extend_from_slice(&o.stdout);
-                    o.status.success()
-                }
-                Err(e) => {
-                    // run_ok は失敗を無視して続行する設計だが、起動すらできな
-                    // かった理由（プログラムが見つからない等）まで無音にする
-                    // と原因調査が不可能になるため、出力に残す。
-                    let mut g = out.lock().unwrap();
-                    g.extend_from_slice(
-                        format!("run_ok: {} の起動に失敗しました: {e}\n", args[0]).as_bytes(),
-                    );
-                    false
-                }
-            }
-        });
-    }
-
-    // file_exists(path)
-    {
-        let dir = dir.clone();
-        engine.register_fn("file_exists", move |path: &str| -> bool {
-            let p = match &dir { Some(d) => std::path::Path::new(d).join(path), None => path.into() };
-            p.exists()
-        });
-    }
-
-    // rm(path) — ファイル削除、失敗しても続行
-    {
-        let dir = dir.clone();
-        engine.register_fn("rm", move |path: &str| -> bool {
-            let p = match &dir { Some(d) => std::path::Path::new(d).join(path), None => path.into() };
-            std::fs::remove_file(p).is_ok()
-        });
-    }
-
-    let code = match engine.eval::<()>(script) {
-        Ok(_)  => 0i32,
-        Err(e) => {
-            out.lock().unwrap().extend_from_slice(format!("script error: {e}\n").as_bytes());
-            1i32
-        }
-    };
-    let bytes = out.lock().unwrap().clone();
-    Ok((bytes, code))
-}
-
-async fn handle_open(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<OpenQuery>) -> Response {
-    if !check_auth(&s.token, &headers) { return unauthorized(); }
-    let url = match q.name.as_str() {
-        "chatgpt"   => "https://chatgpt.com",
-        "claude"    => "https://claude.ai",
-        "tailscale" => "https://login.tailscale.com/admin",
-        other => return (StatusCode::BAD_REQUEST, format!("unknown target: {other}\n")).into_response(),
-    };
-    #[cfg(windows)]
-    if let Err(e) = std::process::Command::new("cmd").args(["/c", "start", "", url]).spawn() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("ブラウザを開けませんでした: {e}\n")).into_response();
-    }
-    (StatusCode::OK, format!("{url}\n")).into_response()
-}
-
-async fn handle_file(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<FileQuery>) -> Response {
-    if !check_auth(&s.token, &headers) { return unauthorized(); }
-    let req_path = match std::path::Path::new(&q.path).canonicalize() {
-        Ok(p) => p,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-    let allowed = s.last_clip.lock().unwrap().files.iter().any(|f| {
-        std::path::Path::new(f).canonicalize().map(|p| p == req_path).unwrap_or(false)
-    });
-    if !allowed { return StatusCode::FORBIDDEN.into_response(); }
-    let (tx, rx) = oneshot::channel();
-    if s.clip_tx.send(ClipRequest::GetFile { path: q.path, reply: tx }).is_err() {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    match rx.await {
-        Ok(Some(data)) => {
-            let mime = mime_for_ext(req_path.extension().and_then(|e| e.to_str()).unwrap_or(""));
-            Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, mime).body(Body::from(data)).unwrap()
-        }
-        _ => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
-async fn handle_vfile(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<VFileQuery>) -> Response {
-    if !check_auth(&s.token, &headers) { return unauthorized(); }
-    let (tx, rx) = oneshot::channel();
-    if s.clip_tx.send(ClipRequest::GetVFile { index: q.i, reply: tx }).is_err() {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    match rx.await {
-        Ok(Some(data)) => {
-            let fname = s.last_clip.lock().unwrap().vfiles.get(q.i).cloned()
-                .unwrap_or_else(|| format!("file_{}", q.i));
-            let mime  = mime_for_ext(std::path::Path::new(&fname).extension().and_then(|e| e.to_str()).unwrap_or(""));
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, mime)
-                .header("Content-Disposition", format!("attachment; filename=\"{fname}\""))
-                .body(Body::from(data)).unwrap()
-        }
-        _ => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
-fn mime_for_ext(ext: &str) -> &'static str {
-    match ext.to_lowercase().as_str() {
-        "png"           => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif"           => "image/gif",
-        "bmp"           => "image/bmp",
-        "webp"          => "image/webp",
-        "pdf"           => "application/pdf",
-        "txt"           => "text/plain",
-        "html" | "htm" => "text/html",
-        "csv"           => "text/csv",
-        "zip"           => "application/zip",
-        "docx"          => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "xlsx"          => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "pptx"          => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        _               => "application/octet-stream",
-    }
-}
-
-// ── serve entry point ─────────────────────────────────────────────────────────
-
-async fn run_serve(args: ServeArgs) -> Result<()> {
-    // `-WindowStyle Hidden` で起動すると標準出力/標準エラーがどこにも残らず、
-    // tracing のログも panic メッセージも消える（「ログが何もない」の直接の
-    // 原因）。ログファイルへ明示的に書く。`_guard` は非同期書き込みスレッドを
-    // 生かし続けるためにこの関数のスタックで保持する（`serve_forever` が
-    // 正常時は無限ループのため、事実上プロセス終了までドロップされない）。
-    let log_path = log_file_path();
-    if let Some(parent) = log_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let file_appender = tracing_appender::rolling::never(
-        log_path.parent().unwrap_or_else(|| Path::new(".")),
-        log_path
-            .file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("clipd.log")),
-    );
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "clipwire=info".into()),
-        )
-        .with_writer(non_blocking)
-        .with_ansi(false)
-        .init();
-    info!("clipd starting (pid={}), log file: {}", std::process::id(), log_path.display());
-
-    if !args.bind_localhost_only && args.token.is_none() && !args.allow_no_token {
-        bail!(
-            "トークンなしでの起動を拒否しました。\n\
-             --token <secret>、CLIPD_TOKEN 環境変数、または --allow-no-token を指定してください。"
-        );
-    }
-
-    #[cfg(windows)]
-    let _mutex = unsafe { win_clip::acquire_mutex() };
-    #[cfg(windows)]
-    win_clip::ensure_aumid_registered();
-
-    let (clip_tx, clip_rx) = mpsc::sync_channel::<ClipRequest>(32);
-    thread::Builder::new()
-        .name("clipboard-sta".into())
-        .spawn(move || {
-            #[cfg(windows)]      win_clip::sta_loop(clip_rx);
-            #[cfg(not(windows))] { drop(clip_rx); }
-        })?;
-
-    let state = AppState {
-        clip_tx,
-        token:        args.token.clone(),
-        last_clip:    Arc::new(Mutex::new(LastClip::default())),
-        config_dir:   clipwire_config_dir(),
-        auto_approve: args.auto_approve,
-    };
-
-    let app = Router::new()
-        .route("/health",   get(handle_health))
-        .route("/",         get(handle_clip))
-        .route("/clip",     get(handle_clip).post(handle_clip_post))
-        .route("/file",     get(handle_file))
-        .route("/vfile",    get(handle_vfile))
-        .route("/open",     get(handle_open))
-        .route("/exec",     post(handle_exec))
-        .route("/register", post(handle_register))
-        .with_state(state.clone());
-
-    let localhost = SocketAddr::from(([127, 0, 0, 1], args.port));
-
-    if args.bind_localhost_only {
-        serve_forever(localhost, app, "localhost").await;
-    } else {
-        match find_tailscale_ip() {
-            Some(ts_ip) => {
-                let ts_addr = SocketAddr::from((ts_ip, args.port));
-                let app2 = app.clone();
-                tokio::spawn(serve_forever(localhost, app2, "localhost"));
-                serve_forever(ts_addr, app, "tailscale").await;
-            }
-            None => {
-                warn!("Tailscale IP not found; falling back to localhost-only");
-                serve_forever(localhost, app, "localhost").await;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// `addr` へ bind して `app` を serve し続ける。エラーが起きても**プロセスを
-/// 道連れにせず**、ログを出して5秒後に再試行する（bind 自体の失敗、serve
-/// ループ中の異常終了のいずれも同様）。
-///
-/// # 修正の背景（2026-08-15）
-///
-/// 旧実装は Tailscale 向けリスナーだけ `axum::serve(..).await?` で
-/// `run_serve` → `main()` までエラーを伝播させ、**プロセスごと終了**していた
-/// （localhost 向けリスナーは対称的に `.ok()` で握り潰していたのに、
-/// こちらだけ非対称だった）。Tailscale の接続は relay⇔direct の切替や
-/// 一時的な `offline` 状態を伴うことがあり、そのタイミングで
-/// `TcpListener::bind`/`axum::serve` がエラーを返すと、そのままサーバー
-/// プロセス全体が落ちていた（実機で「何度再起動しても落ちる」として再現）。
-/// この関数に一本化し、どのリスナーも「失敗したら再試行し続ける」対称な
-/// 挙動にした。
-async fn serve_forever(addr: SocketAddr, app: Router, label: &str) {
-    loop {
-        match tokio::net::TcpListener::bind(addr).await {
-            Ok(listener) => {
-                info!("Listening on http://{addr} ({label})");
-                if let Err(e) = axum::serve(listener, app.clone()).await {
-                    warn!("{label} リスナー ({addr}) が停止しました: {e}。5秒後に再試行します");
-                }
-            }
-            Err(e) => {
-                warn!("{label} ({addr}) への bind に失敗しました: {e}。5秒後に再試行します");
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    }
-}
-
-// ── main ──────────────────────────────────────────────────────────────────────
+mod win;
+
+use client::*;
+use config::*;
+use server::*;
+#[cfg(windows)]
+use win::win_clip;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1667,9 +334,9 @@ fn main() -> Result<()> {
             let cfg = ClientConfig::from_env()?;
             cmd_get(&cfg, &args)
         }
-        Cmd::Put(_) => {
+        Cmd::Put(args) => {
             let cfg = ClientConfig::from_env()?;
-            cmd_put(&cfg)
+            cmd_put(&cfg, args.kind, args.bundle_sources())
         }
         Cmd::Open(args) => {
             let cfg = ClientConfig::from_env()?;
@@ -1679,10 +346,2594 @@ fn main() -> Result<()> {
             let cfg = ClientConfig::from_env()?;
             cmd_exec(&cfg, &args)
         }
+        Cmd::Jobs => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_jobs(&cfg)
+        }
+        Cmd::List(args) => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_list(&cfg, &args)
+        }
+        Cmd::Status => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_status(&cfg)
+        }
+        Cmd::Logs(args) => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_logs(&cfg, &args)
+        }
+        Cmd::Kill(args) => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_kill(&cfg, &args)
+        }
         Cmd::Register(args) => {
             let cfg = ClientConfig::from_env()?;
             cmd_register(&cfg, &args)
         }
         Cmd::Approve(args) => cmd_approve(&args),
+        Cmd::Pending => cmd_pending(),
+        Cmd::Show(args) => cmd_show(&args),
+        Cmd::Deny(args) => cmd_deny(&args),
+        Cmd::Audit(args) => cmd_audit(&args),
+        Cmd::Watchdog(args) => watchdog::run_watchdog(args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(not(windows))]
+    use crate::exec_rhai::exec_rhai;
+    #[cfg(target_os = "linux")]
+    use crate::exec_rhai::exec_rhai_cancelable;
+    use proptest::prelude::*;
+    use quick_xml::{events::Event, Reader};
+    use std::collections::{BTreeMap, HashMap};
+    use tempfile::tempdir;
+    use tower::ServiceExt;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(self.0.clone())
+        }
+    }
+
+    fn capture_logs(action: impl FnOnce()) -> String {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(capture.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, action);
+        let bytes = capture.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn test_state(config_dir: PathBuf, auto_approve: bool) -> AppState {
+        let (clip_tx, _clip_rx) = mpsc::sync_channel(1);
+        let store = Store::new(config_dir.clone());
+        AppState {
+            clip_tx,
+            token: None,
+            allow_no_token: false,
+            last_clip: Arc::new(Mutex::new(LastClip::default())),
+            config_dir: config_dir.clone(),
+            store,
+            auto_approve,
+            host_policy: HostPolicy::default(),
+            audit: audit::AuditLog::new(config_dir.clone()),
+            jobs: jobs::JobRegistry::new(config_dir).unwrap(),
+            stream_ping_interval: Duration::from_secs(30),
+        }
+    }
+
+    fn clipboard_test_state(config_dir: PathBuf) -> AppState {
+        let (clip_tx, clip_rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            if let Ok(ClipRequest::GetClip { reply }) = clip_rx.recv() {
+                let _ = reply.send(ClipKind::Text("stub".into()));
+            }
+        });
+        let store = Store::new(config_dir.clone());
+        AppState {
+            clip_tx,
+            token: None,
+            allow_no_token: false,
+            last_clip: Arc::new(Mutex::new(LastClip::default())),
+            config_dir: config_dir.clone(),
+            store,
+            auto_approve: false,
+            host_policy: HostPolicy::default(),
+            audit: audit::AuditLog::new(config_dir.clone()),
+            jobs: jobs::JobRegistry::new(config_dir).unwrap(),
+            stream_ping_interval: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn ac_t2_1_1_every_route_has_an_explicit_classification() {
+        let actual: Vec<_> = ROUTES
+            .iter()
+            .map(|route| (route.id, route.path, route.class))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                (RouteId::Health, "/health", RouteClass::Common),
+                (RouteId::Root, "/", RouteClass::Clipboard),
+                (RouteId::Clip, "/clip", RouteClass::Clipboard),
+                (RouteId::File, "/file", RouteClass::Clipboard),
+                (RouteId::VFile, "/vfile", RouteClass::Clipboard),
+                (RouteId::Open, "/open", RouteClass::Clipboard),
+                (RouteId::Exec, "/exec", RouteClass::Protected),
+                (RouteId::Register, "/register", RouteClass::Protected),
+                (
+                    RouteId::TargetsCheck,
+                    "/targets/check",
+                    RouteClass::Protected,
+                ),
+                (RouteId::Jobs, "/jobs", RouteClass::Protected),
+                (RouteId::Job, "/jobs/:id", RouteClass::Protected),
+                (RouteId::JobLog, "/jobs/:id/log", RouteClass::Protected),
+                (RouteId::JobKill, "/jobs/:id/kill", RouteClass::Protected),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t2_1_2_middleware_order_and_statuses_are_fixed() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.token = Some("secret".into());
+        state.host_policy.mode = HostCheckMode::Enforce;
+        let app = build_router(state);
+
+        let request = |host: bool, origin: bool, content_type: Option<&str>| {
+            let mut builder = axum::http::Request::builder().method("POST").uri("/exec");
+            if host {
+                builder = builder.header(header::HOST, "localhost");
+            }
+            if origin {
+                builder = builder.header(header::ORIGIN, "http://evil.example");
+            }
+            if let Some(content_type) = content_type {
+                builder = builder.header(header::CONTENT_TYPE, content_type);
+            }
+            builder.body(Body::from("{}")).unwrap()
+        };
+
+        let cases = [
+            (request(false, true, Some("text/plain")), 421),
+            (request(true, true, Some("text/plain")), 403),
+            (request(true, false, Some("text/plain")), 415),
+            (request(true, false, Some("application/json")), 401),
+        ];
+        for (request, expected) in cases {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_t7_7_1_open_accepts_only_json_post() {
+        let dir = tempdir().unwrap();
+        let app = build_router(test_state(dir.path().to_path_buf(), false));
+        let post = axum::http::Request::builder()
+            .method("POST")
+            .uri("/open")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"name":"chatgpt"}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(post).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let get = axum::http::Request::builder()
+            .uri("/open?name=claude")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(get).await.unwrap().status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+
+        let missing_content_type = axum::http::Request::builder()
+            .method("POST")
+            .uri("/open")
+            .header(header::HOST, "localhost")
+            .body(Body::from(r#"{"name":"chatgpt"}"#))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(missing_content_type).await.unwrap().status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+    }
+
+    fn host_policy(mode: HostCheckMode, hosts: &[&str]) -> HostPolicy {
+        HostPolicy {
+            mode,
+            allowed: Arc::new(hosts.iter().map(|host| host.to_string()).collect()),
+        }
+    }
+
+    #[test]
+    fn ac_t2_3_2_tailscale_names_include_fqdn_first_label_and_host_name() {
+        let names = tailscale_names_from_status(
+            br#"{"Self":{"DNSName":"magic-name.tail.example.","HostName":"machine-name"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            names,
+            ["magic-name.tail.example.", "magic-name", "machine-name"]
+        );
+    }
+
+    #[test]
+    fn ac_t2_3_4_cli_defaults_to_log_and_accepts_multiple_allow_hosts() {
+        let cli = Cli::try_parse_from([
+            "clipwire",
+            "serve",
+            "--allow-host",
+            "foo",
+            "--allow-host",
+            "BAR",
+        ])
+        .unwrap();
+        let Cmd::Serve(args) = cli.cmd else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.host_check, HostCheckMode::Log);
+        assert_eq!(args.allow_host, ["foo", "BAR"]);
+    }
+
+    #[test]
+    fn ac_t3_8_2_approve_requires_hash_and_dir_is_removed() {
+        assert!(Cli::try_parse_from(["clipwire", "approve", "demo"]).is_err());
+        assert!(Cli::try_parse_from(["clipwire", "approve", "demo", "--hash", "0123"]).is_ok());
+        let error = Cli::try_parse_from([
+            "clipwire", "approve", "demo", "--hash", "0123", "--dir", "C:\\tmp",
+        ])
+        .err()
+        .expect("--dir must be rejected");
+        assert!(error.to_string().contains("--dir"));
+    }
+
+    #[test]
+    fn ac_t3_8_4_http_routes_have_no_approval_or_denial_endpoint() {
+        assert!(ROUTES.iter().all(|route| {
+            !route.path.contains("approve")
+                && !route.path.contains("deny")
+                && !route.path.contains("pending")
+                && !route.path.contains("show")
+        }));
+    }
+
+    #[test]
+    fn ac_t5_6_1_only_auto_approve_register_may_change_registered() {
+        let mutations: Vec<_> = ROUTES
+            .iter()
+            .map(|route| (route.id, route.path, route.registered_mutation))
+            .collect();
+        assert_eq!(
+            mutations,
+            vec![
+                (RouteId::Health, "/health", RegisteredMutation::Never),
+                (RouteId::Root, "/", RegisteredMutation::Never),
+                (RouteId::Clip, "/clip", RegisteredMutation::Never),
+                (RouteId::File, "/file", RegisteredMutation::Never),
+                (RouteId::VFile, "/vfile", RegisteredMutation::Never),
+                (RouteId::Open, "/open", RegisteredMutation::Never),
+                (RouteId::Exec, "/exec", RegisteredMutation::Never),
+                (
+                    RouteId::Register,
+                    "/register",
+                    RegisteredMutation::AutoApproveOnly,
+                ),
+                (
+                    RouteId::TargetsCheck,
+                    "/targets/check",
+                    RegisteredMutation::Never,
+                ),
+                (RouteId::Jobs, "/jobs", RegisteredMutation::Never),
+                (RouteId::Job, "/jobs/:id", RegisteredMutation::Never),
+                (RouteId::JobLog, "/jobs/:id/log", RegisteredMutation::Never),
+                (
+                    RouteId::JobKill,
+                    "/jobs/:id/kill",
+                    RegisteredMutation::Never
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t5_6_2_manual_register_only_creates_pending() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), false);
+        let response = handle_register(
+            State(state),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"manual","target":{"script":"()"}}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!dir.path().join("registered.toml").exists());
+        assert!(load_target_map(&dir.path().join("pending.toml"))
+            .unwrap()
+            .contains_key("manual"));
+    }
+
+    #[tokio::test]
+    async fn ac_t2_3_1_origin_is_rejected_on_every_route() {
+        let dir = tempdir().unwrap();
+        let app = build_router(test_state(dir.path().to_path_buf(), false));
+
+        for route in ROUTES {
+            let method = match route.id {
+                RouteId::Open
+                | RouteId::Exec
+                | RouteId::Register
+                | RouteId::TargetsCheck
+                | RouteId::JobKill => "POST",
+                _ => "GET",
+            };
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(route.path)
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://evil.example")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::FORBIDDEN,
+                "route={}",
+                route.path
+            );
+        }
+
+        let request = axum::http::Request::builder()
+            .uri("/health")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ac_t2_3_2_host_allowlist_ignores_port_and_ascii_case() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.host_policy = host_policy(
+            HostCheckMode::Enforce,
+            &["127.0.0.1", "localhost", "allowed-name"],
+        );
+        let app = build_router(state);
+
+        for host in ["127.0.0.1:9999", "LOCALHOST", "Allowed-Name:9999"] {
+            let request = axum::http::Request::builder()
+                .uri("/health")
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(app.clone().oneshot(request).await.unwrap().status(), 200);
+        }
+        for host in [Some("evil.example"), None] {
+            let mut request = axum::http::Request::builder().uri("/health");
+            if let Some(host) = host {
+                request = request.header(header::HOST, host);
+            }
+            assert_eq!(
+                app.clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::MISDIRECTED_REQUEST
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_t2_3_3_protected_posts_require_json_content_type() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.token = Some("secret".into());
+        let app = build_router(state);
+
+        for (content_type, expected) in [
+            ("text/plain", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            ("application/json; charset=utf-8", StatusCode::UNAUTHORIZED),
+        ] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/exec")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from("{}"))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_t2_3_4_allow_host_adds_an_accepted_name() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.host_policy = host_policy(HostCheckMode::Enforce, &["foo"]);
+        let request = axum::http::Request::builder()
+            .uri("/health")
+            .header(header::HOST, "foo")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            build_router(state).oneshot(request).await.unwrap().status(),
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t2_3_7_log_mode_allows_mismatch_and_enforce_returns_421() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.host_policy = host_policy(HostCheckMode::Log, &["localhost"]);
+        let request = || {
+            axum::http::Request::builder()
+                .uri("/health")
+                .header(header::HOST, "evil.example")
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            build_router(state.clone())
+                .oneshot(request())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "evil.example".parse().unwrap());
+        let logs = capture_logs(|| {
+            assert!(check_host_header(&state.host_policy, &headers).is_err());
+        });
+        assert!(logs.contains("WARN"));
+        assert!(logs.contains("evil.example"));
+
+        state.host_policy.mode = HostCheckMode::Enforce;
+        assert_eq!(
+            build_router(state)
+                .oneshot(request())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::MISDIRECTED_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t2_2_1_protected_routes_require_a_configured_token() {
+        let dir = tempdir().unwrap();
+        let app = build_router(clipboard_test_state(dir.path().to_path_buf()));
+
+        for path in ["/exec", "/register"] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("--token-file"));
+            assert!(String::from_utf8_lossy(&body).contains("--allow-no-token"));
+        }
+
+        let request = axum::http::Request::builder()
+            .uri("/clip")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ac_t2_2_1b_allow_no_token_accepts_protected_routes_with_browser_guards() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), true);
+        state.allow_no_token = true;
+        state.host_policy = host_policy(HostCheckMode::Enforce, &["localhost"]);
+        let app = build_router(state);
+
+        let request = |path: &'static str, body: &'static str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    "/register",
+                    r#"{"name":"no-token-test","target":{"script":"()"}}"#,
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request("/exec", r#"{"name":"no-token-test"}"#))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let origin = axum::http::Request::builder()
+            .method("POST")
+            .uri("/exec")
+            .header(header::HOST, "localhost")
+            .header(header::ORIGIN, "http://evil.example")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(origin).await.unwrap().status(), 403);
+
+        let non_json = axum::http::Request::builder()
+            .method("POST")
+            .uri("/exec")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(non_json).await.unwrap().status(), 415);
+
+        let bad_host = axum::http::Request::builder()
+            .method("POST")
+            .uri("/exec")
+            .header(header::HOST, "evil.example")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(app.oneshot(bad_host).await.unwrap().status(), 421);
+    }
+
+    #[tokio::test]
+    async fn ac_t2_2_3_correct_token_allows_protected_routes_and_wrong_token_is_401() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), true);
+        state.token = Some("secret".into());
+        let app = build_router(state);
+
+        let request = |path: &str, token: &str, body: &'static str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        for path in ["/exec", "/register"] {
+            let response = app
+                .clone()
+                .oneshot(request(path, "wrong", "{}"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let register = request(
+            "/register",
+            "secret",
+            r#"{"name":"token-test","target":{"script":"()"}}"#,
+        );
+        assert_eq!(
+            app.clone().oneshot(register).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let exec = request("/exec", "secret", r#"{"name":"token-test"}"#);
+        assert_eq!(app.oneshot(exec).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn ac_t2_2_4_auto_approve_emits_one_warning_without_the_token() {
+        let token = Some("secret-value-must-not-appear".to_string());
+        validate_serve_security(true, &token, false).unwrap();
+        let logs = capture_logs(|| warn_auto_approve(true));
+        assert_eq!(logs.matches("serve-start auto_approve=true").count(), 1);
+        assert!(logs.contains("auth=token"));
+        assert!(logs.contains("WARN"));
+        assert!(!logs.contains(token.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn ac_t2_2_2_and_2_4_auto_approve_allows_explicit_no_token_and_warns_strongly() {
+        let no_token = None;
+        let error = validate_serve_security(true, &no_token, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--token-file"));
+        assert!(error.contains("--allow-no-token"));
+
+        validate_serve_security(true, &no_token, true).unwrap();
+        let logs = capture_logs(|| warn_auto_approve(false));
+        assert_eq!(logs.matches("serve-start auto_approve=true").count(), 1);
+        assert!(logs.contains("auth=none"));
+        assert!(logs.contains("到達できるすべての者"));
+        assert!(logs.contains("任意のコード"));
+        assert!(logs.contains("承認なし"));
+        assert!(logs.contains("WARN"));
+    }
+
+    fn script_target(script: &str) -> StoredTarget {
+        StoredTarget {
+            script: Some(script.to_string()),
+            ..StoredTarget::default()
+        }
+    }
+
+    fn fixture_bytes(path: &str) -> Vec<u8> {
+        let mut bytes = std::fs::read(path).unwrap();
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
+        bytes
+    }
+
+    #[test]
+    fn ac_t3_1_1_canonical_env_order_is_stable_for_100_constructions() {
+        let entries: Vec<_> = (0..11)
+            .map(|i| (format!("KEY_{i:02}"), format!("value-{i}")))
+            .collect();
+        let mut expected = None;
+        for seed in 0..100 {
+            let mut insertion_order = entries.clone();
+            insertion_order.sort_by_key(|(key, _)| {
+                key.bytes().fold(seed as u64 + 17, |hash, byte| {
+                    hash.wrapping_mul(1099511628211) ^ u64::from(byte)
+                })
+            });
+            let target = StoredTarget {
+                script: Some("echo stable".into()),
+                env: insertion_order.into_iter().collect(),
+                ..StoredTarget::default()
+            };
+            let bytes = canonical_json(&target);
+            if let Some(expected) = &expected {
+                assert_eq!(&bytes, expected);
+            } else {
+                expected = Some(bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn ac_t3_1_2_canonical_golden_bytes_and_hashes_are_fixed() {
+        let cases = [
+            (
+                StoredTarget {
+                    dir: Some(r"C:\work".into()),
+                    script: Some("Write-Output 'ok'".into()),
+                    env: BTreeMap::from([
+                        ("ZULU".into(), "two".into()),
+                        ("ALPHA".into(), "one".into()),
+                    ]),
+                    ..StoredTarget::default()
+                },
+                "tests/fixtures/canonical/script.json",
+                "sha256:9bf3420dc591ee601f922597f1b029520676d3a6b7baf7f1158c7d9d7dc016d9",
+            ),
+            (
+                StoredTarget {
+                    steps: Some(StepsDef::Text("echo one\necho two".into())),
+                    ..StoredTarget::default()
+                },
+                "tests/fixtures/canonical/steps-text.json",
+                "sha256:add887b1248be49d82a4c6b6d4bc6bc84495c69e6561336700d1275269e886bd",
+            ),
+            (
+                StoredTarget {
+                    steps: Some(StepsDef::Argv(vec![
+                        vec!["echo".into(), "one".into()],
+                        vec!["echo".into(), "two".into()],
+                    ])),
+                    env: BTreeMap::from([("LANG".into(), "ja_JP.UTF-8".into())]),
+                    ..StoredTarget::default()
+                },
+                "tests/fixtures/canonical/steps-argv.json",
+                "sha256:dbabf65f7f74f7d91e065503472096da52c1ad3311a89b9d78a70f4e94bd8b12",
+            ),
+        ];
+        for (target, fixture, hash) in cases {
+            let bytes = canonical_json(&target);
+            assert_eq!(bytes, fixture_bytes(fixture), "fixture={fixture}");
+            assert_eq!(definition_hash(&bytes), hash, "fixture={fixture}");
+        }
+    }
+
+    #[test]
+    fn ac_t3_1_3_text_and_argv_steps_remain_distinct() {
+        let text = StoredTarget {
+            steps: Some(StepsDef::Text("echo one".into())),
+            ..StoredTarget::default()
+        };
+        let argv = StoredTarget {
+            steps: Some(StepsDef::Argv(vec![vec!["echo".into(), "one".into()]])),
+            ..StoredTarget::default()
+        };
+        assert_ne!(canonical_json(&text), canonical_json(&argv));
+        assert_ne!(
+            definition_hash(&canonical_json(&text)),
+            definition_hash(&canonical_json(&argv))
+        );
+    }
+
+    #[test]
+    fn ac_t5_1_2_timeout_is_hashed_only_when_explicit() {
+        let unset = script_target("echo stable");
+        let mut explicit = unset.clone();
+        explicit.timeout = Some("30m".into());
+        assert!(!String::from_utf8(canonical_json(&unset))
+            .unwrap()
+            .contains("timeout"));
+        assert_ne!(canonical_json(&unset), canonical_json(&explicit));
+        assert_ne!(
+            definition_hash(&canonical_json(&unset)),
+            definition_hash(&canonical_json(&explicit))
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t5_1_3_exec_timeout_can_only_shorten_definition() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        let mut target = script_target("let answer = 42;");
+        target.timeout = Some("10m".into());
+        state
+            .store
+            .register("limited".into(), target, true)
+            .await
+            .unwrap();
+
+        let response = handle_exec(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"limited","timeout":"1h"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("10m"));
+
+        let response = handle_exec(
+            State(state),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"limited","timeout":"5s"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ac_t5_1_4_rhai_loop_sleep_and_run_time_out() {
+        // run の子ツリー kill は Unix の Runner でのみ実装済み(Windows は T4.4 まで
+        // スタブで、sh もない)ため、run の経路は Unix でだけ検証する。
+        let mut scripts = vec!["loop {}", "sleep(10000);"];
+        if cfg!(unix) {
+            scripts.push(r#"run(["sh", "-c", "sleep 10"]);"#);
+        }
+        for (index, script) in scripts.into_iter().enumerate() {
+            let dir = tempdir().unwrap();
+            let state = test_state(dir.path().to_path_buf(), true);
+            let mut target = script_target(script);
+            target.timeout = Some("100ms".into());
+            let name = format!("rhai-timeout-{index}");
+            state
+                .store
+                .register(name.clone(), target, true)
+                .await
+                .unwrap();
+            let started = std::time::Instant::now();
+            let response = handle_exec(
+                State(state),
+                HeaderMap::new(),
+                serde_json::to_vec(&serde_json::json!({"name":name}))
+                    .unwrap()
+                    .into(),
+            )
+            .await;
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "script={script}"
+            );
+            assert_eq!(response.headers()["X-Exit-Code"], "124");
+            assert_eq!(response.headers()["X-Job-State"], "timeout");
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_t5_1_5_register_rejects_invalid_and_zero_timeouts() {
+        let dir = tempdir().unwrap();
+        for timeout in ["abc", "-1s", "0s"] {
+            let response = handle_register(
+                State(test_state(dir.path().to_path_buf(), true)),
+                HeaderMap::new(),
+                serde_json::to_vec(&serde_json::json!({
+                    "name": format!("bad-{timeout}"),
+                    "target": {"script": "()", "timeout": timeout}
+                }))
+                .unwrap()
+                .into(),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "timeout={timeout}"
+            );
+        }
+    }
+
+    #[test]
+    fn ac_t3_1_4_unset_future_field_does_not_change_bytes() {
+        #[derive(serde::Serialize)]
+        struct FutureCanonical<'a> {
+            v: u8,
+            script: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            timeout: Option<u64>,
+        }
+        let target = StoredTarget {
+            script: Some("echo stable".into()),
+            ..StoredTarget::default()
+        };
+        assert_eq!(
+            canonical_json(&target),
+            serde_json::to_vec(&FutureCanonical {
+                v: 1,
+                script: "echo stable",
+                timeout: None,
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn ac_t3_2_1_and_2_definition_character_contract() {
+        for forbidden in [
+            '\u{202e}', '\u{2066}', '\u{200b}', '\u{200d}', '\u{feff}', '\u{00ad}', '\u{2028}',
+            '\u{2029}', '\u{3164}', '\0', '\r',
+        ] {
+            let target = script_target(&format!("safe{forbidden}text"));
+            assert!(
+                validate_definition(&target).is_err(),
+                "accepted U+{:04X}",
+                forbidden as u32
+            );
+        }
+        let mut target = script_target("日本語　ok\tline\nCRLF\r\n😀");
+        target.dir = Some("C:\\通常".into());
+        target.env = BTreeMap::from([("NORMAL_KEY".into(), "通常の値 😀".into())]);
+        assert_eq!(validate_definition(&target), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn ac_t3_2_3_register_returns_position_and_codepoint_in_400() {
+        let dir = tempdir().unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "name": "bad-definition",
+            "target": {"script": "first\nabc\u{202e}def"}
+        }))
+        .unwrap();
+        let response = handle_register(
+            State(test_state(dir.path().to_path_buf(), false)),
+            HeaderMap::new(),
+            body.into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("行 2 桁 4: U+202E"));
+        assert!(!dir.path().join("pending.toml").exists());
+        assert!(!dir.path().join("registered.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn ac_t3_5_4_register_response_contains_server_definition_hash() {
+        let dir = tempdir().unwrap();
+        let target = script_target("let answer = 42;");
+        let expected = definition_hash(&canonical_json(&target));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "name": "hash-response",
+            "target": {"script": "let answer = 42;"}
+        }))
+        .unwrap();
+        let response = handle_register(
+            State(test_state(dir.path().to_path_buf(), true)),
+            HeaderMap::new(),
+            body.into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains(&format!("hash: {expected}")));
+    }
+
+    #[tokio::test]
+    async fn ac_t3_4_1_and_3_exec_uses_migrated_record_and_rejects_tampering() {
+        let dir = tempdir().unwrap();
+        let registered = TargetMap::from([("safe".into(), script_target("let answer = 42;"))]);
+        save_target_map(&dir.path().join("registered.toml"), &registered).unwrap();
+        let state = test_state(dir.path().to_path_buf(), false);
+        state.store.migrate().await.unwrap();
+        let request = || {
+            serde_json::to_vec(&serde_json::json!({"name": "safe"}))
+                .unwrap()
+                .into()
+        };
+        let response = handle_exec(State(state.clone()), HeaderMap::new(), request()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let migrated = load_target_map(&dir.path().join("registered.toml")).unwrap();
+        let digest = migrated["safe"]
+            .hash
+            .as_deref()
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap();
+        std::fs::write(
+            dir.path().join("approved").join(format!("{digest}.json")),
+            b"tampered",
+        )
+        .unwrap();
+        let response = handle_exec(State(state), HeaderMap::new(), request()).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("承認検証エラー"));
+    }
+
+    fn validate_targets_file(path: &Path) {
+        let source = std::fs::read_to_string(path).unwrap();
+        let file: TargetsFile = toml::from_str(&source).unwrap();
+        for (name, target) in file.targets {
+            validate_target_name(&name).unwrap();
+            validate_definition(&target).unwrap();
+        }
+    }
+
+    #[test]
+    fn ac_t3_2_4_real_or_synthetic_targets_fixture_passes() {
+        if let Some(path) = std::env::var_os("CLIPWIRE_TARGETS_FIXTURE") {
+            validate_targets_file(Path::new(&path));
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("targets.toml");
+        let long_ascii = format!("powershell -EncodedCommand {}", "QQ==".repeat(10_000));
+        let file = toml::to_string(&serde_json::json!({
+            "targets": {
+                "long-script": { "script": long_ascii },
+                "normal-steps": {
+                    "steps": [["pwsh", "-Command", "Write-Output '日本語 😀'"]],
+                    "env": { "NORMAL": "value" }
+                }
+            }
+        }))
+        .unwrap();
+        std::fs::write(&path, file).unwrap();
+        validate_targets_file(&path);
+    }
+
+    fn invalid_target_names() -> Vec<String> {
+        vec![
+            "".into(),
+            "a".repeat(65),
+            ".a".into(),
+            "-a".into(),
+            "a..b".into(),
+            "a/b".into(),
+            "a b".into(),
+            "a'b".into(),
+            "a<b".into(),
+            "a\u{2018}b".into(),
+            "a\0b".into(),
+            "日本語".into(),
+            "a\nb".into(),
+        ]
+    }
+
+    #[test]
+    fn target_name_validation_matches_contract() {
+        for name in invalid_target_names() {
+            assert!(validate_target_name(&name).is_err(), "accepted {name:?}");
+        }
+        for name in ["awase-build", "a", "a.b_c-d", &"a".repeat(64)] {
+            assert!(validate_target_name(name).is_ok(), "rejected {name:?}");
+        }
+    }
+
+    #[test]
+    fn singleton_mutex_name_is_stable_and_scoped_to_config_dir() {
+        let first = singleton_mutex_name(Path::new("/tmp/clipwire-a"));
+        assert_eq!(first, singleton_mutex_name(Path::new("/tmp/clipwire-a")));
+        assert_ne!(first, singleton_mutex_name(Path::new("/tmp/clipwire-b")));
+        assert!(first.starts_with("Global\\clipwire_singleton_"));
+    }
+
+    #[test]
+    fn pid_file_overwrites_stale_content_and_is_removed_on_drop() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(PID_FILE_NAME);
+        std::fs::write(&path, "stale\n").unwrap();
+
+        let guard = PidFile::create_with_pid(dir.path(), 4242).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "4242\n");
+
+        drop(guard);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn pid_file_drop_does_not_remove_a_replacement_servers_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(PID_FILE_NAME);
+        let guard = PidFile::create_with_pid(dir.path(), 4242).unwrap();
+        std::fs::write(&path, "4343\n").unwrap();
+
+        drop(guard);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "4343\n");
+    }
+
+    #[tokio::test]
+    async fn invalid_register_names_return_400_without_changing_stores() {
+        let dir = tempdir().unwrap();
+        let pending_path = dir.path().join("pending.toml");
+        let registered_path = dir.path().join("registered.toml");
+        let original = HashMap::from([("existing".to_string(), script_target("()"))]);
+        save_target_map(&pending_path, &original).unwrap();
+        save_target_map(&registered_path, &original).unwrap();
+        let pending_before = std::fs::read(&pending_path).unwrap();
+        let registered_before = std::fs::read(&registered_path).unwrap();
+
+        for name in invalid_target_names() {
+            let body =
+                serde_json::to_vec(&serde_json::json!({"name": name, "target": {"script": "()"}}))
+                    .unwrap();
+            let response = handle_register(
+                State(test_state(dir.path().to_path_buf(), false)),
+                HeaderMap::new(),
+                body.into(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "name={name:?}");
+            assert_eq!(std::fs::read(&pending_path).unwrap(), pending_before);
+            assert_eq!(std::fs::read(&registered_path).unwrap(), registered_before);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_exec_names_return_400_before_store_access() {
+        let dir = tempdir().unwrap();
+        for name in invalid_target_names() {
+            let response = handle_exec(
+                State(test_state(dir.path().join("missing"), false)),
+                HeaderMap::new(),
+                serde_json::to_vec(&serde_json::json!({"name": name}))
+                    .unwrap()
+                    .into(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn clients_reject_invalid_names_before_network_access() {
+        let cfg = ClientConfig {
+            host: "invalid.invalid".into(),
+            port: 1,
+            token: None,
+        };
+        let exec_error = cmd_exec(
+            &cfg,
+            &ExecArgs {
+                target: "../bad".into(),
+                timeout: None,
+                no_stream: false,
+                detach: false,
+                copy: false,
+                copy_on_fail: false,
+                raw: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        let register_error = cmd_register(
+            &cfg,
+            &RegisterArgs {
+                target: "../bad".into(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(exec_error.contains("無効なターゲット名"));
+        assert!(register_error.contains("無効なターゲット名"));
+    }
+
+    #[test]
+    fn existing_invalid_names_allow_startup_and_emit_one_warning() {
+        let dir = tempdir().unwrap();
+        let map = HashMap::from([
+            ("valid".to_string(), script_target("()")),
+            ("../bad".to_string(), script_target("()")),
+        ]);
+        save_target_map(&dir.path().join("registered.toml"), &map).unwrap();
+        let logs = capture_logs(|| warn_invalid_stored_target_names(dir.path()));
+        assert_eq!(logs.matches("無効なターゲット名が存在します").count(), 1);
+        assert!(logs.contains("../bad"));
+        assert_eq!(
+            load_target_map(&dir.path().join("registered.toml"))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn auth_results_match_the_existing_contract() {
+        let token = Some("secret".to_string());
+        for (header_value, expected) in [
+            (Some("Bearer secret"), true),
+            (Some("Bearer secreu"), false),
+            (Some("Bearer short"), false),
+            (Some("secret"), false),
+            (Some("bearer secret"), false),
+            (None, false),
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = header_value {
+                headers.insert(header::AUTHORIZATION, value.parse().unwrap());
+            }
+            assert_eq!(check_auth(&token, &headers), expected, "{header_value:?}");
+        }
+        assert!(check_auth(&None, &HeaderMap::new()));
+    }
+
+    #[test]
+    fn ac_t0_2_2_steps_and_target_map_behavior_is_preserved() {
+        let steps = StepsDef::Text("# comment\n echo one\n\ninvalid 'quote\necho two\n".into());
+        assert_eq!(
+            steps.into_argv(),
+            vec![
+                vec!["echo".to_string(), "one".to_string()],
+                vec!["echo".to_string(), "two".to_string()]
+            ]
+        );
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested/targets.toml");
+        assert!(load_target_map(&path).unwrap().is_empty());
+        let mut targets = TargetMap::default();
+        targets.insert("sample".into(), script_target("echo sample"));
+        save_target_map(&path, &targets).unwrap();
+        let loaded = load_target_map(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["sample"].script.as_deref(), Some("echo sample"));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn ac_t0_2_2_exec_rhai_functions_preserve_success_and_failure_behavior() {
+        let dir = tempdir().unwrap();
+        let existing = dir.path().join("existing.txt");
+        std::fs::write(&existing, "present").unwrap();
+        let removable = dir.path().join("remove.txt");
+        std::fs::write(&removable, "remove").unwrap();
+
+        let script = r#"
+            run(["sh", "-c", "printf run-ok"]);
+            if !run_ok(["sh", "-c", "printf run-fail >&2; exit 7"]) { print("run_ok=false"); }
+            if !run_ok(["clipwire-command-that-does-not-exist"]) { print("missing=false"); }
+            if file_exists("existing.txt") && !file_exists("absent.txt") { print("exists-ok"); }
+            if rm("remove.txt") && !rm("absent.txt") { print("rm-ok"); }
+        "#;
+        let (output, code) = exec_rhai(script, dir.path().to_str()).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(code, 0);
+        assert!(output.contains("run-ok"));
+        assert!(output.contains("run-fail"));
+        assert!(output.contains("run_ok: clipwire-command-that-does-not-exist"));
+        // stdout/stderr are no longer concatenated in fixed stderr-first order;
+        // child output and Rhai print now retain their actual production order.
+        assert!(output.find("run-ok").unwrap() < output.find("run-fail").unwrap());
+        assert!(output.find("run-fail").unwrap() < output.find("run_ok=false").unwrap());
+        assert!(!removable.exists());
+
+        let (output, code) = exec_rhai("run([\"sh\", \"-c\", \"exit 9\"]);", None).unwrap();
+        assert_eq!(code, 1);
+        assert!(String::from_utf8(output).unwrap().contains("exit code 9"));
+
+        let (output, code) =
+            exec_rhai("run([\"clipwire-command-that-does-not-exist\"]);", None).unwrap();
+        assert_eq!(code, 1);
+        assert!(String::from_utf8(output).unwrap().contains("script error"));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn ac_t4_5_2_child_output_precedes_following_print() {
+        let (output, code) = exec_rhai(
+            r#"run(["sh", "-c", "echo a; sleep 0.2"]); print("done");"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(output).unwrap(), "a\ndone\n");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn ac_t4_5_3_and_4_resource_limits_stop_runaway_scripts() {
+        for script in ["loop {}", r#"let s = "a"; loop { s += s; }"#] {
+            let (output, code) = exec_rhai(script, None).unwrap();
+            assert_eq!(code, 1);
+            assert!(String::from_utf8(output).unwrap().contains("script error:"));
+        }
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn ac_t4_5_5_child_environment_excludes_clipd_token() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CLIPD_TOKEN", "ac-t4-5-secret");
+        let result = exec_rhai(r#"run(["sh", "-c", "env"]);"#, None);
+        std::env::remove_var("CLIPD_TOKEN");
+        let (output, code) = result.unwrap();
+        assert_eq!(code, 0);
+        assert!(!String::from_utf8(output).unwrap().contains("CLIPD_TOKEN="));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn ac_t4_5_6_cancellation_kills_run_process_group_and_returns() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker = std::thread::spawn(move || {
+            exec_rhai_cancelable(
+                r#"run(["sh", "-c", "echo $$; sleep 100 & wait"]);"#,
+                None,
+                worker_cancelled,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        cancelled.store(true, Ordering::Relaxed);
+        let (output, code) = worker.join().unwrap().unwrap();
+        assert_eq!(code, 1);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("script error:"));
+        let pid: i32 = output.lines().next().unwrap().parse().unwrap();
+        // SAFETY: signal 0 only probes whether the emitted process-group leader remains.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[test]
+    fn token_resolution_honors_priority_and_file_errors() {
+        let dir = tempdir().unwrap();
+        let token_path = dir.path().join("token");
+        std::fs::write(&token_path, "  file-token\r\n").unwrap();
+        assert_eq!(
+            resolve_serve_token(Some("cli-token"), Some(&token_path), Some("env-token")).unwrap(),
+            (Some("cli-token".into()), true)
+        );
+        assert_eq!(
+            resolve_serve_token(None, Some(&token_path), Some("env-token")).unwrap(),
+            (Some("file-token".into()), false)
+        );
+        assert_eq!(
+            resolve_serve_token(None, None, Some("env-token")).unwrap(),
+            (Some("env-token".into()), false)
+        );
+        std::fs::write(&token_path, " \n").unwrap();
+        assert!(resolve_serve_token(None, Some(&token_path), None).is_err());
+        assert!(resolve_serve_token(None, Some(&dir.path().join("missing")), None).is_err());
+    }
+
+    #[test]
+    fn token_file_accepts_utf8_bom() {
+        let dir = tempdir().unwrap();
+        let token_path = dir.path().join("token");
+        std::fs::write(&token_path, "\u{feff}secret-token\r\n").unwrap();
+        assert_eq!(
+            resolve_serve_token(None, Some(&token_path), None).unwrap(),
+            (Some("secret-token".into()), false)
+        );
+    }
+
+    #[test]
+    fn every_token_source_produces_a_working_auth_token() {
+        let dir = tempdir().unwrap();
+        let token_path = dir.path().join("token");
+        std::fs::write(&token_path, "secret\n").unwrap();
+        let sources = [
+            resolve_serve_token(Some("secret"), None, None).unwrap().0,
+            resolve_serve_token(None, Some(&token_path), None)
+                .unwrap()
+                .0,
+            resolve_serve_token(None, None, Some("secret")).unwrap().0,
+        ];
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer secret".parse().unwrap());
+        for token in sources {
+            assert!(check_auth(&token, &headers));
+        }
+    }
+
+    #[test]
+    fn cli_token_warning_never_contains_the_token() {
+        let logs = capture_logs(|| warn!("{}", CLI_TOKEN_DEPRECATION_WARNING));
+        assert!(logs.contains("--token"));
+        assert!(!logs.contains("secret-value"));
+    }
+
+    #[test]
+    fn cmd_get_error_does_not_expose_token() {
+        let token = "get-token-must-not-leak";
+        let cfg = ClientConfig {
+            host: Ipv4Addr::LOCALHOST.to_string(),
+            port: 1,
+            token: Some(token.into()),
+        };
+        let error = cmd_get(
+            &cfg,
+            &GetArgs {
+                quiet: false,
+                dir: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains(token));
+    }
+
+    #[test]
+    fn put_exec_and_register_errors_do_not_expose_token() {
+        let token = "mutation-token-must-not-leak";
+        let cfg = ClientConfig {
+            host: Ipv4Addr::LOCALHOST.to_string(),
+            port: 1,
+            token: Some(token.into()),
+        };
+        let errors = [
+            cmd_put(&cfg, None, None).unwrap_err().to_string(),
+            cmd_exec(
+                &cfg,
+                &ExecArgs {
+                    target: "valid".into(),
+                    timeout: None,
+                    no_stream: false,
+                    detach: false,
+                    copy: false,
+                    copy_on_fail: false,
+                    raw: false,
+                },
+            )
+            .unwrap_err()
+            .to_string(),
+            cmd_register(
+                &cfg,
+                &RegisterArgs {
+                    target: "../invalid".into(),
+                },
+            )
+            .unwrap_err()
+            .to_string(),
+        ];
+        for error in errors {
+            assert!(!error.contains(token), "token leaked in error: {error}");
+        }
+    }
+
+    #[test]
+    fn generated_download_commands_reference_but_do_not_expand_token() {
+        let token = "test-token-must-not-leak";
+        let command = download_command("http://127.0.0.1/file", "out", true).unwrap();
+        assert!(command.contains("$CLIPD_TOKEN"));
+        assert!(!command.contains(token));
+        let no_auth = download_command("http://127.0.0.1/file", "out", false).unwrap();
+        assert!(!no_auth.contains("Authorization"));
+    }
+
+    #[test]
+    #[cfg(unix)] // 生成物は POSIX シェル用。/bin/sh で検証する
+    fn shell_expands_download_command_token_header() {
+        let dir = tempdir().unwrap();
+        let mock_curl = dir.path().join("curl");
+        std::fs::write(
+            &mock_curl,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE\"\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -o ]; then printf ok > \"$2\"; exit 0; fi\n  shift\ndone\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&mock_curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let capture = dir.path().join("args");
+        let output = dir.path().join("download");
+        let command = download_command("http://mock.invalid/file", "download", true).unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", &command])
+            .current_dir(dir.path())
+            .env("CLIPD_TOKEN", "shell-token")
+            .env("CAPTURE", &capture)
+            .env("PATH", dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(std::fs::read_to_string(capture)
+            .unwrap()
+            .contains("Authorization: Bearer shell-token\n"));
+        assert_eq!(std::fs::read(output).unwrap(), b"ok");
+    }
+
+    #[test]
+    #[cfg(unix)] // 生成物は POSIX シェル用。/bin/sh で検証する
+    fn download_command_quotes_untrusted_names_and_stays_in_directory() {
+        let dir = tempdir().unwrap();
+        let mock_curl = dir.path().join("curl");
+        std::fs::write(
+            &mock_curl,
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -o ]; then printf ok > \"$2\"; exit 0; fi\n  shift\ndone\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&mock_curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let outside = dir.path().parent().unwrap().join("clipwire-outside");
+        let malicious = format!("../x'$(touch {})", outside.display());
+        let command = download_command(
+            "http://mock.invalid/file?x='$(touch URL_PWNED)'",
+            &malicious,
+            false,
+        )
+        .unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", &command])
+            .current_dir(dir.path())
+            .env("PATH", dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!outside.exists());
+        assert!(!dir.path().join("URL_PWNED").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join(safe_download_name(&malicious))).unwrap(),
+            b"ok"
+        );
+    }
+
+    #[test]
+    fn source_does_not_restore_powershell_balloon_fallback() {
+        let source = include_str!("main.rs");
+        for forbidden in [
+            ["ShowBalloon", "Tip"].concat(),
+            ["Notify", "Icon"].concat(),
+            ["Command::new(\"power", "shell\""].concat(),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "forbidden source pattern: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn xml_escape_replaces_entities_and_removes_forbidden_controls() {
+        assert_eq!(xml_escape("&<>\"'"), "&amp;&lt;&gt;&quot;&apos;");
+        assert_eq!(xml_escape("a\0\u{1f}\tb\nc\rd"), "a\tb\nc\rd");
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn protected_post(path: &str, body: String) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ac_t3_6_1_health_preserves_text_and_reports_version() {
+        let dir = tempdir().unwrap();
+        let app = build_router(test_state(dir.path().to_path_buf(), false));
+        let plain = axum::http::Request::builder()
+            .uri("/health")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(plain).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "OK\n"
+        );
+
+        let json = axum::http::Request::builder()
+            .uri("/health")
+            .header(header::HOST, "localhost")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let value = response_json(app.oneshot(json).await.unwrap()).await;
+        assert_eq!(value.as_object().unwrap().len(), 1);
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn ac_t3_6_2_register_accepts_only_strict_nested_form() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), true);
+        state.allow_no_token = true;
+        let app = build_router(state);
+        let nested = r#"{"name":"nested","target":{"script":"echo hi","env":{"B":"2","A":"1"}}}"#;
+        let nested_response = app
+            .clone()
+            .oneshot(protected_post("/register", nested.into()))
+            .await
+            .unwrap();
+        let flat_response = app
+            .clone()
+            .oneshot(protected_post(
+                "/register",
+                r#"{"name":"flat","script":"echo hi"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(nested_response.status(), StatusCode::OK);
+        assert_eq!(flat_response.status(), StatusCode::BAD_REQUEST);
+
+        for invalid in [
+            r#"{"name":"bad-outer","target":{"script":"x"},"unknown":1}"#,
+            r#"{"name":"bad-nested","target":{"script":"x","unknown":1}}"#,
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(protected_post("/register", invalid.into()))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[test]
+    fn ac_t3_6_3_client_register_wire_format_is_nested() {
+        let target = script_target("echo compatible");
+        #[derive(Deserialize)]
+        struct NestedRequest {
+            name: String,
+            target: StoredTarget,
+        }
+        let nested = client::register_body("compat", &target);
+        let parsed_nested: NestedRequest = serde_json::from_value(nested).unwrap();
+        assert_eq!(parsed_nested.name, "compat");
+        assert_eq!(
+            parsed_nested.target.script.as_deref(),
+            Some("echo compatible")
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t3_7_1_and_2_check_reports_all_states_without_definitions() {
+        let dir = tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        store
+            .register("ok".into(), script_target("A"), true)
+            .await
+            .unwrap();
+        store
+            .register("changed".into(), script_target("A"), true)
+            .await
+            .unwrap();
+        store
+            .register("remote".into(), script_target("R"), true)
+            .await
+            .unwrap();
+        store
+            .register("pending-same".into(), script_target("P"), false)
+            .await
+            .unwrap();
+        store
+            .register("pending-different".into(), script_target("P"), false)
+            .await
+            .unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.allow_no_token = true;
+        let app = build_router(state);
+        let request = serde_json::json!({"targets": {
+            "ok": {"script":"A"},
+            "changed": {"script":"B"},
+            "pending-same": {"script":"P"},
+            "pending-different": {"script":"Q"},
+            "new": {"script":"N"}
+        }});
+        let response = app
+            .oneshot(protected_post("/targets/check", request.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = response_json(response).await;
+        let targets = &value["targets"];
+        assert_eq!(targets["ok"]["status"], "ok");
+        assert_eq!(targets["changed"]["status"], "changed");
+        assert_eq!(targets["pending-same"]["status"], "pending");
+        assert_eq!(targets["pending-same"]["pending_matches"], true);
+        assert_eq!(targets["pending-different"]["pending_matches"], false);
+        assert_eq!(targets["new"]["status"], "unregistered");
+        assert_eq!(targets["remote"]["status"], "remote-only");
+        let encoded = value.to_string();
+        for secret in ["script", "steps", "env", "dir", "echo"] {
+            assert!(!encoded.contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_t3_7_3_check_authentication_matches_other_protected_routes() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.token = Some("secret".into());
+        let app = build_router(state);
+        let body = r#"{"targets":{}}"#;
+        assert_eq!(
+            app.clone()
+                .oneshot(protected_post("/targets/check", body.into()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut wrong = protected_post("/targets/check", body.into());
+        wrong
+            .headers_mut()
+            .insert(header::AUTHORIZATION, "Bearer wrong".parse().unwrap());
+        assert_eq!(
+            app.clone().oneshot(wrong).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let no_token_app = build_router(test_state(dir.path().to_path_buf(), false));
+        assert_eq!(
+            no_token_app
+                .oneshot(protected_post("/targets/check", body.into()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t3_7_4_check_accepts_three_megabytes_and_rejects_over_sixteen_mib() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.allow_no_token = true;
+        let app = build_router(state);
+        let large_script = "x".repeat(1_600);
+        let targets: serde_json::Map<String, serde_json::Value> = (0..2_000)
+            .map(|index| {
+                (
+                    format!("target-{index}"),
+                    serde_json::json!({"script": large_script}),
+                )
+            })
+            .collect();
+        let body = serde_json::json!({"targets": targets}).to_string();
+        assert!(body.len() > 3 * 1024 * 1024);
+        assert_eq!(
+            app.clone()
+                .oneshot(protected_post("/targets/check", body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let oversized = format!(
+            r#"{{"targets":{{"huge":{{"script":"{}"}}}}}}"#,
+            "x".repeat(17 * 1024 * 1024)
+        );
+        assert_eq!(
+            app.oneshot(protected_post("/targets/check", oversized))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn escaped_xml_round_trips(value in any::<String>().prop_filter(
+            "XML 1.0 characters only",
+            |s| s.chars().all(|ch| matches!(ch, '\u{9}' | '\u{a}' | '\u{d}')
+                || ('\u{20}'..='\u{d7ff}').contains(&ch)
+                || ('\u{e000}'..='\u{fffd}').contains(&ch)
+                || ('\u{10000}'..='\u{10ffff}').contains(&ch))
+        )) {
+            let document = format!("<x>{}</x>", xml_escape(&value));
+            let mut reader = Reader::from_str(&document);
+            let encoded = loop {
+                match reader.read_event().unwrap() {
+                    Event::Start(start) => break reader.read_text(start.name()).unwrap(),
+                    Event::Eof => panic!("missing element"),
+                    _ => {}
+                }
+            };
+            let decoded = quick_xml::escape::unescape(&encoded.decode().unwrap()).unwrap().into_owned();
+            prop_assert_eq!(decoded, value);
+        }
+    }
+
+    fn audit_values(dir: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dir.join(audit::AUDIT_FILE_NAME))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn ac_t5_2_1_register_approve_exec_events_are_ordered_jsonl() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), false);
+        let response = handle_register(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"audit-flow","target":{"script":"()"}}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let target = state.store.pending().unwrap()["audit-flow"].clone();
+        let hash = definition_hash(&canonical_json(&target));
+        state.store.approve("audit-flow", &hash).unwrap();
+        let mut approval =
+            audit::AuditEvent::new(audit::AuditEventKind::Approve).target("audit-flow", &hash);
+        approval.approver = Some("local-user".into());
+        state.audit.record(approval);
+        let response = handle_exec(
+            State(state),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"audit-flow"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let values = audit_values(dir.path());
+        let events: Vec<_> = values
+            .iter()
+            .map(|value| value["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(events, ["register", "approve", "start", "end"]);
+    }
+
+    async fn register_exec_target(
+        state: &AppState,
+        name: &str,
+        script: &str,
+        concurrency: Option<&str>,
+    ) {
+        let mut value = serde_json::json!({"name": name, "target": {"script": script}});
+        if let Some(concurrency) = concurrency {
+            value["target"]["concurrency"] = concurrency.into();
+        }
+        let response = handle_register(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&value).unwrap().into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ac_t6_1_1_and_2_concurrency_is_per_target_and_allow_bypasses_it() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        register_exec_target(&state, "reject", r#"run(["sh", "-c", "sleep 0.4"]);"#, None).await;
+        register_exec_target(&state, "other", r#"run(["sh", "-c", "sleep 0.4"]);"#, None).await;
+        register_exec_target(
+            &state,
+            "allow",
+            r#"run(["sh", "-c", "sleep 0.4"]);"#,
+            Some("allow"),
+        )
+        .await;
+
+        let execute = |state: AppState, name: &'static str| {
+            tokio::spawn(async move {
+                handle_exec(
+                    State(state),
+                    HeaderMap::new(),
+                    serde_json::to_vec(&serde_json::json!({"name":name}))
+                        .unwrap()
+                        .into(),
+                )
+                .await
+            })
+        };
+        let first = execute(state.clone(), "reject");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let conflict = execute(state.clone(), "reject").await.unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let conflict_body = String::from_utf8(
+            axum::body::to_bytes(conflict.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(conflict_body.contains("ジョブ"), "{conflict_body}");
+
+        let other = execute(state.clone(), "other");
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(other.await.unwrap().status(), StatusCode::OK);
+
+        let allow_one = execute(state.clone(), "allow");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let allow_two = execute(state, "allow");
+        assert_eq!(allow_one.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(allow_two.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ac_t6_1_4_rhai_records_child_pid_and_rebuilds_as_orphaned() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        register_exec_target(
+            &state,
+            "rhai-child",
+            r#"run(["sh", "-c", "sleep 1"]);"#,
+            None,
+        )
+        .await;
+        let execution = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                handle_exec(
+                    State(state),
+                    HeaderMap::new(),
+                    serde_json::to_vec(&serde_json::json!({"name":"rhai-child"}))
+                        .unwrap()
+                        .into(),
+                )
+                .await
+            })
+        };
+        let jobs_dir = dir.path().join("jobs");
+        let (id, meta) = loop {
+            let found = std::fs::read_dir(&jobs_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .find_map(|entry| {
+                    let bytes = std::fs::read(entry.path().join("meta.json")).ok()?;
+                    let meta: jobs::JobMeta = serde_json::from_slice(&bytes).ok()?;
+                    if meta.child.is_some() {
+                        Some((meta.id.clone(), meta))
+                    } else {
+                        None
+                    }
+                });
+            if let Some(found) = found {
+                break found;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_ne!(meta.child.unwrap().pid, std::process::id());
+        let rebuilt = jobs::JobRegistry::new(dir.path()).unwrap();
+        assert_eq!(rebuilt.get(&id).unwrap().state, jobs::JobStatus::Orphaned);
+        assert_eq!(execution.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ac_t5_2_2_secrets_environment_and_child_output_are_not_audited() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        let secret_token = "TOKEN_DO_NOT_AUDIT";
+        let secret_env = "ENV_DO_NOT_AUDIT";
+        let secret_output = "OUTPUT_DO_NOT_AUDIT";
+        handle_register(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({
+                "name":"audit-secret",
+                "target": {
+                    "script": format!("print(\"{secret_output}\");"),
+                    "env":{"SECRET":secret_env}
+                }
+            }))
+            .unwrap()
+            .into(),
+        )
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {secret_token}").parse().unwrap(),
+        );
+        let response = handle_exec(
+            State(state),
+            headers,
+            serde_json::to_vec(&serde_json::json!({"name":"audit-secret"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains(secret_output));
+        let log = std::fs::read_to_string(dir.path().join(audit::AUDIT_FILE_NAME)).unwrap();
+        for secret in [secret_token, secret_env, secret_output] {
+            assert!(!log.contains(secret));
+        }
+    }
+
+    #[test]
+    fn ac_t5_2_3_rotates_at_ten_mib_and_keeps_one_generation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(audit::AUDIT_FILE_NAME);
+        std::fs::write(&path, vec![b'x'; audit::AUDIT_ROTATE_BYTES as usize]).unwrap();
+        let log = audit::AuditLog::new(dir.path().to_path_buf());
+        log.record(audit::AuditEvent::new(audit::AuditEventKind::Start));
+        assert_eq!(
+            std::fs::metadata(dir.path().join(audit::AUDIT_ROTATED_FILE_NAME))
+                .unwrap()
+                .len(),
+            audit::AUDIT_ROTATE_BYTES
+        );
+        std::fs::write(&path, vec![b'y'; audit::AUDIT_ROTATE_BYTES as usize]).unwrap();
+        log.record(audit::AuditEvent::new(audit::AuditEventKind::End));
+        assert_eq!(
+            std::fs::read(dir.path().join(audit::AUDIT_ROTATED_FILE_NAME)).unwrap()[0],
+            b'y'
+        );
+        assert!(!dir.path().join("audit.2.jsonl").exists());
+    }
+
+    #[derive(Default)]
+    struct WarningRecorder(std::sync::atomic::AtomicUsize);
+
+    impl audit::ApprovalAuditWarning for WarningRecorder {
+        fn warn(&self, _message: &str) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_t5_2_4_audit_failure_does_not_stop_exec_and_warns_for_approval() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        state
+            .store
+            .register("audit-io".into(), script_target("()"), true)
+            .await
+            .unwrap();
+        let invalid_root = dir.path().join("not-a-directory");
+        std::fs::write(&invalid_root, b"file").unwrap();
+        let warning = Arc::new(WarningRecorder::default());
+        let mut state = state;
+        state.audit = audit::AuditLog::with_warning(invalid_root, warning.clone());
+        state
+            .audit
+            .record(audit::AuditEvent::new(audit::AuditEventKind::Approve));
+        assert_eq!(warning.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let response = handle_exec(
+            State(state),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"audit-io"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn ac_t5_2_5_audit_is_not_an_http_route() {
+        assert!(ROUTES.iter().all(|route| route.path != "/audit"));
+    }
+
+    #[tokio::test]
+    async fn ac_t5_2_6_def_hash_recovers_the_approved_definition() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        handle_register(
+            State(state),
+            HeaderMap::new(),
+            serde_json::to_vec(
+                &serde_json::json!({"name":"recover","target":{"script":"let x = 1;"}}),
+            )
+            .unwrap()
+            .into(),
+        )
+        .await;
+        let event = &audit_values(dir.path())[0];
+        let digest = event["def_hash"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap();
+        let approved =
+            std::fs::read(dir.path().join("approved").join(format!("{digest}.json"))).unwrap();
+        let expected = canonical_json(&script_target("let x = 1;"));
+        assert_eq!(approved, expected);
+    }
+
+    #[tokio::test]
+    async fn ac_t5_2_7_auto_approve_records_auto_approver_and_approval_record() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        handle_register(
+            State(state),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"automatic","target":{"script":"()"}}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        let values = audit_values(dir.path());
+        assert_eq!(values[1]["event"], "approve");
+        assert_eq!(values[1]["approver"], "auto");
+        let digest = values[1]["def_hash"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap();
+        assert!(dir
+            .path()
+            .join("approved")
+            .join(format!("{digest}.json"))
+            .exists());
+    }
+
+    #[test]
+    fn ac_t5_2_8_auto_approve_serve_start_is_audited() {
+        let dir = tempdir().unwrap();
+        let log = audit::AuditLog::new(dir.path().to_path_buf());
+        log.record(audit::serve_start_event(123, true, true));
+        let value = &audit_values(dir.path())[0];
+        assert_eq!(value["event"], "serve-start");
+        assert_eq!(value["auto_approve"], true);
+        assert_eq!(value["auth"], "token");
+    }
+
+    #[tokio::test]
+    async fn ac_t5_2_9_1571_auto_approved_registers_finish_with_valid_json_under_60s() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        let started = std::time::Instant::now();
+        for _ in 0..1571 {
+            let response = handle_register(
+                State(state.clone()),
+                HeaderMap::new(),
+                serde_json::to_vec(
+                    &serde_json::json!({"name":"bulk-register","target":{"script":"let x = 1;"}}),
+                )
+                .unwrap()
+                .into(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let elapsed = started.elapsed();
+        // 2026-10-01, Linux debug test run in this repository: 1.63 seconds.
+        assert!(elapsed < Duration::from_secs(60), "elapsed={elapsed:?}");
+        let values = audit_values(dir.path());
+        assert_eq!(values.len(), 1571 * 2);
+    }
+
+    #[tokio::test]
+    async fn ac_t6_2_1_detach_returns_id_and_job_completes() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        handle_register(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(
+                &serde_json::json!({"name":"detached","target":{"script":"sleep(150); print(\"done\");"}}),
+            )
+            .unwrap()
+            .into(),
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let response = handle_exec(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"detached","detach":true}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let value = response_json(response).await;
+        let id = value["id"].as_str().unwrap();
+        assert_eq!(state.jobs.get(id).unwrap().state, jobs::JobStatus::Running);
+        for _ in 0..100 {
+            if state.jobs.get(id).unwrap().state == jobs::JobStatus::Succeeded {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("detached job did not finish");
+    }
+
+    #[tokio::test]
+    async fn ac_t6_2_2_logs_return_full_output_and_offset() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        let id = state
+            .jobs
+            .start("log", "hash", None, Concurrency::Allow)
+            .unwrap();
+        state.jobs.write_log(&id, b"abcdef").unwrap();
+        state.jobs.finish(&id, jobs::JobStatus::Succeeded, Some(0));
+        let full = server::jobs::log(
+            State(state.clone()),
+            axum::extract::Path(id.clone()),
+            Query(server::jobs::LogQuery {
+                offset: 0,
+                follow: false,
+            }),
+        )
+        .await;
+        let tail = server::jobs::log(
+            State(state),
+            axum::extract::Path(id),
+            Query(server::jobs::LogQuery {
+                offset: 3,
+                follow: false,
+            }),
+        )
+        .await;
+        assert_eq!(
+            axum::body::to_bytes(full.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "abcdef"
+        );
+        assert_eq!(
+            axum::body::to_bytes(tail.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "def"
+        );
+    }
+
+    async fn next_body_chunk<S>(stream: &mut S) -> axum::body::Bytes
+    where
+        S: futures_core::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Unpin,
+    {
+        std::future::poll_fn(|cx| {
+            futures_core::Stream::poll_next(std::pin::Pin::new(&mut *stream), cx)
+        })
+        .await
+        .expect("stream ended")
+        .expect("infallible body")
+    }
+
+    fn ndjson_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, "application/x-ndjson".parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn ac_t6_3_1_first_output_arrives_before_completion() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        register_exec_target(
+            &state,
+            "stream-early",
+            r#"print("first"); sleep(300); print("last");"#,
+            None,
+        )
+        .await;
+        let response = handle_exec(
+            State(state.clone()),
+            ndjson_headers(),
+            serde_json::to_vec(&serde_json::json!({"name":"stream-early"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/x-ndjson"
+        );
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_millis(150), next_body_chunk(&mut body))
+            .await
+            .expect("first output was buffered until completion");
+        let event: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(event["t"], "out");
+        assert_eq!(event["d"], "first\n");
+        assert_eq!(state.jobs.list(Some(jobs::JobStatus::Running)).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ac_t6_3_3_idle_stream_sends_ping() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), true);
+        state.stream_ping_interval = Duration::from_millis(10);
+        register_exec_target(&state, "stream-ping", "sleep(100);", None).await;
+        let response = handle_exec(
+            State(state),
+            ndjson_headers(),
+            serde_json::to_vec(&serde_json::json!({"name":"stream-ping"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        let event: serde_json::Value =
+            serde_json::from_slice(&next_body_chunk(&mut body).await).unwrap();
+        assert_eq!(event, serde_json::json!({"t":"ping"}));
+    }
+
+    #[tokio::test]
+    async fn ac_t6_3_4_exit_is_last_after_all_output_under_repetition() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        register_exec_target(&state, "stream-order", r#"print("tail");"#, None).await;
+        for _ in 0..100 {
+            let response = handle_exec(
+                State(state.clone()),
+                ndjson_headers(),
+                serde_json::to_vec(&serde_json::json!({"name":"stream-order"}))
+                    .unwrap()
+                    .into(),
+            )
+            .await;
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let events: Vec<serde_json::Value> = bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect();
+            assert_eq!(events.last().unwrap()["t"], "exit");
+            assert_eq!(
+                events.iter().filter(|event| event["t"] == "exit").count(),
+                1
+            );
+            let output: String = events
+                .iter()
+                .filter(|event| event["t"] == "out")
+                .map(|event| event["d"].as_str().unwrap())
+                .collect();
+            assert_eq!(output, "tail\n");
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_t6_3_5_and_6_buffered_response_and_missing_status_are_preserved() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        register_exec_target(&state, "buffered-exec", r#"print("done");"#, None).await;
+        let response = handle_exec(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"buffered-exec"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(response.headers()["X-Exit-Code"], "0");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "done\n"
+        );
+
+        let missing = handle_exec(
+            State(state),
+            ndjson_headers(),
+            serde_json::to_vec(&serde_json::json!({"name":"not-registered"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ac_t6_2_3_kill_terminates_tree_changes_state_and_audits() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        register_exec_target(
+            &state,
+            "killable",
+            r#"run(["sh", "-c", "sleep 100 & sleep 100"]);"#,
+            None,
+        )
+        .await;
+        let response = handle_exec(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name":"killable","detach":true}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        let id = response_json(response).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for _ in 0..100 {
+            if state.jobs.get(&id).unwrap().child.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let killed = server::jobs::kill(
+            State(state.clone()),
+            axum::extract::Path(id.clone()),
+            "{}".into(),
+        )
+        .await;
+        assert_eq!(killed.status(), StatusCode::ACCEPTED);
+        for _ in 0..100 {
+            if state.jobs.get(&id).unwrap().state == jobs::JobStatus::Killed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.jobs.get(&id).unwrap().state, jobs::JobStatus::Killed);
+        assert!(audit_values(dir.path())
+            .iter()
+            .any(|event| event["event"] == "kill"));
+        let again = server::jobs::kill(State(state), axum::extract::Path(id), "{}".into()).await;
+        assert_eq!(again.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn ac_t6_2_4_dropped_normal_exec_request_does_not_cancel_job() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        handle_register(State(state.clone()), HeaderMap::new(), serde_json::to_vec(
+            &serde_json::json!({"name":"disconnected","target":{"script":"sleep(100); print(\"survived\");"}})
+        ).unwrap().into()).await;
+        let request_state = state.clone();
+        let request = tokio::spawn(async move {
+            handle_exec(
+                State(request_state),
+                HeaderMap::new(),
+                serde_json::to_vec(&serde_json::json!({"name":"disconnected"}))
+                    .unwrap()
+                    .into(),
+            )
+            .await
+        });
+        let id = loop {
+            if let Some(job) = state
+                .jobs
+                .list(None)
+                .into_iter()
+                .find(|job| job.target == "disconnected")
+            {
+                break job.id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        request.abort();
+        for _ in 0..100 {
+            if state.jobs.get(&id).unwrap().state == jobs::JobStatus::Succeeded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.jobs.get(&id).unwrap().state,
+            jobs::JobStatus::Succeeded
+        );
+        assert_eq!(state.jobs.read_log(&id, 0).unwrap().unwrap(), b"survived\n");
+    }
+
+    #[tokio::test]
+    async fn ac_t6_2_5_jobs_routes_enforce_auth_origin_and_json() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), false);
+        let request = |method: &str, path: &str| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::HOST, "localhost")
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+        assert_eq!(
+            build_router(state.clone())
+                .oneshot(request("GET", "/jobs"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut token_state = state.clone();
+        token_state.token = Some("secret".into());
+        let wrong = axum::http::Request::builder()
+            .uri("/jobs")
+            .header(header::HOST, "localhost")
+            .header(header::AUTHORIZATION, "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            build_router(token_state)
+                .oneshot(wrong)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut open_state = state;
+        open_state.allow_no_token = true;
+        assert_eq!(
+            build_router(open_state.clone())
+                .oneshot(request("GET", "/jobs"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let origin = axum::http::Request::builder()
+            .uri("/jobs")
+            .header(header::HOST, "localhost")
+            .header(header::ORIGIN, "http://evil")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            build_router(open_state.clone())
+                .oneshot(origin)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let plain = axum::http::Request::builder()
+            .method("POST")
+            .uri("/jobs/nope/kill")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            build_router(open_state)
+                .oneshot(plain)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_t6_2_6_unknown_job_ids_return_404() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.allow_no_token = true;
+        let app = build_router(state);
+        for path in ["/jobs/missing", "/jobs/missing/log"] {
+            let request = axum::http::Request::builder()
+                .uri(path)
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/jobs/missing/kill")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }
