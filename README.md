@@ -289,6 +289,34 @@ wl-paste | clipwire put
 wl-paste --type image/png | clipwire put   # 画像の場合
 ```
 
+### 画像 (PNG / SVG) を Windows クリップボードへ送る
+
+`clipwire put` は stdin の内容から種別を自動判別する (PNG シグネチャ / ルート要素が `<svg>`)。`-t text|png|svg` で明示指定もできる。
+
+```bash
+clipwire put < diagram.png
+clipwire put < diagram.svg
+clipwire put -t text < diagram.svg   # SVG ソースをテキストとして送りたいとき
+```
+
+| 種別 | 設定されるクリップボード形式 |
+|---|---|
+| PNG | `PNG` (アルファ保持) + `CF_DIB` (互換用) |
+| SVG | `image/svg+xml` + `CF_UNICODETEXT` (SVG 非対応アプリにはソースが貼られる) |
+
+#### 複数の表現を同時に載せる
+
+貼り付け先アプリは自分が読める形式を選ぶので、ラスター・ベクター・テキストを 1 回で全部載せられる。`-` は stdin。
+
+```bash
+rsvg-convert diagram.svg -o diagram.png
+clipwire put --svg diagram.svg --png diagram.png --text alt.txt
+```
+
+`--png` / `--svg` / `--text` は任意の組み合わせで指定できる (`-t` とは併用不可)。HTTP では `application/json` (`{"text": "...", "svg": "...", "png": "<base64>"}`) で送る。
+
+HTTP では `POST /clip` の `Content-Type` (`text/plain` / `image/png` / `image/svg+xml`) で切り替わる。本文は検証され、不正な PNG / SVG は 400 になる。
+
 tmux キーバインドとして登録しておくと便利（`contrib/tmux.conf.snippet` 参照）。
 
 ---

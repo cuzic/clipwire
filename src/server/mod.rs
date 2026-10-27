@@ -1,6 +1,6 @@
 use super::*;
 
-mod clip;
+pub(crate) mod clip;
 mod exec;
 mod http_surface;
 pub(crate) mod jobs;
@@ -58,13 +58,24 @@ pub(crate) enum ClipKind {
     Empty,
 }
 
+/// `POST /clip` で受け取った、クリップボードへ書き込む内容。
+/// 設定された表現を全て同時に載せる(貼り付け側が読める形式を選ぶ)。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClipContent {
+    pub text: Option<String>,
+    /// 検証済みの PNG バイト列
+    pub png: Option<Vec<u8>>,
+    /// 検証済みの SVG ソース(UTF-8)
+    pub svg: Option<String>,
+}
+
 #[allow(dead_code)]
 pub(crate) enum ClipRequest {
     GetClip {
         reply: oneshot::Sender<ClipKind>,
     },
     SetClip {
-        text: String,
+        content: ClipContent,
         reply: oneshot::Sender<Result<()>>,
     },
     GetFile {

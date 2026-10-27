@@ -179,7 +179,43 @@ struct GetArgs {
 }
 
 #[derive(Args, Debug)]
-struct PutArgs;
+struct PutArgs {
+    /// stdin の種別を指定 (既定: 内容から自動判別。PNG / SVG 以外はテキスト)
+    #[arg(short = 't', long = "type", value_enum)]
+    kind: Option<PutKind>,
+
+    /// PNG ファイル (`-` で stdin)。--svg / --text と併用すると全て同時にクリップボードへ載せる
+    #[arg(long, value_name = "FILE", conflicts_with = "kind")]
+    png: Option<String>,
+
+    /// SVG ファイル (`-` で stdin)
+    #[arg(long, value_name = "FILE", conflicts_with = "kind")]
+    svg: Option<String>,
+
+    /// テキストファイル (`-` で stdin)。SVG 非対応アプリ向けの代替表現など
+    #[arg(long, value_name = "FILE", conflicts_with = "kind")]
+    text: Option<String>,
+}
+
+impl PutArgs {
+    fn bundle_sources(&self) -> Option<PutBundleSources<'_>> {
+        if self.png.is_none() && self.svg.is_none() && self.text.is_none() {
+            return None;
+        }
+        Some(PutBundleSources {
+            png: self.png.as_deref(),
+            svg: self.svg.as_deref(),
+            text: self.text.as_deref(),
+        })
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum PutKind {
+    Text,
+    Png,
+    Svg,
+}
 
 #[derive(Args, Debug)]
 struct OpenArgs {
@@ -298,9 +334,9 @@ fn main() -> Result<()> {
             let cfg = ClientConfig::from_env()?;
             cmd_get(&cfg, &args)
         }
-        Cmd::Put(_) => {
+        Cmd::Put(args) => {
             let cfg = ClientConfig::from_env()?;
-            cmd_put(&cfg)
+            cmd_put(&cfg, args.kind, args.bundle_sources())
         }
         Cmd::Open(args) => {
             let cfg = ClientConfig::from_env()?;
@@ -1734,7 +1770,7 @@ mod tests {
             token: Some(token.into()),
         };
         let errors = [
-            cmd_put(&cfg).unwrap_err().to_string(),
+            cmd_put(&cfg, None, None).unwrap_err().to_string(),
             cmd_exec(
                 &cfg,
                 &ExecArgs {

@@ -327,26 +327,50 @@ pub(crate) mod win_clip {
         Ok(String::from_utf16_lossy(&words[..end]))
     }
 
-    pub unsafe fn write_clipboard_text(text: &str) -> Result<()> {
-        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-        let byte_len = wide.len() * 2;
-
-        let hg = GlobalAlloc(GMEM_MOVEABLE, byte_len)?;
-        let ptr = GlobalLock(hg) as *mut u16;
+    unsafe fn alloc_hglobal(bytes: &[u8]) -> Result<HGLOBAL> {
+        let hg = GlobalAlloc(GMEM_MOVEABLE, bytes.len())?;
+        let ptr = GlobalLock(hg) as *mut u8;
         if ptr.is_null() {
             bail!("GlobalLock failed");
         }
-        std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
         let _ = GlobalUnlock(hg);
+        Ok(hg)
+    }
 
-        OpenClipboard(None)?;
+    /// クリップボードを空にして、(フォーマット, データ) をまとめて設定する。
+    /// SetClipboardData 成功時、HGLOBAL の所有権はシステムへ移る。
+    unsafe fn write_formats(formats: &[(u32, Vec<u8>)]) -> Result<()> {
+        let handles = formats
+            .iter()
+            .map(|(_, data)| alloc_hglobal(data))
+            .collect::<Result<Vec<_>>>()?;
+        let _g = ClipGuard::open()?;
         EmptyClipboard()?;
-        if let Err(e) = SetClipboardData(CF_UNICODETEXT, HANDLE(hg.0)) {
-            let _ = CloseClipboard();
-            bail!("SetClipboardData: {e}");
+        for ((fmt, _), hg) in formats.iter().zip(handles) {
+            if let Err(e) = SetClipboardData(*fmt, HANDLE(hg.0)) {
+                bail!("SetClipboardData(format {fmt}): {e}");
+            }
         }
-        CloseClipboard()?;
         Ok(())
+    }
+
+    pub unsafe fn write_clipboard(content: &super::ClipContent) -> Result<()> {
+        use crate::server::clip::{clip_formats, ClipFormat};
+        let formats = clip_formats(content)?
+            .into_iter()
+            .map(|(kind, data)| {
+                let id = match kind {
+                    ClipFormat::UnicodeText => CF_UNICODETEXT,
+                    ClipFormat::Dib => CF_DIB,
+                    ClipFormat::Png => reg_fmt(w!("PNG")),
+                    // Inkscape・Office 365・Chromium 系などが読む
+                    ClipFormat::Svg => reg_fmt(w!("image/svg+xml")),
+                };
+                (id, data)
+            })
+            .collect::<Vec<_>>();
+        write_formats(&formats)
     }
 
     pub fn show_balloon(msg: &str) {
@@ -595,8 +619,8 @@ pub(crate) mod win_clip {
                     ClipRequest::GetClip { reply } => {
                         let _ = reply.send(read_clipboard());
                     }
-                    ClipRequest::SetClip { text, reply } => {
-                        let _ = reply.send(write_clipboard_text(&text));
+                    ClipRequest::SetClip { content, reply } => {
+                        let _ = reply.send(write_clipboard(&content));
                     }
                     ClipRequest::GetFile { path, reply } => {
                         let _ = reply.send(std::fs::read(&path).ok());

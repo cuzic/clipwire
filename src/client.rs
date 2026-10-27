@@ -560,14 +560,94 @@ pub(crate) fn cmd_get(cfg: &ClientConfig, args: &GetArgs) -> Result<()> {
 
 // ── Client: put ───────────────────────────────────────────────────────────────
 
-pub(crate) fn cmd_put(cfg: &ClientConfig) -> Result<()> {
-    let mut body = Vec::new();
-    io::stdin().read_to_end(&mut body)?;
+/// stdin の内容から送信時の Content-Type を決める。
+/// 明示指定が優先。自動判別は PNG シグネチャと SVG ルート要素のみ。
+pub(crate) fn put_content_type(kind: Option<PutKind>, body: &[u8]) -> &'static str {
+    const PNG_SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    match kind {
+        Some(PutKind::Png) => "image/png",
+        Some(PutKind::Svg) => "image/svg+xml",
+        Some(PutKind::Text) => "text/plain; charset=utf-8",
+        None if body.starts_with(PNG_SIG) => "image/png",
+        None if std::str::from_utf8(body).is_ok_and(server::clip::looks_like_svg) => {
+            "image/svg+xml"
+        }
+        None => "text/plain; charset=utf-8",
+    }
+}
 
+/// `--png` / `--svg` / `--text` で指定された入力元(ファイルパス、`-` は stdin)。
+pub(crate) struct PutBundleSources<'a> {
+    pub png: Option<&'a str>,
+    pub svg: Option<&'a str>,
+    pub text: Option<&'a str>,
+}
+
+/// 各表現のバイト列を `POST /clip` 用の JSON バンドルにする。検証はサーバー側。
+pub(crate) fn build_put_bundle(
+    png: Option<&[u8]>,
+    svg: Option<&[u8]>,
+    text: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    let utf8 = |name: &str, b: &[u8]| -> Result<String> {
+        String::from_utf8(b.to_vec())
+            .map_err(|_| anyhow::anyhow!("--{name} は UTF-8 である必要があります"))
+    };
+    let mut map = serde_json::Map::new();
+    if let Some(b) = png {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b);
+        map.insert("png".into(), b64.into());
+    }
+    if let Some(b) = svg {
+        map.insert("svg".into(), utf8("svg", b)?.into());
+    }
+    if let Some(b) = text {
+        map.insert("text".into(), utf8("text", b)?.into());
+    }
+    Ok(serde_json::to_vec(&map)?)
+}
+
+fn read_put_source(path: &str, stdin_used: &mut bool) -> Result<Vec<u8>> {
+    if path == "-" {
+        if std::mem::replace(stdin_used, true) {
+            bail!("stdin (`-`) は 1 つの入力にしか使えません");
+        }
+        let mut buf = Vec::new();
+        io::stdin().read_to_end(&mut buf)?;
+        Ok(buf)
+    } else {
+        std::fs::read(path).with_context(|| format!("{path} を読めません"))
+    }
+}
+
+pub(crate) fn cmd_put(
+    cfg: &ClientConfig,
+    kind: Option<PutKind>,
+    bundle: Option<PutBundleSources<'_>>,
+) -> Result<()> {
+    let (body, content_type) = match bundle {
+        Some(src) => {
+            let mut stdin_used = false;
+            let mut read =
+                |p: Option<&str>| p.map(|p| read_put_source(p, &mut stdin_used)).transpose();
+            let png = read(src.png)?;
+            let svg = read(src.svg)?;
+            let text = read(src.text)?;
+            let body = build_put_bundle(png.as_deref(), svg.as_deref(), text.as_deref())?;
+            (body, "application/json")
+        }
+        None => {
+            let mut body = Vec::new();
+            io::stdin().read_to_end(&mut body)?;
+            let content_type = put_content_type(kind, &body);
+            (body, content_type)
+        }
+    };
     let url = format!("{}/clip", cfg.base_url());
     let req = cfg.set_auth(
         ureq::post(&url)
-            .set("Content-Type", "text/plain; charset=utf-8")
+            .set("Content-Type", content_type)
             .timeout(Duration::from_secs(30)),
     );
 
@@ -1573,3 +1653,46 @@ pub(crate) fn download_command(url: &str, output: &str, has_token: bool) -> Resu
 }
 
 // ── Domain types (serve) ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod put_type_tests {
+    use super::*;
+
+    #[test]
+    fn put_bundle_json_has_only_given_parts() {
+        let json = build_put_bundle(Some(b"\x89PNG"), None, Some(b"alt")).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["text"], "alt");
+        assert_eq!(v["png"], "iVBORw==");
+        assert!(v.get("svg").is_none());
+        assert!(build_put_bundle(None, Some(&[0xff]), None).is_err());
+    }
+
+    #[test]
+    fn put_content_type_detects_png_svg_and_text() {
+        let png = b"\x89PNG\r\n\x1a\nrest";
+        assert_eq!(put_content_type(None, png), "image/png");
+        assert_eq!(
+            put_content_type(None, b"<?xml version=\"1.0\"?><svg/>"),
+            "image/svg+xml"
+        );
+        assert_eq!(
+            put_content_type(None, b"hello"),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            put_content_type(None, b"<html></html>"),
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn put_content_type_explicit_kind_wins() {
+        assert_eq!(
+            put_content_type(Some(PutKind::Text), b"<svg/>"),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(put_content_type(Some(PutKind::Png), b"x"), "image/png");
+        assert_eq!(put_content_type(Some(PutKind::Svg), b"x"), "image/svg+xml");
+    }
+}

@@ -1,6 +1,10 @@
 stdin の内容を Windows クリップボードに書き込む
 
-Usage: clipwire put
+Usage: clipwire put [OPTIONS]
 
 Options:
-  -h, --help  Print help
+  -t, --type <KIND>  stdin の種別を指定 (既定: 内容から自動判別。PNG / SVG 以外はテキスト) [possible values: text, png, svg]
+      --png <FILE>   PNG ファイル (`-` で stdin)。--svg / --text と併用すると全て同時にクリップボードへ載せる
+      --svg <FILE>   SVG ファイル (`-` で stdin)
+      --text <FILE>  テキストファイル (`-` で stdin)。SVG 非対応アプリ向けの代替表現など
+  -h, --help         Print help
