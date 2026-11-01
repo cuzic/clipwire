@@ -373,6 +373,47 @@ pub(crate) mod win_clip {
         write_formats(&formats)
     }
 
+    /// `"locked"` / `"unlocked"` / `"unknown"` for the current interactive
+    /// session. UAC's consent prompt renders on the secure desktop, which
+    /// Windows cannot show over a locked workstation — an elevation request
+    /// (e.g. `Start-Process -Verb RunAs`) made while the session is locked
+    /// fails immediately as "The operation was canceled by the user" with
+    /// no dialog ever appearing. Callers check this first to fail fast with
+    /// a clear diagnostic instead of that misleading message.
+    pub fn session_state() -> &'static str {
+        use windows::Win32::System::RemoteDesktop::{
+            WTSFreeMemory, WTSQuerySessionInformationW, WTSINFOEXW, WTSSessionInfoEx,
+            WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK,
+            WTS_SESSIONSTATE_UNLOCK,
+        };
+        use windows::core::PWSTR;
+
+        unsafe {
+            let mut buffer = PWSTR::null();
+            let mut bytes_returned: u32 = 0;
+            if WTSQuerySessionInformationW(
+                WTS_CURRENT_SERVER_HANDLE,
+                WTS_CURRENT_SESSION,
+                WTSSessionInfoEx,
+                &mut buffer,
+                &mut bytes_returned,
+            )
+            .is_err()
+                || buffer.is_null()
+            {
+                return "unknown";
+            }
+            let info = buffer.0 as *const WTSINFOEXW;
+            let flags = (*info).Data.WTSInfoExLevel1.SessionFlags as u32;
+            WTSFreeMemory(buffer.0 as *mut _);
+            match flags {
+                WTS_SESSIONSTATE_LOCK => "locked",
+                WTS_SESSIONSTATE_UNLOCK => "unlocked",
+                _ => "unknown",
+            }
+        }
+    }
+
     pub fn show_balloon(msg: &str) {
         let msg = msg.to_string();
         std::thread::spawn(move || {

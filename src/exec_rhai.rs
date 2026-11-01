@@ -279,6 +279,7 @@ fn exec_rhai_with_output(
     engine.register_fn("notify", move |message: &str| {
         notify(message);
     });
+    engine.register_fn("session_state", session_state);
     {
         let dir = dir.clone();
         engine.register_fn("rm", move |path: &str| -> bool {
@@ -325,6 +326,18 @@ fn notify(message: &str) {
 
 #[cfg(not(windows))]
 fn notify(_message: &str) {}
+
+/// `"locked"` / `"unlocked"` / `"unknown"` — see `win_clip::session_state`.
+/// Non-Windows always reports `"unknown"` since there is no UAC to guard.
+#[cfg(windows)]
+fn session_state() -> String {
+    crate::win_clip::session_state().to_string()
+}
+
+#[cfg(not(windows))]
+fn session_state() -> String {
+    "unknown".to_string()
+}
 
 fn string_args(args: rhai::Array) -> Vec<String> {
     args.into_iter()
@@ -523,6 +536,17 @@ mod tests {
             assert!(
                 !output.to_ascii_uppercase().contains("CLIPD_TOKEN="),
                 "{output:?}"
+            );
+        }
+
+        #[test]
+        fn session_state_reports_one_of_the_known_values() {
+            let (output, code) = text(r#"print(session_state());"#);
+            assert_eq!(code, 0, "{output}");
+            let state = output.trim();
+            assert!(
+                ["locked", "unlocked", "unknown"].contains(&state),
+                "{state:?}"
             );
         }
 
