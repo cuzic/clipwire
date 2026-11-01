@@ -93,6 +93,12 @@ pub(crate) struct JobRegistry {
     jobs: Arc<Mutex<HashMap<String, JobMeta>>>,
     controls: Arc<Mutex<HashMap<String, Arc<JobControl>>>>,
     lost_events: Arc<Mutex<Vec<JobMeta>>>,
+    // Jobs a `GET .../exec` NDJSON stream is actively following. A job can
+    // finish (and so become a prune() candidate) before its own stream has
+    // delivered the exit event — without this guard, prune() can delete a
+    // just-finished job's log out from under the very client waiting on it,
+    // which the client then reports as a bogus "job not found" disconnect.
+    followers: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 #[derive(Debug, Default)]
@@ -161,6 +167,7 @@ impl JobRegistry {
             jobs: Arc::new(Mutex::new(jobs)),
             controls: Arc::new(Mutex::new(HashMap::new())),
             lost_events: Arc::new(Mutex::new(lost_events)),
+            followers: Arc::new(Mutex::new(std::collections::HashSet::new())),
         };
         registry.prune();
         Ok(registry)
@@ -276,6 +283,17 @@ impl JobRegistry {
         self.jobs.lock().unwrap().get(id).cloned()
     }
 
+    /// Marks `id` as having an active NDJSON follower, exempting it from
+    /// `prune()` until a matching [`JobRegistry::remove_follower`] call.
+    pub(crate) fn add_follower(&self, id: &str) {
+        self.followers.lock().unwrap().insert(id.to_string());
+    }
+
+    pub(crate) fn remove_follower(&self, id: &str) {
+        self.followers.lock().unwrap().remove(id);
+        self.prune();
+    }
+
     pub(crate) fn list(&self, state: Option<JobStatus>) -> Vec<JobMeta> {
         let mut jobs: Vec<_> = self
             .jobs
@@ -329,11 +347,13 @@ impl JobRegistry {
         if completed <= RETAIN {
             return;
         }
+        let followers = self.followers.lock().unwrap();
         let mut candidates: Vec<_> = jobs
             .values()
-            .filter(|job| !job.state.active())
+            .filter(|job| !job.state.active() && !followers.contains(&job.id))
             .cloned()
             .collect();
+        drop(followers);
         candidates.sort_by_key(|job| (job.state.failure() || job.detached, job.started_at));
         for job in candidates.into_iter().take(completed - RETAIN) {
             match fs::remove_dir_all(self.root.join(&job.id)) {
@@ -532,6 +552,45 @@ mod tests {
                 .filter(|job| !job.state.active())
                 .count(),
             RETAIN
+        );
+    }
+
+    /// A streaming `GET .../exec` follower must not have the job it is
+    /// reading pruned out from under it — otherwise the client sees a
+    /// bogus "job not found" mid-stream even though the job actually
+    /// succeeded (see `server::stream::FollowerGuard`).
+    #[test]
+    fn a_followed_job_survives_prune_until_the_follower_detaches() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new(dir.path()).unwrap();
+        let first = registry
+            .start("ok-first", "hash", None, Concurrency::Allow)
+            .unwrap();
+        registry.finish(&first, JobStatus::Succeeded, Some(0));
+        registry.add_follower(&first);
+        thread::sleep(Duration::from_millis(2));
+        for index in 0..51 {
+            let id = registry
+                .start(&format!("ok-{index}"), "hash", None, Concurrency::Allow)
+                .unwrap();
+            registry.finish(&id, JobStatus::Succeeded, Some(0));
+        }
+        assert!(
+            registry.get(&first).is_some(),
+            "a job with an active follower must not be pruned"
+        );
+        // `first` occupying a protected slot means the loop above only ever
+        // needed to evict down to exactly RETAIN total, so nothing is over
+        // budget yet. One more success tips it over budget again, and with
+        // `first` no longer protected it is (still) the oldest candidate.
+        registry.remove_follower(&first);
+        let one_more = registry
+            .start("ok-one-more", "hash", None, Concurrency::Allow)
+            .unwrap();
+        registry.finish(&one_more, JobStatus::Succeeded, Some(0));
+        assert!(
+            registry.get(&first).is_none(),
+            "once unfollowed, a later prune should be free to collect it"
         );
     }
 }

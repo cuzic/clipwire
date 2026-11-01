@@ -116,12 +116,34 @@ pub(super) fn follow_response(state: AppState, id: String, offset: usize) -> Res
         .unwrap()
 }
 
+/// Keeps `id` exempt from `JobRegistry::prune()` for as long as a stream is
+/// following it, released on every exit path (including early `return`s)
+/// via `Drop` rather than duplicated cleanup calls.
+struct FollowerGuard<'a> {
+    jobs: &'a crate::jobs::JobRegistry,
+    id: &'a str,
+}
+
+impl<'a> FollowerGuard<'a> {
+    fn new(jobs: &'a crate::jobs::JobRegistry, id: &'a str) -> Self {
+        jobs.add_follower(id);
+        Self { jobs, id }
+    }
+}
+
+impl Drop for FollowerGuard<'_> {
+    fn drop(&mut self) {
+        self.jobs.remove_follower(self.id);
+    }
+}
+
 async fn follow(
     state: AppState,
     id: String,
     mut offset: usize,
     sender: tokio::sync::mpsc::Sender<Result<axum::body::Bytes, Infallible>>,
 ) {
+    let _follower_guard = FollowerGuard::new(&state.jobs, &id);
     let mut utf8 = Utf8Chunks::default();
     let mut last_ping = Instant::now();
     loop {
