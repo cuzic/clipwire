@@ -670,6 +670,18 @@ mod tests {
         }
     }
 
+    fn script_file_target() -> StoredTarget {
+        StoredTarget {
+            script_file: Some(ScriptFileDef {
+                interpreter: vec!["python3".into()],
+                body: "print('t9.0')".into(),
+                ext: Some("py".into()),
+                env: Default::default(),
+            }),
+            ..StoredTarget::default()
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ac_t3_3_2_corrupt_store_is_quarantined_and_never_overwritten() {
         let dir = tempfile::tempdir().unwrap();
@@ -883,6 +895,49 @@ mod tests {
         for name in ["old", "new"] {
             assert!(store.verified_target(name).unwrap().is_some());
         }
+    }
+
+    /// AC-T9.0.1: a binary that recognizes `script_file` (the updated
+    /// watchdog fallback / "good.exe") must never silently drop it while
+    /// reloading and resaving `registered.toml` — neither on a bare
+    /// load->save cycle, nor when that rewrite is triggered by registering
+    /// an unrelated second target (the same `load_for_update` ->
+    /// `atomic_save_target_map` cycle a real good.exe performs). Runs on
+    /// both Linux and Windows CI (`.github/workflows/ci.yml`), standing in
+    /// for the real-machine good.exe swap while the dev machine is offline.
+    #[tokio::test]
+    async fn ac_t9_0_1_script_file_entry_survives_a_registered_toml_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        store
+            .register("script-file-target".into(), script_file_target(), true)
+            .await
+            .unwrap();
+        let path = dir.path().join("registered.toml");
+
+        let before_bytes = fs::read(&path).unwrap();
+        let reloaded = load_target_map(&path).unwrap();
+        atomic_save_target_map(&path, &reloaded).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before_bytes,
+            "an unmodified load -> save round trip must not change script_file's bytes"
+        );
+        let before_entry = reloaded.get("script-file-target").unwrap().clone();
+        assert!(before_entry.script_file.is_some());
+
+        store
+            .register("other-target".into(), target("echo other"), true)
+            .await
+            .unwrap();
+        let after_entry = load_target_map(&path)
+            .unwrap()
+            .remove("script-file-target")
+            .unwrap();
+        assert_eq!(
+            before_entry, after_entry,
+            "registering an unrelated target must not drop or alter the existing script_file entry"
+        );
     }
 
     #[cfg(windows)]
