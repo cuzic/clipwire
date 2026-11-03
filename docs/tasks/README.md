@@ -52,9 +52,9 @@
 | T7.5 | Deferred | 運用モード (A) では価値が低い(OQ-0) |
 | T7.6 | 完了 | `docs/tasks/backlog.md`(AC-T7.6.1) |
 | T7.7 | L 完了(AC-T7.7.1) / X 未検証 | `clipwire open` は `POST /open` を使う。**旧 `GET /open` とフォールバックは 2026-10-01 に削除**(互換性方針)。AC-T7.7.2(互換期間中の新旧組み合わせ)は対象外 |
-| T9.1 | L 完了(AC-T9.1.1〜T9.1.5) / W 未検証 | コミット 2ffbb35。`script_file` の register/exec を実装。AC-T9.1.6(実機の BOM/CP932 確認)は未検証。T9.0(ウォッチドッグのフォールバックバイナリ更新)が出荷前提のため未出荷 |
+| T9.1 | L 完了(AC-T9.1.1〜T9.1.5) / W 未検証 | コミット 2ffbb35。`script_file` の register/exec を実装。AC-T9.1.6(実機での `script_file` 実行・BOM/CP932 確認)は未検証。T9.0 は完了(上記)したため出荷前提は満たしたが、main へのマージ・本番サーバーへの反映はまだ行っていない |
 | T9.2 | L 完了(AC-T9.2.1〜T9.2.3・T9.2.6) / C・W 未検証 | コミット ae00656(パス安全性の純粋関数モジュール `write_path.rs`)・44d64c5(`/write` 本体: `--enable-write`/`--write-root`、`RouteClass::Write`、`MoveFileExW`(Windows)/rename スタブ(非Windows開発用)、監査 fail-closed、`/health` features)。AC-T9.2.4・T9.2.5(Windows CI での `MoveFileExW` 実挙動)・T9.2.7(実機の重複警告)は未検証。**承認済みターゲットとの重複警告(ADR-0014 §1 の警告ログ)は未実装**(`registered.toml` 読み込みが前提のため別タスク) |
-| T9.0 | C 完了(AC-T9.0.1 の中核) / W 未検証 | コミット 11b05d8。`dragonflyg4`(実機 Windows)が Tailscale 上でオフラインのため実機での good.exe 配置は未実施。代わりに `load_for_update`→`atomic_save_target_map`(good.exe が registered.toml を再保存するたびに通る経路そのもの)で `script_file` が欠落・変化しないことを示す回帰テストを追加し、GitHub Actions の Linux・Windows 両 CI(run 41603349082)で確認済み。実機への新 good.exe 配置自体は、機体がオンラインに戻った後の運用作業として別途行う |
+| T9.0 | C・W 完了(AC-T9.0.1) | コミット 11b05d8(CI 回帰テスト、run 41603349082 で緑)。`dragonflyg4` が 2026-11-03 にオンライン復帰したため実機でも検証済み: `C:\Users\cuzic\scoop\persist\msys2\home\cuzic\clipwire` を `origin/feat/t0.4-watchdog`(c119dad)まで pull・ビルドし、一時ポート・一時 `CLIPWIRE_CONFIG_DIR` で起動して `/health` 200 を確認した上で `%LOCALAPPDATA%\clipwire\bin\good\clipwire.exe` に配置(このパスに good.exe が置かれるのは初めてで、既存ファイルの入れ替えではない)。配置した good.exe 自身で `script_file` を register → 別ターゲットを register して `registered.toml` を強制的に再書き込み → `script_file` が残っていることを確認。稼働中の本番サーバー(`C:\clipwire-build-b\debug\clipwire.exe`, PID 6632)には触れていない。タスクスケジューラへの `clipwire watchdog --good ...` 登録はまだ行っていない(good.exe の配置のみ) |
 | T9.3 | 未着手 | 永続実行コンテキスト PoC は Windows 実機(対話的な起動・pywinauto 相当の確認)が前提で、`dragonflyg4` オフラインのためこのセッションからは着手できない |
 
 ## 運用の実態(計画の前提)
