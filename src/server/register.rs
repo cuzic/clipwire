@@ -21,6 +21,7 @@ struct TargetDefinition {
     dir: Option<String>,
     script: Option<String>,
     steps: Option<StepsDef>,
+    script_file: Option<crate::config::ScriptFileDef>,
     #[serde(default)]
     env: std::collections::BTreeMap<String, String>,
     timeout: Option<String>,
@@ -33,6 +34,7 @@ impl From<TargetDefinition> for StoredTarget {
             dir: value.dir,
             script: value.script,
             steps: value.steps,
+            script_file: value.script_file,
             env: value.env,
             timeout: value.timeout,
             concurrency: value.concurrency,
@@ -86,6 +88,35 @@ async fn handle_register_with_ip(
 
     if let Err(e) = validate_definition(&target) {
         return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response();
+    }
+    if [
+        target.script.is_some(),
+        target.steps.is_some(),
+        target.script_file.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count()
+        >= 2
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "script / steps / script_file はいずれか1つだけ指定してください\n",
+        )
+            .into_response();
+    }
+    if let Some(ext) = target
+        .script_file
+        .as_ref()
+        .and_then(|script_file| script_file.ext.as_deref())
+    {
+        if !crate::config::valid_script_file_ext(ext) {
+            return (
+                StatusCode::BAD_REQUEST,
+                "script_file.ext が不正です(英数字1〜16文字)\n",
+            )
+                .into_response();
+        }
     }
     if let Some(value) = &target.timeout {
         let valid = humantime::parse_duration(value).is_ok_and(crate::runner::valid_timeout);

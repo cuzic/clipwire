@@ -10,6 +10,16 @@ pub(crate) enum StepsDef {
     Argv(Vec<Vec<String>>),
 }
 
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScriptFileDef {
+    pub(crate) interpreter: Vec<String>,
+    pub(crate) body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ext: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) env: std::collections::BTreeMap<String, String>,
+}
+
 impl StepsDef {
     pub(crate) fn into_argv(self) -> Vec<Vec<String>> {
         match self {
@@ -36,6 +46,13 @@ pub(crate) enum ExecPayload {
         #[serde(default)]
         env: std::collections::BTreeMap<String, String>,
     },
+    ScriptFile {
+        interpreter: Vec<String>,
+        body: String,
+        ext: Option<String>,
+        #[serde(default)]
+        env: std::collections::BTreeMap<String, String>,
+    },
 }
 
 /// Windows 側 pending.toml / registered.toml のエントリ (dir あり)
@@ -47,6 +64,8 @@ pub(crate) struct StoredTarget {
     pub(crate) script: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) steps: Option<StepsDef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) script_file: Option<ScriptFileDef>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub(crate) env: std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,6 +95,8 @@ struct CanonicalTarget<'a> {
     script: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     steps: Option<&'a StepsDef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    script_file: Option<&'a ScriptFileDef>,
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     env: &'a std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,6 +112,7 @@ pub(crate) fn canonical_json(target: &StoredTarget) -> Vec<u8> {
         dir: target.dir.as_deref(),
         script: target.script.as_deref(),
         steps: target.steps.as_ref(),
+        script_file: target.script_file.as_ref(),
         env: &target.env,
         timeout: target.timeout.as_deref(),
         concurrency: target.concurrency,
@@ -182,6 +204,12 @@ pub(crate) fn validate_definition(target: &StoredTarget) -> Result<(), Definitio
             }
         }
     }
+    if let Some(script_file) = &target.script_file {
+        for (index, value) in script_file.interpreter.iter().enumerate() {
+            validate_definition_string(format!("script_file.interpreter[{index}]"), value)?;
+        }
+        validate_definition_string("script_file.body".into(), &script_file.body)?;
+    }
     for (key, value) in &target.env {
         validate_definition_string(format!("env key {key:?}"), key)?;
         validate_definition_string(format!("env[{key:?}]"), value)?;
@@ -190,6 +218,10 @@ pub(crate) fn validate_definition(target: &StoredTarget) -> Result<(), Definitio
         validate_definition_string("timeout".into(), timeout)?;
     }
     Ok(())
+}
+
+pub(crate) fn valid_script_file_ext(ext: &str) -> bool {
+    !ext.is_empty() && ext.len() <= 16 && ext.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 impl StoredTarget {
@@ -204,8 +236,18 @@ impl StoredTarget {
                     env: self.env,
                 },
             ))
+        } else if let Some(script_file) = self.script_file {
+            Ok((
+                self.dir,
+                ExecPayload::ScriptFile {
+                    interpreter: script_file.interpreter,
+                    body: script_file.body,
+                    ext: script_file.ext,
+                    env: script_file.env,
+                },
+            ))
         } else {
-            bail!("ターゲットに script も steps もありません")
+            bail!("ターゲットに script / steps / script_file がありません")
         }
     }
 }

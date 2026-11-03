@@ -290,6 +290,53 @@ async fn run_job(
             )
             .map_err(|e| e.to_string())
         }
+        ExecPayload::ScriptFile {
+            interpreter,
+            body,
+            ext,
+            env,
+        } => {
+            let (output, relay) = output_pair.map_err(|e| e.to_string())?;
+            if interpreter.is_empty() {
+                return Err("script_file.interpreter が空です".to_string());
+            }
+            let script_dir = registry
+                .log_path(&running_id)
+                .parent()
+                .expect("job log path always has a parent directory")
+                .to_path_buf();
+            let file_name = match &ext {
+                Some(ext) => format!("script.{ext}"),
+                None => "script".to_string(),
+            };
+            let script_path = script_dir.join(file_name);
+            std::fs::write(&script_path, body.as_bytes()).map_err(|e| e.to_string())?;
+            let runner =
+                Runner::with_output(std::env::temp_dir().join("clipwire-runner"), output.clone());
+            let mut args: Vec<std::ffi::OsString> =
+                interpreter[1..].iter().map(Into::into).collect();
+            args.push(script_path.into_os_string());
+            let mut spec = JobSpec::new(&interpreter[0], "http");
+            spec.args = args;
+            spec.cwd = dir.as_ref().map(Into::into);
+            spec.env = env.iter().map(|(k, v)| (k.into(), v.into())).collect();
+            let mut job = runner.spawn(spec).map_err(|e| e.to_string())?;
+            if let Some(error) = job.spawn_error() {
+                return Err(format!("実行エラー: {error}"));
+            }
+            registry.set_child(
+                &running_id,
+                job.child_identity().map_err(|e| e.to_string())?,
+            );
+            job.wait_cancelable(&cancel).map_err(|e| e.to_string())?;
+            registry.set_child(&running_id, None);
+            let exit_code = job.exit_code().unwrap_or(-1);
+            drop(runner);
+            output
+                .finish(relay)
+                .map(|bytes| (bytes, exit_code))
+                .map_err(|e| e.to_string())
+        }
     })
     .await;
     deadline.abort();

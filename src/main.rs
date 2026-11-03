@@ -1096,6 +1096,40 @@ mod tests {
     }
 
     #[test]
+    fn ac_t9_1_1_script_file_is_canonicalized_and_hashed() {
+        let target = StoredTarget {
+            script_file: Some(ScriptFileDef {
+                interpreter: vec!["python".into(), "-u".into()],
+                body: "print('hello')\n".into(),
+                ext: Some("py".into()),
+                env: BTreeMap::from([("PYTHONUTF8".into(), "1".into())]),
+            }),
+            ..StoredTarget::default()
+        };
+        let bytes = canonical_json(&target);
+        assert_eq!(
+            bytes,
+            fixture_bytes("tests/fixtures/canonical/script-file.json")
+        );
+        assert_eq!(
+            definition_hash(&bytes),
+            "sha256:70cfb4318e1486c32a068278a7f567aa22c3b623adc5d7a8c0715bf19cd066f2"
+        );
+
+        let mut changed = target;
+        changed
+            .script_file
+            .as_mut()
+            .unwrap()
+            .body
+            .push_str("# changed\n");
+        assert_ne!(
+            definition_hash(&bytes),
+            definition_hash(&canonical_json(&changed))
+        );
+    }
+
+    #[test]
     fn ac_t3_1_3_text_and_argv_steps_remain_distinct() {
         let text = StoredTarget {
             steps: Some(StepsDef::Text("echo one".into())),
@@ -1265,6 +1299,172 @@ mod tests {
         target.dir = Some("C:\\通常".into());
         target.env = BTreeMap::from([("NORMAL_KEY".into(), "通常の値 😀".into())]);
         assert_eq!(validate_definition(&target), Ok(()));
+    }
+
+    #[test]
+    fn ac_t9_1_3_script_file_definition_rejects_control_characters() {
+        let target = StoredTarget {
+            script_file: Some(ScriptFileDef {
+                interpreter: vec!["python".into()],
+                body: "safe\u{202e}text".into(),
+                ext: Some("py".into()),
+                env: BTreeMap::new(),
+            }),
+            ..StoredTarget::default()
+        };
+        let error = validate_definition(&target).unwrap_err();
+        assert_eq!(error.field, "script_file.body");
+        assert_eq!(error.codepoint, 0x202e);
+    }
+
+    #[tokio::test]
+    async fn ac_t9_1_2_and_3_register_enforces_exclusivity_and_extension() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        let register = |name: &str, target: serde_json::Value| {
+            handle_register(
+                State(state.clone()),
+                HeaderMap::new(),
+                serde_json::to_vec(&serde_json::json!({"name": name, "target": target}))
+                    .unwrap()
+                    .into(),
+            )
+        };
+
+        let response = register(
+            "exclusive",
+            serde_json::json!({
+                "script": "()",
+                "script_file": {"interpreter": ["echo"], "body": "ignored"}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        for (index, ext) in ["", "../x", "abcdefghijklmnopq"].into_iter().enumerate() {
+            let response = register(
+                &format!("bad-ext-{index}"),
+                serde_json::json!({
+                    "script_file": {"interpreter": ["echo"], "body": "ignored", "ext": ext}
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "ext={ext:?}");
+        }
+
+        let response = register(
+            "valid-script-file",
+            serde_json::json!({
+                "script_file": {"interpreter": ["echo"], "body": "ignored", "ext": "py"}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn ac_t9_1_2_existing_mixed_target_keeps_script_precedence() {
+        let target = StoredTarget {
+            script: Some("script wins".into()),
+            steps: Some(StepsDef::Argv(vec![vec!["ignored-step".into()]])),
+            script_file: Some(ScriptFileDef {
+                interpreter: vec!["ignored-interpreter".into()],
+                body: "ignored body".into(),
+                ext: None,
+                env: BTreeMap::new(),
+            }),
+            ..StoredTarget::default()
+        };
+        let (_, payload) = target.into_exec().unwrap();
+        match payload {
+            ExecPayload::Script { script } => assert_eq!(script, "script wins"),
+            _ => panic!("script must retain precedence over steps and script_file"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ac_t9_1_4_script_file_exec_writes_body_in_job_directory() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), true);
+        let response = handle_register(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "script-file-exec",
+                "target": {
+                    "script_file": {
+                        "interpreter": ["echo"],
+                        "body": "the script body",
+                        "ext": null
+                    }
+                }
+            }))
+            .unwrap()
+            .into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = handle_exec(
+            State(state.clone()),
+            HeaderMap::new(),
+            serde_json::to_vec(&serde_json::json!({"name": "script-file-exec"}))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let job = state
+            .jobs
+            .list(None)
+            .into_iter()
+            .find(|job| job.target == "script-file-exec")
+            .unwrap();
+        let script_path = dir.path().join("jobs").join(&job.id).join("script");
+        assert_eq!(
+            std::fs::read_to_string(&script_path).unwrap(),
+            "the script body"
+        );
+        assert!(String::from_utf8_lossy(&body).contains(script_path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn ac_t9_1_5_prune_removes_script_file_with_job_directory() {
+        let dir = tempdir().unwrap();
+        let registry = jobs::JobRegistry::new(dir.path()).unwrap();
+        let mut ids = Vec::new();
+        for index in 0..=50 {
+            let id = registry
+                .start(
+                    &format!("target-{index}"),
+                    "sha256:test",
+                    None,
+                    Concurrency::Reject,
+                )
+                .unwrap();
+            let script_path = registry.log_path(&id).parent().unwrap().join("script");
+            std::fs::write(script_path, "body").unwrap();
+            registry.finish(&id, jobs::JobStatus::Succeeded, Some(0));
+            ids.push(id);
+        }
+
+        let remaining = registry.list(None);
+        assert_eq!(remaining.len(), 50);
+        let removed: Vec<_> = ids
+            .iter()
+            .filter(|id| !dir.path().join("jobs").join(id).exists())
+            .collect();
+        assert_eq!(removed.len(), 1);
+        assert!(!dir
+            .path()
+            .join("jobs")
+            .join(removed[0])
+            .join("script")
+            .exists());
     }
 
     #[tokio::test]
