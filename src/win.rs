@@ -381,12 +381,12 @@ pub(crate) mod win_clip {
     /// no dialog ever appearing. Callers check this first to fail fast with
     /// a clear diagnostic instead of that misleading message.
     pub fn session_state() -> &'static str {
+        use windows::core::PWSTR;
         use windows::Win32::System::RemoteDesktop::{
-            WTSFreeMemory, WTSQuerySessionInformationW, WTSINFOEXW, WTSSessionInfoEx,
+            WTSFreeMemory, WTSQuerySessionInformationW, WTSSessionInfoEx, WTSINFOEXW,
             WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK,
             WTS_SESSIONSTATE_UNLOCK,
         };
-        use windows::core::PWSTR;
 
         unsafe {
             let mut buffer = PWSTR::null();
