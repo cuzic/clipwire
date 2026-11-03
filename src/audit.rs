@@ -25,6 +25,7 @@ pub(crate) enum AuditEventKind {
     #[allow(dead_code)]
     AutoApprove,
     ServeStart,
+    Write,
 }
 
 impl AuditEventKind {
@@ -60,6 +61,14 @@ pub(crate) struct AuditEvent {
     pub(crate) auto_approve: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) auth: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) overwrote: Option<bool>,
 }
 
 impl AuditEvent {
@@ -81,6 +90,10 @@ impl AuditEvent {
             approver: None,
             auto_approve: None,
             auth: None,
+            path: None,
+            bytes: None,
+            sha256: None,
+            overwrote: None,
         }
     }
 
@@ -165,6 +178,10 @@ impl AuditLog {
                 ));
             }
         }
+    }
+
+    pub(crate) fn try_record(&self, event: AuditEvent) -> io::Result<()> {
+        self.append(&event)
     }
 
     fn append(&self, event: &AuditEvent) -> io::Result<()> {

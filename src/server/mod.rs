@@ -6,6 +6,7 @@ mod http_surface;
 pub(crate) mod jobs;
 mod register;
 mod stream;
+mod write;
 
 use crate::audit::AuditLog;
 use clip::*;
@@ -107,6 +108,9 @@ pub(crate) struct AppState {
     pub(crate) audit: AuditLog,
     pub(crate) jobs: crate::jobs::JobRegistry,
     pub(crate) stream_ping_interval: Duration,
+    pub(crate) enable_write: bool,
+    pub(crate) write_roots: Vec<crate::write_path::WindowsPath>,
+    pub(crate) write_denylist: Vec<crate::write_path::WindowsPath>,
 }
 
 // ── Logging / panic visibility (serve) ────────────────────────────────────────
@@ -356,7 +360,7 @@ pub(crate) fn unauthorized() -> Response {
 
 // ── HTTP handlers (serve) ─────────────────────────────────────────────────────
 
-pub(crate) async fn handle_health(headers: HeaderMap) -> Response {
+pub(crate) async fn handle_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let wants_json = headers
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok())
@@ -371,6 +375,9 @@ pub(crate) async fn handle_health(headers: HeaderMap) -> Response {
     if wants_json {
         return axum::Json(serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
+            "features": ["write"],
+            "write_enabled": state.enable_write,
+            "write_roots": state.write_roots.len(),
         }))
         .into_response();
     }
@@ -430,6 +437,139 @@ pub(crate) fn warn_auto_approve(has_token: bool) {
     );
 }
 
+fn os_path_string(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        path.to_string_lossy().into_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        let rendered = path.to_string_lossy();
+        if rendered.len() >= 3
+            && rendered.as_bytes()[0].is_ascii_alphabetic()
+            && rendered.as_bytes()[1] == b':'
+            && rendered.as_bytes()[2] == b'\\'
+        {
+            return rendered.into_owned();
+        }
+        format!(
+            "C:\\{}",
+            rendered.trim_start_matches('/').replace('/', "\\")
+        )
+    }
+}
+
+pub(crate) fn parse_os_path(
+    path: &Path,
+) -> std::result::Result<crate::write_path::WindowsPath, crate::write_path::PathError> {
+    crate::write_path::parse_canonical(&os_path_string(path))
+}
+
+fn canonical_or_absolute(path: &Path) -> PathBuf {
+    if path.exists() {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn default_write_denylist_dirs(config_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![config_dir.to_path_buf()];
+    if let Some(local) = dirs_next::data_local_dir() {
+        dirs.push(local.join("clipwire"));
+        dirs.push(local.join("clipwire/bin"));
+    }
+    if let Some(home) = dirs_next::home_dir() {
+        dirs.push(home.clone());
+        dirs.push(home.join("Documents/WindowsPowerShell"));
+        dirs.push(home.join("Documents/PowerShell"));
+    }
+    if let Some(roaming) = dirs_next::config_dir() {
+        dirs.push(roaming.join("Microsoft/Windows/Start Menu/Programs/Startup"));
+    }
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+    {
+        dirs.push(exe_dir);
+    }
+    dirs
+}
+
+pub(crate) fn resolve_write_roots(
+    write_roots: &[PathBuf],
+    denylist_dirs: &[PathBuf],
+) -> Result<(
+    Vec<crate::write_path::WindowsPath>,
+    Vec<crate::write_path::WindowsPath>,
+)> {
+    let mut denylist = Vec::new();
+    for directory in denylist_dirs {
+        let path = canonical_or_absolute(directory);
+        if let Ok(parsed) = parse_os_path(&path) {
+            if let Some(drive) = parsed.drive {
+                let drive_root = crate::write_path::parse_canonical(&format!("{drive}:\\"))
+                    .expect("drive root is valid");
+                if !denylist.contains(&drive_root) {
+                    denylist.push(drive_root);
+                }
+            }
+            if !denylist.contains(&parsed) {
+                denylist.push(parsed);
+            }
+        }
+    }
+
+    let mut resolved = Vec::new();
+    for root in write_roots {
+        if !root.exists() {
+            bail!("--write-root が存在しません: {}", root.display());
+        }
+        let canonical = std::fs::canonicalize(root)
+            .with_context(|| format!("--write-root を正規化できません: {}", root.display()))?;
+        let parsed = parse_os_path(&canonical).map_err(|error| {
+            anyhow::anyhow!("--write-root が不正です: {}: {error:?}", root.display())
+        })?;
+        if parsed.components.is_empty()
+            || denylist.iter().any(|deny| write_path_denied(&parsed, deny))
+        {
+            bail!("このルートは広すぎます: {}", root.display());
+        }
+        resolved.push(parsed);
+    }
+    Ok((resolved, denylist))
+}
+
+pub(crate) fn write_path_denied(
+    path: &crate::write_path::WindowsPath,
+    deny: &crate::write_path::WindowsPath,
+) -> bool {
+    // A drive root is retained in the denylist to reject selecting the drive
+    // itself; treating it as an ordinary ancestor would reject every useful
+    // directory on that drive.
+    if deny.components.is_empty() {
+        return path.components.is_empty() && path.drive == deny.drive;
+    }
+    crate::write_path::overlaps(path, deny)
+}
+
+fn resolve_write_configuration(
+    enable_write: bool,
+    config_dir: &Path,
+    write_roots: &[PathBuf],
+) -> Result<(
+    Vec<crate::write_path::WindowsPath>,
+    Vec<crate::write_path::WindowsPath>,
+)> {
+    if !enable_write {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if write_roots.is_empty() {
+        bail!("--enable-write には少なくとも 1 つの --write-root <DIR> が必要です");
+    }
+    resolve_write_roots(write_roots, &default_write_denylist_dirs(config_dir))
+}
+
 // ── serve entry point ─────────────────────────────────────────────────────────
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
@@ -484,6 +624,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     }
 
     let config_dir = clipwire_config_dir();
+    let (write_roots, write_denylist) =
+        resolve_write_configuration(args.enable_write, &config_dir, &args.write_root)?;
 
     #[cfg(windows)]
     let _mutex = unsafe { win_clip::acquire_mutex(&config_dir) };
@@ -551,7 +693,17 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         audit,
         jobs,
         stream_ping_interval: Duration::from_secs(30),
+        enable_write: args.enable_write,
+        write_roots,
+        write_denylist,
     };
+
+    if state.enable_write {
+        warn!(
+            "--enable-write: /write を有効化しました(許可ルート {} 件)",
+            state.write_roots.len()
+        );
+    }
 
     let serve_start = crate::audit::serve_start_event(
         crate::audit::audit_timestamp(SystemTime::now()),

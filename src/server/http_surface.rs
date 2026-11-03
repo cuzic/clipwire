@@ -9,6 +9,7 @@ pub(crate) enum RouteClass {
     Common,
     Clipboard,
     Protected,
+    Write,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +27,7 @@ pub(crate) enum RouteId {
     Job,
     JobLog,
     JobKill,
+    Write,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +82,12 @@ pub(crate) const ROUTES: &[RouteSpec] = &[
         registered_mutation: RegisteredMutation::Never,
     },
     RouteSpec {
+        id: RouteId::Write,
+        path: "/write",
+        class: RouteClass::Write,
+        registered_mutation: RegisteredMutation::Never,
+    },
+    RouteSpec {
         id: RouteId::Exec,
         path: "/exec",
         class: RouteClass::Protected,
@@ -127,6 +135,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
     let mut common = Router::new();
     let mut clipboard = Router::new();
     let mut protected = Router::new();
+    let mut write_group = Router::new();
 
     for route in ROUTES {
         let router = match route.id {
@@ -153,11 +162,13 @@ pub(crate) fn build_router(state: AppState) -> Router {
             RouteId::Job => Router::new().route(route.path, get(super::jobs::get_job)),
             RouteId::JobLog => Router::new().route(route.path, get(super::jobs::log)),
             RouteId::JobKill => Router::new().route(route.path, post(super::jobs::kill)),
+            RouteId::Write => Router::new().route(route.path, post(super::write::handle_write)),
         };
         match route.class {
             RouteClass::Common => common = common.merge(router),
             RouteClass::Clipboard => clipboard = clipboard.merge(router),
             RouteClass::Protected => protected = protected.merge(router),
+            RouteClass::Write => write_group = write_group.merge(router),
         }
     }
 
@@ -166,10 +177,15 @@ pub(crate) fn build_router(state: AppState) -> Router {
     protected = protected
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .route_layer(middleware::from_fn(require_json_content_type));
+    write_group = write_group
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .route_layer(middleware::from_fn(require_octet_stream_content_type))
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
 
     common
         .merge(clipboard)
         .merge(protected)
+        .merge(write_group)
         .with_state(state.clone())
         .layer(middleware::from_fn(reject_origin))
         .layer(middleware::from_fn_with_state(state.clone(), require_host))
@@ -240,6 +256,30 @@ async fn require_json_content_type(request: Request, next: Next) -> Response {
         return (
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "application/json required\n",
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+async fn require_octet_stream_content_type(request: Request, next: Next) -> Response {
+    if request.method() != axum::http::Method::POST {
+        return next.run(request).await;
+    }
+    let is_octet_stream = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| {
+            value
+                .trim()
+                .eq_ignore_ascii_case("application/octet-stream")
+        });
+    if !is_octet_stream {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "application/octet-stream required\n",
         )
             .into_response();
     }

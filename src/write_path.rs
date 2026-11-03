@@ -27,13 +27,19 @@ pub(crate) enum PathError {
 /// not an encoded space.
 pub(crate) fn decode_and_validate_header_path(raw: &str) -> Result<WindowsPath, PathError> {
     let decoded = percent_decode(raw)?;
+    parse_canonical(&decoded)
+}
+
+/// Applies the same lexical validation as [`decode_and_validate_header_path`]
+/// to an already-decoded path (for example one returned by the OS).
+pub(crate) fn parse_canonical(decoded: &str) -> Result<WindowsPath, PathError> {
     if decoded.contains('\0') {
         return Err(PathError::InvalidEncoding);
     }
 
     let (path, had_extended_prefix) = match decoded.strip_prefix(r"\\?\") {
         Some(path) => (path, true),
-        None => (decoded.as_str(), false),
+        None => (decoded, false),
     };
 
     if path.starts_with(r"\\") {
@@ -70,6 +76,16 @@ pub(crate) fn decode_and_validate_header_path(raw: &str) -> Result<WindowsPath, 
         drive: path.chars().next(),
         components,
     })
+}
+
+/// Renders a validated drive path as a Windows absolute path string.
+pub(crate) fn to_absolute_string(path: &WindowsPath) -> String {
+    let drive = path
+        .drive
+        .expect("WindowsPath without a drive is not supported here");
+    let mut absolute = format!("{drive}:\\");
+    absolute.push_str(&path.components.join("\\"));
+    absolute
 }
 
 /// Applies the path comparison folding used by this module.
@@ -311,5 +327,32 @@ mod tests {
             parse(r"C:\work\a+b.txt").components.last().unwrap(),
             "a+b.txt"
         );
+    }
+
+    #[test]
+    fn parse_canonical_validates_without_percent_decoding() {
+        assert_eq!(
+            parse_canonical(r"C:\work\run.py"),
+            Ok(parse(r"C:\work\run.py"))
+        );
+        assert_eq!(
+            parse_canonical(r"C:\work\..\run.py"),
+            Err(PathError::DotComponent)
+        );
+        assert_eq!(
+            parse_canonical(r"C:\work\%2E%2E\run.py")
+                .unwrap()
+                .components[1],
+            "%2E%2E"
+        );
+    }
+
+    #[test]
+    fn renders_an_absolute_windows_path() {
+        assert_eq!(
+            to_absolute_string(&parse(r"C:\work\run.py")),
+            r"C:\work\run.py"
+        );
+        assert_eq!(to_absolute_string(&parse(r"D:\")), r"D:\");
     }
 }

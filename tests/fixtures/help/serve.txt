@@ -11,4 +11,6 @@ Options:
       --auto-approve             register リクエストを自動承認する (approve 不要)
       --host-check <HOST_CHECK>  Host ヘッダ不一致時の動作 (初回出荷はログのみ) [default: log] [possible values: log, enforce]
       --allow-host <HOST>        Host ヘッダで追加許可する名前 (複数指定可)
+      --enable-write             /write エンドポイントを有効化する(既定は無効)
+      --write-root <DIR>         /write が書き込みを許可するルート(複数指定可)。--enable-write 併用時は必須
   -h, --help                     Print help

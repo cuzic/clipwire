@@ -165,6 +165,14 @@ struct ServeArgs {
     /// Host ヘッダで追加許可する名前 (複数指定可)
     #[arg(long, value_name = "HOST", action = clap::ArgAction::Append)]
     allow_host: Vec<String>,
+
+    /// /write エンドポイントを有効化する(既定は無効)
+    #[arg(long)]
+    enable_write: bool,
+
+    /// /write が書き込みを許可するルート(複数指定可)。--enable-write 併用時は必須
+    #[arg(long, value_name = "DIR", action = clap::ArgAction::Append)]
+    write_root: Vec<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -448,6 +456,9 @@ mod tests {
             audit: audit::AuditLog::new(config_dir.clone()),
             jobs: jobs::JobRegistry::new(config_dir).unwrap(),
             stream_ping_interval: Duration::from_secs(30),
+            enable_write: false,
+            write_roots: Vec::new(),
+            write_denylist: Vec::new(),
         }
     }
 
@@ -471,6 +482,9 @@ mod tests {
             audit: audit::AuditLog::new(config_dir.clone()),
             jobs: jobs::JobRegistry::new(config_dir).unwrap(),
             stream_ping_interval: Duration::from_secs(30),
+            enable_write: false,
+            write_roots: Vec::new(),
+            write_denylist: Vec::new(),
         }
     }
 
@@ -489,6 +503,7 @@ mod tests {
                 (RouteId::File, "/file", RouteClass::Clipboard),
                 (RouteId::VFile, "/vfile", RouteClass::Clipboard),
                 (RouteId::Open, "/open", RouteClass::Clipboard),
+                (RouteId::Write, "/write", RouteClass::Write),
                 (RouteId::Exec, "/exec", RouteClass::Protected),
                 (RouteId::Register, "/register", RouteClass::Protected),
                 (
@@ -650,6 +665,7 @@ mod tests {
                 (RouteId::File, "/file", RegisteredMutation::Never),
                 (RouteId::VFile, "/vfile", RegisteredMutation::Never),
                 (RouteId::Open, "/open", RegisteredMutation::Never),
+                (RouteId::Write, "/write", RegisteredMutation::Never),
                 (RouteId::Exec, "/exec", RegisteredMutation::Never),
                 (
                     RouteId::Register,
@@ -2146,8 +2162,194 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let value = response_json(app.oneshot(json).await.unwrap()).await;
-        assert_eq!(value.as_object().unwrap().len(), 1);
+        assert_eq!(value.as_object().unwrap().len(), 4);
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["features"], serde_json::json!(["write"]));
+        assert_eq!(value["write_enabled"], false);
+        assert_eq!(value["write_roots"], 0);
+    }
+
+    fn write_request(path: &Path, uri: &str, body: &'static [u8]) -> axum::http::Request<Body> {
+        let canonical_parent = std::fs::canonicalize(path.parent().unwrap()).unwrap();
+        let parsed_parent = server::parse_os_path(&canonical_parent).unwrap();
+        let mut components = parsed_parent.components;
+        components.push(path.file_name().unwrap().to_string_lossy().into_owned());
+        let header_path = write_path::to_absolute_string(&write_path::WindowsPath {
+            drive: parsed_parent.drive,
+            components,
+        });
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header("X-Clipwire-Path", header_path)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ac_t9_2_2_and_3_write_is_mounted_disabled_and_requires_octet_stream() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.allow_no_token = true;
+        let app = build_router(state);
+        let target = dir.path().join("disabled.bin");
+        let disabled = write_request(&target, "/write", b"data");
+        assert_eq!(app.clone().oneshot(disabled).await.unwrap().status(), 403);
+
+        for content_type in [None, Some("text/plain"), Some("application/json")] {
+            let mut builder = axum::http::Request::builder()
+                .method("POST")
+                .uri("/write")
+                .header(header::HOST, "localhost");
+            if let Some(content_type) = content_type {
+                builder = builder.header(header::CONTENT_TYPE, content_type);
+            }
+            let response = app
+                .clone()
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ac_t9_2_write_success_bounds_overwrite_denylist_and_missing_parent() {
+        let allowed = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let denied = tempdir().unwrap();
+        let state_dir = tempdir().unwrap();
+        let mut state = test_state(state_dir.path().to_path_buf(), false);
+        state.allow_no_token = true;
+        state.enable_write = true;
+        state.write_roots = [allowed.path(), denied.path()]
+            .into_iter()
+            .map(|path| server::parse_os_path(&std::fs::canonicalize(path).unwrap()).unwrap())
+            .collect();
+        state.write_denylist =
+            vec![server::parse_os_path(&std::fs::canonicalize(denied.path()).unwrap()).unwrap()];
+        let app = build_router(state);
+
+        let target = allowed.path().join("new.bin");
+        assert_eq!(
+            app.clone()
+                .oneshot(write_request(&target, "/write", b"first"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"first");
+        assert_eq!(
+            app.clone()
+                .oneshot(write_request(&target, "/write", b"second"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"first");
+        assert_eq!(
+            app.clone()
+                .oneshot(write_request(&target, "/write?overwrite=1", b"second"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"second");
+
+        let outside_target = outside.path().join("outside.bin");
+        assert_eq!(
+            app.clone()
+                .oneshot(write_request(&outside_target, "/write", b"x"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let denied_target = denied.path().join("denied.bin");
+        assert_eq!(
+            app.clone()
+                .oneshot(write_request(&denied_target, "/write", b"x"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let missing_parent = allowed.path().join("missing/file.bin");
+        let parsed_root =
+            server::parse_os_path(&std::fs::canonicalize(allowed.path()).unwrap()).unwrap();
+        let mut components = parsed_root.components;
+        components.extend(["missing".into(), "file.bin".into()]);
+        let missing_header = write_path::to_absolute_string(&write_path::WindowsPath {
+            drive: parsed_root.drive,
+            components,
+        });
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/write")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header("X-Clipwire-Path", missing_header)
+            .body(Body::from("x"))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        assert!(!missing_parent.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ac_t9_2_6_audit_failure_does_not_create_destination() {
+        let allowed = tempdir().unwrap();
+        let state_dir = tempdir().unwrap();
+        let audit_blocker = state_dir.path().join("not-a-directory");
+        std::fs::write(&audit_blocker, b"block").unwrap();
+        let mut state = test_state(state_dir.path().to_path_buf(), false);
+        state.allow_no_token = true;
+        state.enable_write = true;
+        state.write_roots =
+            vec![server::parse_os_path(&std::fs::canonicalize(allowed.path()).unwrap()).unwrap()];
+        state.audit = audit::AuditLog::new(audit_blocker);
+        let target = allowed.path().join("unchanged.bin");
+        let response = build_router(state)
+            .oneshot(write_request(&target, "/write", b"never committed"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!target.exists());
+        assert!(std::fs::read_dir(allowed.path())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".clipwire-write-")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ac_t9_2_2_startup_rejects_missing_and_overlapping_roots() {
+        let deny = tempdir().unwrap();
+        let child = tempfile::Builder::new()
+            .prefix("child-")
+            .tempdir_in(deny.path())
+            .unwrap();
+        let error = server::resolve_write_roots(
+            &[child.path().to_path_buf()],
+            &[deny.path().to_path_buf()],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("このルートは広すぎます"));
+        let missing = deny.path().join("missing");
+        assert!(server::resolve_write_roots(&[missing], &[]).is_err());
     }
 
     #[tokio::test]
