@@ -299,6 +299,9 @@ mod store;
 mod watchdog;
 #[cfg(windows)]
 mod win;
+// T9.2 exposes this pure path API before the /write handler consumes it.
+#[allow(dead_code)]
+pub(crate) mod write_path;
 
 use client::*;
 use config::*;
