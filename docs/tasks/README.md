@@ -52,6 +52,7 @@
 | T7.5 | Deferred | 運用モード (A) では価値が低い(OQ-0) |
 | T7.6 | 完了 | `docs/tasks/backlog.md`(AC-T7.6.1) |
 | T7.7 | L 完了(AC-T7.7.1) / X 未検証 | `clipwire open` は `POST /open` を使う。**旧 `GET /open` とフォールバックは 2026-10-01 に削除**(互換性方針)。AC-T7.7.2(互換期間中の新旧組み合わせ)は対象外 |
+| T9.0〜T9.3 | 未着手 | pad2py 連携(ADR-0012/0013/0014)。`docs/tasks/09-pad2py-integration.md`。T9.0(ウォッチドッグのフォールバックバイナリ更新)が T9.1 の出荷前提。T9.3 は PoC のみ、本実装は未着手 |
 
 ## 運用の実態(計画の前提)
 
@@ -83,6 +84,7 @@
 | 6 | [06-streaming-and-jobs.md](06-streaming-and-jobs.md) | ストリーミング・ジョブ管理 | 0001, 0002 | L | P4, P5a |
 | 7 | [07-features.md](07-features.md) | `list`/`status`、Rhai API、`exec --copy`(params は Deferred) | 0005, 0007, 0008 | M | P3〜P6(個別) |
 | 8 | [08-release.md](08-release.md) | 互換性検証・移行・リリース | 全 | M | 全 |
+| 9 | [09-pad2py-integration.md](09-pad2py-integration.md) | pad2py 連携: `script_file`・`/write`・永続実行コンテキスト PoC | 0012, 0013, 0014 | L(T9.1)〜XL(T9.2) | P0〜P7(現行基盤) |
 
 ```
 T0.1 → P1(T1.1〜1.5 は T0.2 を待たない。T1.5 = `--token-file`)
