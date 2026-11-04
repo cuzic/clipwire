@@ -29,7 +29,7 @@ fn find_python() -> Option<&'static str> {
 
 struct Wrapper {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     responses: std::sync::mpsc::Receiver<String>,
 }
 
@@ -71,17 +71,22 @@ impl Wrapper {
 
         Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             responses: rx,
         }
     }
 
-    fn turn(&mut self, code: &str) -> serde_json::Value {
+    fn send_code(&mut self, code: &str) {
         let request = serde_json::json!({ "code": code });
         let line = serde_json::to_string(&request).unwrap();
-        self.stdin.write_all(line.as_bytes()).unwrap();
-        self.stdin.write_all(b"\n").unwrap();
-        self.stdin.flush().unwrap();
+        let stdin = self.stdin.as_mut().expect("stdin not closed");
+        stdin.write_all(line.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    fn turn(&mut self, code: &str) -> serde_json::Value {
+        self.send_code(code);
         let response = self
             .responses
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -89,6 +94,14 @@ impl Wrapper {
         serde_json::from_str(&response).unwrap_or_else(|error| {
             panic!("response was not a single JSON line: {error}: {response:?}")
         })
+    }
+
+    /// Drops the child's stdin handle, delivering EOF on its read end —
+    /// simulates the server process (and so the pipe) going away without
+    /// killing the wrapper directly, to test that the wrapper notices on
+    /// its own (ADR-0013 §3's EOF requirement).
+    fn close_stdin(&mut self) {
+        self.stdin = None;
     }
 }
 
@@ -131,6 +144,78 @@ print("from_stderr", file=sys.stderr)
         "raw os.write(1, ..) output missing from capture: stdout={stdout:?}"
     );
     assert!(stderr.contains("from_stderr"), "stderr={stderr:?}");
+}
+
+/// レビューで判明した不備の回帰テスト: ターンがハング中(ここでは長い
+/// sleep で代用)でも、stdin への EOF(サーバプロセスの終了を模する)を
+/// 別スレッドで検知して速やかに終了すること。当初の実装は stdin の読み
+/// 取りをメインスレッド(ターン実行スレッドそのもの)で行っていたため、
+/// ハング中のターンは EOF に気づけず、サーバ再起動後も `JobRegistry` の
+/// 「席」を握り続けてしまう(ADR-0013 §3 改訂3 で要件化)。
+#[test]
+fn poc_eof_during_a_hung_turn_still_exits_promptly() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping: no python3/python interpreter on PATH");
+        return;
+    };
+    let mut wrapper = Wrapper::spawn(python);
+
+    // Starts a turn that would otherwise hang for 30s (standing in for a
+    // pywinauto call stuck on a modal dialog). Don't wait for its response.
+    wrapper.send_code("import time; time.sleep(30)");
+    // Give the turn time to actually enter the sleep (be genuinely hung)
+    // before simulating the server's death.
+    thread::sleep(std::time::Duration::from_millis(300));
+    wrapper.close_stdin();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(Some(_status)) = wrapper.child.try_wait() {
+            return; // exited on its own well before the 30s sleep would finish.
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "wrapper did not exit within 5s of stdin EOF despite a hung turn"
+        );
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// レビューで判明した不備の回帰テスト: ターン中に起動したバックグラウン
+/// ドスレッドが、そのターンの応答が返った**後**に fd 1 へ書いても、次の
+/// ターンの応答のフレーミングを壊さないこと。当初の wrapper.py 実装は
+/// ターン終了時に fd 1 をプロトコル用パイプへ戻していたため、この書き込
+/// みが直接プロトコルに混入していた(ADR-0013 §2 改訂3 時点では未検出)。
+#[test]
+fn poc_item1_late_write_after_turn_does_not_corrupt_next_turns_framing() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping: no python3/python interpreter on PATH");
+        return;
+    };
+    let mut wrapper = Wrapper::spawn(python);
+
+    let code = r#"
+import threading, time
+def _late():
+    time.sleep(0.3)
+    import os
+    os.write(1, b"late-background-write\n")
+threading.Thread(target=_late, daemon=True).start()
+print("turn1-done")
+"#;
+    let r1 = wrapper.turn(code);
+    assert_eq!(r1["stdout"].as_str().unwrap().trim(), "turn1-done");
+
+    // The background thread's write lands ~0.3s later, while the wrapper is
+    // idle between turns. Give it time to happen before sending turn 2.
+    thread::sleep(std::time::Duration::from_millis(500));
+
+    let r2 = wrapper.turn("print('turn2-done')");
+    assert_eq!(
+        r2["stdout"].as_str().unwrap().trim(),
+        "turn2-done",
+        "a late write from turn 1's background thread corrupted turn 2's response: {r2}"
+    );
 }
 
 /// PoC 項目 2: 大きい出力・複数ターンにわたって、改行区切り JSON の
