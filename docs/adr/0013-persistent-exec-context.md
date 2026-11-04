@@ -1,8 +1,8 @@
 # ADR-0013: 状態を持つ実行コンテキスト(persistent context)
 
-- Status: Proposed(PoC 完了。T9.3 evidence 参照。本実装着手には T4.4 の完了が追加の前提になったため、まだ Accepted には進めない)
-- Date: 2026-11-02(改訂1: 2026-11-03、Opus レビュー反映。「Rhai `script` と同じ信頼モデル」という説明を撤回し、承認済みの任意コード実行オラクルとして正面から扱う設計に変更。改訂2: 2026-11-03、T9.3 PoC 結果反映。`docs/tasks/evidence/t9.3-persistent-context-poc.md` 参照)
-- Depends on: ADR-0004(パラメータ付きターゲット。実行時の自由入力を承認無効化の理由として却下した判断)、ADR-0009(ランナー)、ADR-0010(承認モデル)、ADR-0012(`script_file`。起動スクリプトとして使う)、**T4.4(Windows Job Object。改訂2で追加。§3 参照)**
+- Status: Proposed(PoC 完了。T9.3 evidence 参照。改訂3で、未決の設計論点が残っていることを理由に Proposed を維持。§「Status」参照。T4.4 待ちではない)
+- Date: 2026-11-02(改訂1: 2026-11-03、Opus レビュー反映。「Rhai `script` と同じ信頼モデル」という説明を撤回し、承認済みの任意コード実行オラクルとして正面から扱う設計に変更。改訂2: 2026-11-03、T9.3 PoC 結果反映。改訂3: 2026-11-03、改訂2に対する Opus レビューを反映。mtime ゲートの正しさ・Job Object 依存の妥当性・相互排他の実装場所を再検討)
+- Depends on: ADR-0004(パラメータ付きターゲット。実行時の自由入力を承認無効化の理由として却下した判断)、ADR-0009(ランナー)、ADR-0010(承認モデル)、ADR-0012(`script_file`。起動スクリプトとして使う)
 
 ## Context
 
@@ -22,7 +22,7 @@ pad2py 自身が「余裕があれば」「急ぎではない」と位置づけ�
 
 本 ADR は、この性質を隠さずに正面から設計する。
 
-## Decision(PoC 前の設計方針。詳細は PoC 結果で確定する)
+## Decision(T9.3 PoC の結果を改訂3まで反映済み。残る未決点は Status 参照)
 
 ### 1. 永続モードはハッシュ束縛された定義の一部にする
 
@@ -34,23 +34,24 @@ pad2py 自身が「余裕があれば」「急ぎではない」と位置づけ�
 ### 2. 起動とプロトコル
 
 - 永続コンテキストは ADR-0012 の `script_file`(`persistent: true`)をラッパースクリプトの起動として使う。ラッパーは stdin から 1 行 1 JSON ターンを読み、受け取ったコードを実行し、stdout に 1 行 JSON で結果を返す。
-- **ラッパーは実行中、`sys.stdout`/`sys.stderr` を自分で捕捉し、JSON レスポンスに含めて返す**(例: Python の `contextlib.redirect_stdout`/`redirect_stderr`)。ユーザーコードが素の `print()` や、pywinauto 等がログ目的で直接標準出力に書くことを想定し、生のパイプにフレーミングを任せない。
+- **プロトコル応答は stdout を直接使わず、起動直後に複製した専用の fd に流す**(T9.3 PoC 項目1・5.1 で判明。改訂3で修正): ラッパー起動直後、まず `proto_fd = os.dup(1)` で応答用の fd を退避する。各ターンの実行中だけ、fd 1/2 を一時ファイルへ `os.dup2` で向け直し(Python レベルの `sys.stdout`/`sys.stderr` だけでなく、同じ fd を継承したサブプロセスや生の `os.write(1, ...)` の出力も含めて漏れなく捕捉するため。`contextlib.redirect_stdout` のような Python レベルの差し替えだけでは、サブプロセス・ネイティブ拡張の出力を拾えない)、ターン終了時に読み戻して JSON レスポンスの `stdout`/`stderr` に入れる。**レスポンス自体は `proto_fd` 経由で書く**(fd 1 ではない)。この分離により、ターン中・ターン外を問わず fd 1 に書く何か(バックグラウンドスレッド、ターン終了後も動き続ける処理)があっても、プロトコルの改行区切り JSON フレーミングは壊れない(`docs/tasks/evidence/poc/t9.3/wrapper.py`・`tests/t9_3_persistent_context_poc.rs` で Linux・Windows CI の両方で確認済み)。**出力の到着順序は保証しない**(print・サブプロセス継承・生の fd 書き込みの間で、各ライターの flush タイミングに依存する。ソースコード上の順序と一致しないことがある。pad2py のデバッグ用途(どのクリックの後にどのログが出たか)に影響するため、呼び出し側に明記する)。
 - 子プロセスの `stdin` を `Stdio::piped()` にする新しい spawn 経路を `Runner` とは別に用意する(既存 `Runner::spawn` の `Stdio::null()` 前提は変更しない。ADR-0009 の対象外)。**stderr は継続的に排出する**(ADR-0009 のリレー機構を再利用する。排出せずパイプバッファが埋まると子がブロックし、ターンがハングする。ADR-0009 §1 が同じ理由でリレー方式を採用した)。
 - サーバ側は**コンテキストごとに 1 ターンを直列化**する(同一コンテキストへの並行 `exec` は 409 で拒否。stdin/stdout の 1 対 1 対応を壊さないため)。
 - **ターン送信エンドポイントは `RouteClass::Protected` とする**(`require_auth` + JSON Content-Type 必須)。ターンの本文はコードそのものであり、ADR-0014 の `/write`(ファイルのバイト列。Content-Type 不問)とは性質が違う。リクエストボディは `{"code": "..."}` のような JSON で運ぶ。
 
 ### 3. ライフサイクル・失効・監査
 
-- 新しいレジストリ(`PersistentContextRegistry`。`JobRegistry` とは独立)が、コンテキスト ID・バッキングプロセスの `ChildIdentity`・最終アクセス時刻・起動に使った定義ハッシュ・`registered.toml` の mtime(次項参照)を管理する。
-- **毎ターン、承認ハッシュを再検証する。ただし素朴な実装ではコストが高すぎることが T9.3 PoC で判明したため、mtime ゲートを挟む**(T9.3 evidence 項目5): `exec`(単発実行)が `approved/<hash>.json` を読んで sha256 を再計算し不一致なら拒否するのと同じ仕組みを、素朴に「`registered.toml` 全体を毎ターン再読み込み・再パースする」形で永続コンテキストに適用すると、実測で 1 ターンあたり約 300ms(1571 エントリ規模。`toml::from_str` が支配的)の追加レイテンシが生まれ、対話的な応答性を明確に損なう。そこで各ターンの冒頭でまず `fs::metadata("registered.toml").modified()` だけを取得し(実測 26〜39µs、全体再パースの 1/10000 以下)、コンテキスト起動時または直前のチェック時に記録した mtime と比較する。**変化がなければ全体の再パース・再検証をその回はスキップする**(mtime が変わっていない限りファイルは書き換えられていないため、結果は変わらない。「承認変更は次のターンから有効にする」という安全性要件は、mtime の変化を検知した時にだけ以下の再検証を行えば壊れない)。mtime が変化していた場合のみ、次の**両方**を確認するフルの再検証を行う: (a) `registered.toml` の対象ターゲット名のエントリが、コンテキスト起動時に記録したハッシュと今も一致すること、(b) そのハッシュに対応する `approved/<hash>.json` が今も存在すること。いずれかが満たされなければ、そのターンを拒否してコンテキストを終了させる。
-- **アイドルタイムアウトに加えて絶対寿命を設ける**。アイドルタイムアウト単独では、30 分おきにポーリングするだけのクライアントがコンテキストを無期限に生かし続けられる。絶対寿命(例 : 数時間、要 PoC での検討)を超えたら、アイドル状態に関わらず終了させる。
+- 新しいレジストリ(`PersistentContextRegistry`。`JobRegistry` とは独立)が、コンテキスト ID・バッキングプロセスの `ChildIdentity`・最終アクセス時刻・起動に使った定義ハッシュ・起動時の `canonical_json(target)` を管理する。
+- **毎ターン、承認ハッシュを再検証する。(a) `registered.toml` 側の再パースのみ mtime ゲートで省略可能にし、(b) `approved/<hash>.json` 側は毎ターン必ず検証する**(改訂3。T9.3 evidence 項目5 で判明したコストの内訳と、改訂2の Opus レビューを反映): `exec`(単発実行)と同じ再検証(`registered.toml` から対象ターゲットの現在のハッシュを読み、`approved/<hash>.json` を読んで sha256 を再計算し、起動時に保持した canonical 定義と一致するか確認)を素朴に「`registered.toml` 全体を毎ターン再パースする」形で永続コンテキストに適用すると、1571 エントリ規模で追加レイテンシが生まれる(デバッグビルドでの実測は 1 ターンあたり約 300ms。release ビルドでの実測は T9.3 evidence 項目5 改訂3 に記載。**この数字次第で、以下の mtime ゲート自体が「必須の設計変更」から「対話的応答性のための任意の最適化」に格下げされる**)。コストが問題になる場合は、`registered.toml` の再パースだけを、`fs::metadata` から得る `(ファイル identity, size, mtime)` の組をロック内・パース前に取得して直前の記録と `!=` で比較するゲートの対象にし、変化がなければ再パースを省略してよい(`>` ではなく `!=` にする理由: 一時ファイル → rename の順序やシステムクロックの巻き戻りで、新しい mtime が記録値より小さくなるケースを取りこぼさないため。identity を組に含める理由: mtime の分解能(NTFS は既定で約 15.6ms 刻み、FAT/exFAT は 2 秒)より速く書き込みが起きても、clipwire 自身の書き込みは原子的な置換で毎回新しいファイルを作るため identity は確実に変わる)。**ただし (b) の `approved/<hash>.json` 検証は、このゲートの対象にしない**: 検証結果は `registered.toml` と `approved/<hash>.json` という 2 つの独立したファイルに依存し、`registered.toml` の mtime だけでは `approved/<hash>.json` の削除・改ざん・部分書き込み(ADR-0010 §3 が「改ざん・部分書き込みの検出」と位置づける検査)を検知できない。(b) は数 KB の読み込み + sha256 で µs〜数十 µs にすぎず(T9.3 evidence 項目5 の内訳どおり支配的コストではない)、省略する理由がない。省略すれば、永続コンテキストは通常 `exec` より弱い完全性検査で無期限の任意コード実行を許すことになり、本末転倒。(a)(b) いずれかで不一致・不在が判明すれば、そのターンを拒否してコンテキストを終了させる。**この再検証の実装は `PersistentContextRegistry` 専用に複製せず、`Store::verified_target`(通常 `exec` が使う経路そのもの)に mtime ゲートを組み込み、両方の経路が同じ実装を通る**ようにする(実装が2系統に分かれると、片方だけ直す事故が起きやすい)。
+- **アイドルタイムアウトに加えて絶対寿命を設ける**。アイドルタイムアウト単独では、30 分おきにポーリングするだけのクライアントがコンテキストを無期限に生かし続けられる。絶対寿命(例 : 数時間、要検討。本実装着手前に確定させる未決事項として Status に残す)を超えたら、アイドル状態に関わらず終了させる。
 - **ターンごとのタイムアウトと kill エンドポイントを設ける**。UIA 呼び出しがモーダルダイアログで止まるなど、ターンがハングする可能性は pywinauto の用途では現実的に高い。ハング中のターンは「進行中」である限りアイドルタイムアウトを起動させないため、ターン単独のタイムアウト(ADR-0003 の上限に揃える)でコンテキストを終了させる仕組みと、`DELETE /contexts/<id>` のような明示的な kill エンドポイントの両方が必要。
-- **Windows での終了は T4.4(Job Object)が前提になる(T9.3 PoC で判明)**: `src/runner/windows.rs` の `OsProcessGroup` は現時点でスタブであり、`spawn_in_group` は素の `command.spawn()`、`terminate()` は何もしない、`members()` は未実装エラーを返す。`JobHandle::terminate()`(`src/runner/mod.rs`)も Windows では直接の子プロセスにのみ `child.kill()` する実装になっている。つまり現状のコードベースには「Job に入れて `TerminateJobObject` で子孫も倒す」という選択肢自体が存在しない。アイドルタイムアウト・絶対寿命・kill エンドポイントのいずれでラッパーを終了させても、**ラッパーが起動した孫プロセスは現状の Windows 実装では道連れにならず残り続ける**(実機 `dragonflyg4` でも、親プロセスのみを終了させ孫プロセスが生き残ることを直接再現済み。`docs/tasks/evidence/t9.3-persistent-context-poc.md` 項目3)。永続コンテキストの本実装は、(a) T4.4 の実装完了を前提にする、または (b) ラッパー自身が起動した子孫の PID を自己追跡し明示的に kill する自前の仕組みを持つ、のいずれかを選ぶ。本 ADR は (a) を既定方針とし、Depends on に T4.4 を追加する((b) は T4.4 と独立に進められる代案として Alternatives に残す)。
+- **Windows での終了: 直接の子プロセス kill で出荷し、孫プロセスの残存は T5.1/T6.2 と同じ既知の制約として扱う**(改訂3。T4.4 待ちだった改訂2の方針を撤回): `src/runner/windows.rs` の `OsProcessGroup` は現時点でスタブで(`spawn_in_group` は素の `command.spawn()`、`terminate()` は何もしない)、`JobHandle::terminate()` も Windows では直接の子プロセスにのみ `child.kill()` する。アイドルタイムアウト・絶対寿命・kill エンドポイントでラッパーを終了させても、**ラッパーが起動した孫プロセスは現状の Windows 実装では道連れにならず残り続ける**(実機 `dragonflyg4` で、親プロセスのみを終了させ孫プロセスが生き残ることを直接再現済み。`docs/tasks/evidence/t9.3-persistent-context-poc.md` 項目3)。これを理由に本実装を T4.4(Job Object)の完了まで止めるのは一貫していない: 同じ「Windows では子孫を倒せない」制約を抱えたまま、T5.1(timeout)・T6.2(`--detach`/`kill`)は既に「孫プロセスの Windows ツリー kill は T4.4 待ち」として出荷されている(`docs/tasks/README.md`)。加えて、Job Object は pywinauto の用途に対して必要条件でも十分条件でもない: pywinauto が操作する対象アプリは、既に起動済みのアプリや COM 経由で別ホストから起動されるプロセスなど、ラッパーの子孫でない場合が多く Job に入らない(不十分)。逆にラッパー自身が `Application().start()` で起動したアプリは Job に入り、`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` を使うとコンテキスト終了時に**操作対象として残したいアプリまで落ちる**副作用がある。したがって「T4.4 を待てば終了処理が正しくなる」とは言えない。**停止させるべき安全要件は「任意コードの受付口を止めること」であり、これはラッパー自身(直接の子)に対する `child.kill()` で今すぐ満たせる**。残る孫プロセスのリソースリークは T5.1/T6.2 と同種の既知の制約として README/本 ADR に明記し、T4.4 完了時に自動的に改善される扱いとする。`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` が操作対象アプリを落とす問題については、pad2py の実際の pywinauto 運用でそれが許容できるかを別途確認する(本実装着手前の未決事項。Status 参照)。
 - **クラッシュ検出**: ターンの合間にプロセスが終了していた場合、次の `exec` 呼び出しは「コンテキストは既に失われている」ことを明確なエラーで返す(ハングさせない)。
 - **サーバ再起動時**: ラッパーは stdin の `readline()` でブロックしているため、サーバプロセスが終了すると(ADR-0009 §1 の「EPIPE」ではなく)**EOF** を受け取る。ラッパーは EOF を受けたら速やかに終了することを要件にする(EOF 後も書き込みを試みない限り `EPIPE` は発生しない)。サーバ再起動後の持ち越しはしない(呼び出し側が再度コンテキストを起動する)。
 - **監査**: `AuditEventKind` に `ContextStart` / `ContextTurn` / `ContextEnd` / `ContextKilled` を追加する。`ContextTurn` にはターン本文の sha256 とバイト数を記録し、本文そのものは専用ログに追記する(配置は次段落)。**監査記録に失敗したターンは拒否する**(承認が「殻」だけで、以後の内容は監査だけが唯一の裏付けになるため、通常のログ書き込み失敗より厳しく扱う)。現在の `AuditLog::record` はエラーを握り込んで `()` を返す(`src/audit.rs`)ため、コンテキストのターン監査には `Result` を返す別経路を用意する(ADR-0014 §9 の `/write` 監査と同じ要件)。
 - **コンテキストのログは `jobs/` を流用しない**。`jobs/<job-id>/` は `JobRegistry` が `meta.json` を持つディレクトリとして管理し、`prune()` もそれを前提に動く。コンテキストは `meta.json` を持たないため、`jobs/<context-id>/` に置いても `JobRegistry::open`(起動時の読み込み)はそれを素通りし、`prune()` も対象として認識せず、ターン本文(`turns.jsonl`)が無制限に積み上がる。コンテキスト専用のルート(例: `dirs_next::data_local_dir().join("clipwire").join("contexts").join(<context-id>)`。`%LOCALAPPDATA%` 側。ジョブログや自己更新バイナリと同じ「ローミングしなくてよい」側に置く。`%APPDATA%` 側の `clipwire_config_dir()` はターゲット定義・承認レコードという小さく重要な状態専用に保つ)を設け、独自の保持件数・サイズ上限で刈り込む。
-- **`Concurrency::Reject` との関係(実装場所は exec ディスパッチ層に新設する。T9.3 PoC で判明)**: `Concurrency::Reject` は `JobRegistry::start`(`src/jobs.rs:176`)の内部で、`JobRegistry` 自身が持つ `jobs` マップを線形走査して実装されており、ロックも `JobRegistry` 内部止まりで他レジストリから見えない。`PersistentContextRegistry` を `JobRegistry` と独立にする設計のままでは、どちらのレジストリの内部に相互排他を実装しても、もう一方からは見えない。そこで `src/server/exec.rs` の exec ディスパッチハンドラ(ターゲット名を確定させた直後、`JobRegistry::start` か `PersistentContextRegistry` の起動/ターン処理に分岐する手前)に、ターゲット名をキーにした共有の「使用中」集合(例: `Arc<Mutex<HashSet<String>>>`)を新設し、両方の経路がそこを確認・登録してから各自のレジストリに委譲する。既存の `JobRegistry` 内部には手を入れない。
+- **`persistent: true` のターゲットは通常の単発 `exec` では起動できない**(改訂3で追加。T9.3 PoC 項目4 の議論を踏まえた前提の確定): ラッパーは stdin の `readline()` で待ち受ける設計のため、`Runner::spawn` の `Stdio::null()` で単発起動しても EOF を即座に受け取って終了するだけで意味がない。`into_exec`(`src/config.rs`)の段階で `persistent: true` の `script_file` を単発 `exec` 経路に渡すことを禁止する。これにより、1 つのターゲット名は常に「通常の `exec`/`steps`/`script_file`」か「永続コンテキスト」のどちらか一方の経路でしか動かなくなり、相互排他が必要な場面は「同名ターゲットに対する永続コンテキストの多重起動」と「実行中の通常ジョブが残っている間に同名ターゲットが永続定義で再承認された直後の起動」に縮小される。
+- **相互排他の実装場所: 永続コンテキストが `JobRegistry` に「席」を取る**(改訂3。シェアされた `HashSet` を exec ディスパッチ層に新設する改訂2の案を撤回): `Concurrency::Reject` は `JobRegistry::start`(`src/jobs.rs:195`)の内部で、`JobRegistry` 自身が持つ `jobs` マップを線形走査して実装されている。改訂2の「共有 `HashSet`」案は、(1) `JobRegistry::open` が起動時に復元する `Orphaned`(再起動前に生きていた子)の状態が見えず、サーバ再起動直後に通常 `exec` 側は弾かれるのに永続コンテキスト側は素通りする非対称が生じる、(2) `finish`/`kill`/`Lost` 遷移・detach(即座に 202 を返す)・panic など `JobRegistry` のライフサイクル全経路に解放フックを重複して持つ必要があり、片方だけ更新されると集合がリークしたまま 409 を返し続けるか、相互排他そのものが壊れる、という二重管理の問題を抱える(Opus レビューで指摘)。代わりに、永続コンテキストの起動時に `JobRegistry::start(target, hash, requester, Concurrency::Reject)` を呼んで通常の job と同じ「席」を取り、コンテキストが生きている間はその job を `Running` のまま保持し、終了時に `finish`(または kill 経路)で閉じる。ターンの入出力(stdin/stdout とのやり取り)は `JobHandle::wait` を使わず `PersistentContextRegistry` が持つ。これにより Reject 判定・`Orphaned` 復元(`set_child` で `ChildIdentity` を記録すれば再起動後も検出される)・`/jobs` 一覧での可視性・`prune` がすべて既存実装のまま効き、新しい共有集合は不要になる。`persistent: true` のターゲットは、保存されている `concurrency` フィールドの値に関わらず常に `Concurrency::Reject` 相当として扱う(1 ターゲットに対し同時に複数の永続コンテキストを許す使い方は想定しないため、`Concurrency::Allow` との組み合わせを個別に定義する必要がない)。
 
 ### 4. README 脅威モデルへの反映
 
@@ -58,19 +59,30 @@ pad2py 自身が「余裕があれば」「急ぎではない」と位置づけ�
 
 ## 実装前に PoC で確認する項目(T9.3、2026-11-03 完了。結果は `docs/tasks/evidence/t9.3-persistent-context-poc.md`)
 
-1. **確認済み**: ラッパー内での stdout/stderr 捕捉(§2)が、pywinauto のようにネイティブ拡張やサブプロセスを経由するライブラリの出力も含めて漏れなく拾えること。fd レベルの `dup2` 退避で確認(print/サブプロセス継承/生の `os.write(1, ...)` のすべてを捕捉)。ただし出力順序の保証はない。
-2. **確認済み**: `Stdio::piped()` の子に対する 1 ターンのフレーミング(改行区切り JSON)が安定して届くこと(200KB 超の出力・50 ターン連続送信・ターンを跨いだ状態保持で確認。Linux で確認、Windows は CI で確認)。
-3. **ブロッキングな発見**: アイドルタイムアウト・絶対寿命でプロセスを終了させる際の Job Object との関係 — 比較対象の Windows Job Object 統合(T4.4)自体が未実装(`src/runner/windows.rs` はスタブ)であることが判明。本 ADR は Depends on に T4.4 を追加した(§3)。
-4. **判明**: `Concurrency::Reject` と永続コンテキストの相互排他は、どちらのレジストリの内部にも実装できず、exec ディスパッチ層(`src/server/exec.rs`)に新設する共有集合が必要(§3)。
-5. **設計変更が必要と判明**: 毎ターンのハッシュ再検証のコストは、sha256 や disk I/O ではなく `registered.toml`(1571 エントリ規模)の `toml::from_str` 全体再パースが支配的で、素朴な実装では 1 ターンあたり約 300ms かかる。mtime ゲート(§3)で対話的応答性を確保する設計に変更した。
+1. **確認済み**: ラッパー内での stdout/stderr 捕捉(§2)が、pywinauto のようにネイティブ拡張やサブプロセスを経由するライブラリの出力も含めて漏れなく拾えること。fd レベルの `dup2` 退避で確認(print/サブプロセス継承/生の `os.write(1, ...)` のすべてを捕捉)。ただし出力順序の保証はない。プロトコル応答を fd 1 に相乗りさせない設計(§2 改訂3)で、ターン外の fd 1 書き込みによるフレーミング破壊のリスクも塞いだ。
+2. **確認済み**: `Stdio::piped()` の子に対する 1 ターンのフレーミング(改行区切り JSON)が安定して届くこと(200KB 超の出力・50 ターン連続送信・ターンを跨いだ状態保持を Linux で確認、16 バイト〜8 MiB の単一行ペイロードを実機 `dragonflyg4` で直接確認、同一テストを Windows CI(run 41751250415・41762228257)でも確認)。
+3. **判明(改訂3で結論変更)**: 比較対象の Windows Job Object 統合(T4.4)自体が未実装(`src/runner/windows.rs` はスタブ)であり、アイドルタイムアウト・絶対寿命での終了は孫プロセスを道連れにしない。ただしこれは T5.1/T6.2 が既に抱えて出荷している既知の制約と同種であり、Job Object は pywinauto の対象アプリに対して必要条件でも十分条件でもないため、T4.4 を本実装の前提にはしない(§3)。
+4. **判明(改訂3で結論変更)**: `Concurrency::Reject` と永続コンテキストの相互排他は、exec ディスパッチ層への共有集合ではなく、永続コンテキストが `JobRegistry::start` で通常の job と同じ「席」を取る形で実装する。これには前提として `persistent: true` ターゲットの単発 `exec` を禁止する必要がある(§3)。
+5. **release ビルドでの再測定が必要と判明(改訂3)**: デバッグビルドでの実測(1 ターンあたり約 300ms、`toml::from_str` が支配的)は opt-level 0 の値であり、本番の `opt-level=3, lto=true` でのコストは別。`docs/tasks/evidence/t9.3-persistent-context-poc.md` 項目5 改訂3 に release 実測を追記。また、承認完全性の検証(`approved/<hash>.json` 側)は mtime ゲートの対象から外し、毎ターン必ず行う(§3)。
 
 ## Alternatives considered
 
 - **「Rhai `script` と同じ信頼モデル」という当初の説明**: Opus レビューで、Rhai `script` には呼び出し側からのコード入力チャネルが存在しないため等価ではないと指摘され撤回した(Context 参照)。
 - **`JobStatus`/`JobRegistry` を拡張して「生存中・次のターン待ち」状態を表現する**: `Runner::spawn` の `Stdio::null()` 前提、`JobHandle::wait`/`wait_cancelable` の「プロセス終了を待つ」設計が、ターンごとに戻ってくる非終了プロセスとかみ合わない。別レジストリにする方が既存のジョブの一回限り実行という不変条件を壊さない。
 - **ターンごとに個別ハッシュ承認を要求する**: 対話的な制御フロー(FSM・コルーチン的な実行)という要望の本質(呼び出し側が実行時に次の一手を決める)と矛盾する。要求するなら永続コンテキスト自体を提供する意味がなくなる。
-- **(改訂2で追加)Windows の終了を T4.4 待ちにせず、ラッパー自身が子孫 PID を自己追跡して kill する**: T4.4 と独立に進められる利点はあるが、ラッパー(Python)側に子孫追跡という追加の責務を持たせることになり、pywinauto が起動する子孫をラッパーが本当に全て把握できるかという新しい不確実性を持ち込む。T4.4 自体は Runner 全体(通常の `exec`/`steps` にも効く、`docs/tasks/04-runner.md` T4.4)の基盤改善であり、永続コンテキスト専用に別解を持つより、T4.4 を前提にする方が筋が良いと判断し既定案を (a) とした。
+- **(改訂2で追加、改訂3で撤回)本実装の着手を T4.4(Job Object)の完了まで待つ**: 改訂2はこれを既定方針としたが、Opus レビューで (1) 同じ制約を抱える T5.1/T6.2 が既に出荷済みであることと一貫しない、(2) Job Object は pywinauto の対象アプリに対して必要条件でも十分条件でもなく、`KILL_ON_JOB_CLOSE` には操作対象アプリを落とす副作用もある、と指摘され撤回した(§3)。
+- **(改訂2で追加、改訂3でも不採用のまま)ラッパー自身が子孫 PID を自己追跡して kill する**: T4.4 と独立に進められる利点はあるが、ラッパー(Python)側に子孫追跡という追加の責務を持たせることになり、pywinauto が起動する子孫(既に起動済みのアプリ、COM 経由のプロセスなど)をラッパーが全て把握できるとは限らず、Job Object 案と同様に不完全。追加の複雑さに見合わないと判断し、既定案は「直接の子 kill + 既知の制約として明記」(§3)とした。
+- **(改訂2で追加、改訂3で撤回)相互排他をシェアされた `HashSet` として exec ディスパッチ層に新設する**: `JobRegistry` の `Orphaned` 復元状態が見えず、ライフサイクル全経路(finish/kill/lost/panic/detach)への解放フックの重複が必要になる二重管理になることが Opus レビューで指摘され撤回した。永続コンテキストが `JobRegistry::start` で席を取る方式(§3)に変更した。
 
 ## Status
 
-PoC(T9.3)は完了した(`docs/tasks/evidence/t9.3-persistent-context-poc.md`)。項目1・2は設計方針どおりに動くことを確認した。項目3(Job Object)・項目5(再検証コスト)は、当初の Decision をそのまま実装すると成立しない/応答性を損なうことが判明したため、本 ADR 改訂2で Decision 自体を修正した(§3 の mtime ゲート、T4.4 への依存追加)。したがって Accepted へは進めず、Proposed のまま: 本実装の着手には、改訂2の Decision で前提とした **T4.4(Windows Job Object)の完了**をさらに待つ。T4.4 完了後、ADR-0012 の `script_file`/`persistent` フィールドも揃った時点で Accepted に進める。
+PoC(T9.3)は完了した(`docs/tasks/evidence/t9.3-persistent-context-poc.md`)。項目1・2は設計方針どおりに動くことを実機・Windows CI で確認した。項目3・4・5 は、改訂2の Decision をそのまま実装すると成立しない、または前提が誤っていたことが判明し、本 ADR 改訂3で Decision を再修正した(§3: mtime ゲートの対象を `registered.toml` 側のみに限定、Windows の終了を T4.4 待ちにしない、相互排他を `JobRegistry` の「席」で実現)。
+
+**Proposed のまま Accepted に進めない理由は「T4.4 待ち」ではなく、以下の未決の設計論点が残っているため**(依存タスクの完了待ちと設計の未確定は別の理由であり、混同しない):
+
+1. 項目5の release ビルドでの実測(`docs/tasks/evidence/t9.3-persistent-context-poc.md` に追記予定)。結果次第で mtime ゲート自体の必要性が変わる。
+2. 絶対寿命の具体的な値(§3 で「要検討」のまま)。
+3. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` が pywinauto の操作対象アプリを落とす可能性について、pad2py の実際の運用で許容できるかの確認(§3)。T4.4 自体の実装は別タスク(`docs/tasks/04-runner.md` T4.4)で進めてよく、本 ADR の Accepted 条件ではない。
+4. `Store::verified_target` への mtime ゲート実装(§3)の具体的な `(identity, size, mtime)` 比較を、Windows の `GetFileInformationByHandle`(`nFileIndexHigh/Low`)を使って実装する詳細(std の安定 API ではないため `windows` クレート経由になる)。
+
+これらが解消された時点で Accepted に進める。ADR-0012 の `script_file`/`persistent` フィールドは本 ADR 自身が定義するものであり(ADR-0012 には存在しない)、Accepted の前提として参照しない(改訂2の記述は循環していたため訂正)。
