@@ -1190,7 +1190,14 @@ mod tests {
     /// `registered.toml` 全体を再パースし、`.store.lock` をロックする
     /// (register と同じ経路)ため、対話的なターンの応答性に効くのは
     /// sha256 そのものではなくこちらだと予想して検証する。
+    ///
+    /// `#[ignore]`: 20 回 x 約 300ms の CPU 束縛な `toml::from_str` を
+    /// 連続実行するため、デフォルトの `cargo test` 並列実行下では他の
+    /// タイミング依存テスト(`ac_t6_1_5_*`・`ac_t4_5_6_*` 等)を不安定化
+    /// させることが実測で確認された(CI run 41751250415 で再現)。
+    /// 通常の CI では実行せず、`cargo test -- --ignored` で単独実行する。
     #[test]
+    #[ignore = "CPU束縛な連続ベンチマークで他のタイミング依存テストを不安定化させる。単独実行用"]
     fn poc_t9_3_item5_verified_target_cost_against_1571_entries() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
