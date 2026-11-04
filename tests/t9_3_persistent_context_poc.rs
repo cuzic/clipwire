@@ -29,7 +29,7 @@ fn find_python() -> Option<&'static str> {
 
 struct Wrapper {
     child: Child,
-    stdin: Option<ChildStdin>,
+    stdin: ChildStdin,
     responses: std::sync::mpsc::Receiver<String>,
 }
 
@@ -39,8 +39,34 @@ impl Wrapper {
             env!("CARGO_MANIFEST_DIR"),
             "/docs/tasks/evidence/poc/t9.3/wrapper.py"
         );
-        let mut child = Command::new(python)
-            .arg(wrapper_path)
+        let mut cmd = Command::new(python);
+        cmd.arg(wrapper_path);
+        Self::spawn_with_command(cmd)
+    }
+
+    /// Spawns wrapper.py behind an intermediate Python "stub" process that
+    /// does nothing but launch it and wait, inheriting this process's
+    /// piped stdin/stdout/stderr through to wrapper.py unchanged. This
+    /// makes the stub (not this test process) wrapper.py's real OS-level
+    /// parent, so a test can kill the stub — simulating "the real server
+    /// process died" — while this test process keeps running to observe
+    /// the result. That isn't possible when this test process is
+    /// wrapper.py's direct parent, since killing it would end the test
+    /// itself.
+    fn spawn_behind_stub(python: &str) -> Self {
+        let wrapper_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/tasks/evidence/poc/t9.3/wrapper.py"
+        );
+        let mut cmd = Command::new(python);
+        cmd.arg("-c").arg(format!(
+            "import subprocess, sys; p = subprocess.Popen([sys.executable, {wrapper_path:?}]); p.wait()"
+        ));
+        Self::spawn_with_command(cmd)
+    }
+
+    fn spawn_with_command(mut cmd: Command) -> Self {
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -71,7 +97,7 @@ impl Wrapper {
 
         Self {
             child,
-            stdin: Some(stdin),
+            stdin,
             responses: rx,
         }
     }
@@ -79,10 +105,9 @@ impl Wrapper {
     fn send_code(&mut self, code: &str) {
         let request = serde_json::json!({ "code": code });
         let line = serde_json::to_string(&request).unwrap();
-        let stdin = self.stdin.as_mut().expect("stdin not closed");
-        stdin.write_all(line.as_bytes()).unwrap();
-        stdin.write_all(b"\n").unwrap();
-        stdin.flush().unwrap();
+        self.stdin.write_all(line.as_bytes()).unwrap();
+        self.stdin.write_all(b"\n").unwrap();
+        self.stdin.flush().unwrap();
     }
 
     fn turn(&mut self, code: &str) -> serde_json::Value {
@@ -94,14 +119,6 @@ impl Wrapper {
         serde_json::from_str(&response).unwrap_or_else(|error| {
             panic!("response was not a single JSON line: {error}: {response:?}")
         })
-    }
-
-    /// Drops the child's stdin handle, delivering EOF on its read end —
-    /// simulates the server process (and so the pipe) going away without
-    /// killing the wrapper directly, to test that the wrapper notices on
-    /// its own (ADR-0013 §3's EOF requirement).
-    fn close_stdin(&mut self) {
-        self.stdin = None;
     }
 }
 
@@ -165,18 +182,25 @@ print("from_stderr", file=sys.stderr)
 }
 
 /// レビューで判明した不備の回帰テスト: ターンがハング中(ここでは長い
-/// sleep で代用)でも、stdin への EOF(サーバプロセスの終了を模する)を
-/// 別スレッドで検知して速やかに終了すること。当初の実装は stdin の読み
-/// 取りをメインスレッド(ターン実行スレッドそのもの)で行っていたため、
-/// ハング中のターンは EOF に気づけず、サーバ再起動後も `JobRegistry` の
-/// 「席」を握り続けてしまう(ADR-0013 §3 改訂3 で要件化)。
+/// sleep で代用)でも、親プロセス(サーバ)が死んだことを別スレッドで
+/// 検知して速やかに終了すること。当初は stdin の EOF をトリガにしてい
+/// たが、別スレッドが stdin をブロッキング読み取りしている状態で
+/// ターン内から subprocess を起動すると Windows 実機 CI だけで必ず
+/// ハングすることが判明したため、stdin を読まない「親 PID の生存を
+/// sleep ベースでポーリングする」方式に変更した(ADR-0013 §2 改訂6、
+/// T9.3 evidence 項目1 続き参照)。
 #[test]
 fn poc_eof_during_a_hung_turn_still_exits_promptly() {
     let Some(python) = find_python() else {
         eprintln!("skipping: no python3/python interpreter on PATH");
         return;
     };
-    let mut wrapper = Wrapper::spawn(python);
+    // wrapper.py detects "the server died" by polling its real OS parent's
+    // liveness, not by reading stdin — so this test needs wrapper.py's
+    // real parent to be something other than this test process itself
+    // (which must stay alive to observe the result). `spawn_behind_stub`
+    // interposes a throwaway Python process for exactly this purpose.
+    let mut wrapper = Wrapper::spawn_behind_stub(python);
     let marker = std::env::temp_dir().join(format!("t93-entering-sleep-{}", std::process::id()));
     let _ = std::fs::remove_file(&marker);
 
@@ -184,7 +208,7 @@ fn poc_eof_during_a_hung_turn_still_exits_promptly() {
     // pywinauto call stuck on a modal dialog). Don't wait for its response.
     // `time.sleep` releases the GIL, so the reader thread can still run
     // during it — this test covers exactly that case, not a GIL-holding
-    // native call (ADR-0013 Status 2's remaining, narrower limitation).
+    // native call (ADR-0013 Consequences' remaining, narrower limitation).
     // A turn's own stdout/stderr are captured into its eventual JSON
     // response rather than relayed live, so a marker file (not a print) is
     // how the turn signals "I am now inside the sleep" to the test.
@@ -197,18 +221,32 @@ fn poc_eof_during_a_hung_turn_still_exits_promptly() {
     // a fixed delay.
     wait_for_file(&marker, std::time::Duration::from_secs(5));
     let _ = std::fs::remove_file(&marker);
-    wrapper.close_stdin();
+    // Kill the stub (wrapper.py's real OS parent), simulating the server
+    // process dying, without touching this test process (wrapper.py's
+    // *grandparent*, which must stay alive to observe the result). Also
+    // reap it (wait()) — on Unix, an unreaped killed child stays a zombie,
+    // and a zombie's PID still answers `kill(pid, 0)` as "alive", which
+    // would stop wrapper.py's liveness poll from ever seeing it as gone.
+    wrapper.child.kill().expect("kill the stub process");
+    wrapper.child.wait().expect("reap the stub process");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if let Ok(Some(_status)) = wrapper.child.try_wait() {
-            return; // exited on its own well before the 30s sleep would finish.
+        // wrapper.py closing its last handle to the stdout pipe (on exit)
+        // is what disconnects this channel — there is no direct Child
+        // handle to wrapper.py itself to try_wait() on, since the stub
+        // stands between it and this test process.
+        match wrapper
+            .responses
+            .recv_timeout(std::time::Duration::from_millis(50))
+        {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            _ => {}
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "wrapper did not exit within 5s of stdin EOF despite a hung turn"
+            "wrapper did not exit within 5s of its parent dying despite a hung turn"
         );
-        thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 

@@ -24,21 +24,36 @@ fd 1 の捨て先は fd 2(stderr リレー)への dup2 ではなく専用の dev
 なら、devnull ではなく診断用の別ファイル/パイプへ向けることを検討する
 (stderr との別名付けは避ける)。
 
-stdin の読み取りは専用スレッドで行い、EOF を検知したら、メインスレッドが
-ターンの実行中でハングしていても構わず `os._exit()` で即座に終了する。
-サーバプロセスが終了すれば stdin は EOF になる(ADR-0013 §3)。ターン実行
-スレッドだけが stdin を読む設計だと、ターンがハング中(pywinauto のモー
-ダルダイアログ待ち等)は EOF に気づけず、サーバ再起動後も `JobRegistry`
-の「席」を握ったまま残ってしまう。
+サーバプロセスの生存監視は、stdin の EOF ではなく**親プロセス
+(サーバ)の PID が生きているかの定期ポーリング**で行う(改訂6。
+下記参照)。別スレッドが 0.2 秒おきに親 PID の生存を確認し、消えていたら
+メインスレッドがターンの実行中でハングしていても構わず `os._exit()` で
+即座に終了する。
+
+【重要な設計変更の経緯】当初は stdin の読み取りを専用スレッドで
+ブロッキングに行い、EOF(読み取り 0 バイト)を終了のトリガにしていた。
+これは Linux では問題なく動作し、ローカルでのテストも全て通ったが、
+**Windows 実機 CI でだけ、ターン内で `subprocess.run()`/`subprocess.Popen()`
+を呼ぶと必ずハングする**ことが判明した(T9.3 evidence 項目1 続き)。
+fd 1/fd 2 側の実装(別名付け先・devnull化・set_inheritable)や stdin の
+読み取り方法(`sys.stdin` 経由 / `os.read()` 直接)を何通り試しても
+解消せず、スレッド自体を無効化すると(EOF 検知の要件を諦めれば)初めて
+解消したことから、**「別スレッドが stdin へのブロッキング読み取りで
+待機している状態で、別のスレッドから `subprocess` を起動する」という
+組み合わせ自体が Windows で問題を起こす**と断定した(API レベルの
+正確な機序は特定できていない)。
+そこで、終了検知の手段を「stdin を読む」ことから切り離し、親 PID の
+生存を sleep ベースでポーリングする方式に変更した。`time.sleep()` は
+ブロッキング I/O ではなく GIL も解放するため、同様の問題を起こさない
+(回帰テストで確認済み)。
 """
-import contextlib
-import io
+import ctypes
 import json
 import os
-import queue
 import sys
 import tempfile
 import threading
+import time
 import traceback
 
 _PROTOCOL_STDOUT_FD = os.dup(1)
@@ -51,6 +66,35 @@ os.set_inheritable(_PROTOCOL_STDOUT_FD, False)
 _idle_sink_fd = os.open(os.devnull, os.O_WRONLY)
 os.dup2(_idle_sink_fd, 1)
 os.close(_idle_sink_fd)
+
+
+def _parent_alive(pid):
+    """Checks whether process `pid` is still running. Caveat: PID reuse by
+    the OS after the original process exits can cause a false "alive"
+    result if checked long after exit; acceptable for a liveness poll on a
+    short interval, where a stale PID is checked again moments later."""
+    if os.name == "nt":
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            return exit_code.value == STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # exists, just not ours to signal
 
 
 def _drain(path):
@@ -113,17 +157,21 @@ def run_turn(code, shared_globals):
 
 
 def main():
-    # DIAGNOSTIC BUILD (temporary): the background stdin-reader thread is
-    # disabled to isolate whether its mere presence (concurrent with a
-    # subprocess spawned inside a turn) is what hangs on Windows CI. This
-    # intentionally drops the EOF-during-a-hung-turn requirement; do not
-    # ship this as is.
     shared_globals = {}
+    parent_pid = os.getppid()
+
+    def watch_parent():
+        while True:
+            time.sleep(0.2)
+            if not _parent_alive(parent_pid):
+                os._exit(0)
+
+    threading.Thread(target=watch_parent, daemon=True).start()
 
     while True:
         raw = sys.stdin.readline()
         if not raw:
-            break
+            break  # ordinary EOF: the server closed stdin while we were idle.
         line = raw.strip()
         if not line:
             continue
@@ -132,6 +180,7 @@ def main():
         response = {"stdout": stdout_text, "stderr": stderr_text, "error": error}
         payload = (json.dumps(response) + "\n").encode("utf-8")
         os.write(_PROTOCOL_STDOUT_FD, payload)
+    os._exit(0)
 
 
 if __name__ == "__main__":
