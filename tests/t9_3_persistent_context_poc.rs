@@ -29,7 +29,7 @@ fn find_python() -> Option<&'static str> {
 
 struct Wrapper {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     responses: std::sync::mpsc::Receiver<String>,
 }
 
@@ -97,7 +97,7 @@ impl Wrapper {
 
         Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             responses: rx,
         }
     }
@@ -105,9 +105,20 @@ impl Wrapper {
     fn send_code(&mut self, code: &str) {
         let request = serde_json::json!({ "code": code });
         let line = serde_json::to_string(&request).unwrap();
-        self.stdin.write_all(line.as_bytes()).unwrap();
-        self.stdin.write_all(b"\n").unwrap();
-        self.stdin.flush().unwrap();
+        let stdin = self.stdin.as_mut().expect("stdin not closed");
+        stdin.write_all(line.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    /// Drops this test process's handle to wrapper.py's stdin pipe,
+    /// delivering EOF on its read end. Since only the process holding the
+    /// pipe's *write* end matters for EOF (not however many processes sit
+    /// between it and wrapper.py on the read side), this correctly
+    /// simulates "the server died" regardless of whether wrapper.py was
+    /// spawned directly or behind a relay (`spawn_behind_stub`).
+    fn close_stdin(&mut self) {
+        self.stdin = None;
     }
 
     fn turn(&mut self, code: &str) -> serde_json::Value {
@@ -182,25 +193,34 @@ print("from_stderr", file=sys.stderr)
 }
 
 /// レビューで判明した不備の回帰テスト: ターンがハング中(ここでは長い
-/// sleep で代用)でも、親プロセス(サーバ)が死んだことを別スレッドで
-/// 検知して速やかに終了すること。当初は stdin の EOF をトリガにしてい
-/// たが、別スレッドが stdin をブロッキング読み取りしている状態で
-/// ターン内から subprocess を起動すると Windows 実機 CI だけで必ず
-/// ハングすることが判明したため、stdin を読まない「親 PID の生存を
-/// sleep ベースでポーリングする」方式に変更した(ADR-0013 §2 改訂6、
-/// T9.3 evidence 項目1 続き参照)。
+/// sleep で代用)でも、stdin の EOF(サーバプロセスの終了を模する)を
+/// 別スレッドで検知して速やかに終了すること。
+///
+/// この検知方式は改訂6で一度「親 PID の生存ポーリング」に置き換えられた
+/// (別スレッドが stdin をブロッキング読み取りしている状態でターン内から
+/// subprocess を起動すると Windows 実機 CI だけで必ずハングすると判明した
+///ため)。しかし `script_file` の `interpreter` が venv のリダイレクタ・
+/// `uv run`・py ランチャーのような中継プロセスを経由する構成では、
+/// ラッパーの実の親はサーバではなく中継プロセスになり、サーバが死んでも
+/// 中継プロセスは死なないため `getppid()` ベースの監視が機能しないと
+/// 2回目のレビューで指摘された。
+///
+/// 改訂7で、ハングの原因は「stdin のパイプ自体」ではなく「fd 0 という
+/// **番号**を、別スレッドがブロッキング読み取り中に、別のスレッドで
+/// `subprocess` を起動すると(stdin 未指定時に CPython が fd 0 に触れる
+/// ため)Windows で衝突する」ことだと特定した。fd 0 の番号自体を恒久的に
+/// devnull へ向け、実際のプロトコル入力は fd 0 とは独立した
+/// non-inheritable な fd から読むようにしたところハングが解消したため、
+/// 本来の stdin EOF 方式に戻した。EOF はパイプの**書き込み側**を持つ
+/// プロセス(サーバ)が死ねば、中継プロセスが何段挟まっていても確実に
+/// 起きるため、中継プロセスの問題も同時に解決する(次のテスト参照)。
 #[test]
 fn poc_eof_during_a_hung_turn_still_exits_promptly() {
     let Some(python) = find_python() else {
         eprintln!("skipping: no python3/python interpreter on PATH");
         return;
     };
-    // wrapper.py detects "the server died" by polling its real OS parent's
-    // liveness, not by reading stdin — so this test needs wrapper.py's
-    // real parent to be something other than this test process itself
-    // (which must stay alive to observe the result). `spawn_behind_stub`
-    // interposes a throwaway Python process for exactly this purpose.
-    let mut wrapper = Wrapper::spawn_behind_stub(python);
+    let mut wrapper = Wrapper::spawn(python);
     let marker = std::env::temp_dir().join(format!("t93-entering-sleep-{}", std::process::id()));
     let _ = std::fs::remove_file(&marker);
 
@@ -221,32 +241,95 @@ fn poc_eof_during_a_hung_turn_still_exits_promptly() {
     // a fixed delay.
     wait_for_file(&marker, std::time::Duration::from_secs(5));
     let _ = std::fs::remove_file(&marker);
-    // Kill the stub (wrapper.py's real OS parent), simulating the server
-    // process dying, without touching this test process (wrapper.py's
-    // *grandparent*, which must stay alive to observe the result). Also
-    // reap it (wait()) — on Unix, an unreaped killed child stays a zombie,
-    // and a zombie's PID still answers `kill(pid, 0)` as "alive", which
-    // would stop wrapper.py's liveness poll from ever seeing it as gone.
-    wrapper.child.kill().expect("kill the stub process");
-    wrapper.child.wait().expect("reap the stub process");
+    wrapper.close_stdin();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        // wrapper.py closing its last handle to the stdout pipe (on exit)
-        // is what disconnects this channel — there is no direct Child
-        // handle to wrapper.py itself to try_wait() on, since the stub
-        // stands between it and this test process.
+        if let Ok(Some(_status)) = wrapper.child.try_wait() {
+            return; // exited on its own well before the 30s sleep would finish.
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "wrapper did not exit within 5s of stdin EOF despite a hung turn"
+        );
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// レビューで判明した不備の回帰テスト: `script_file` の `interpreter` が
+/// venv のリダイレクタ・`uv run`・py ランチャーのような中継プロセスを
+/// 経由していても、サーバが死んだ(= このテストプロセスが stdin の
+/// パイプを閉じた)ことを検知できること。中継プロセス(スタブ)自体は
+/// **生かしたまま**にする——EOF はパイプの書き込み側を持つプロセスにしか
+/// 依存しないため、中継プロセスが生きていても検知できるはずだが、
+/// `getppid()` ベースの監視(改訂6で一度採用し、改訂7で撤回)では中継
+/// プロセスの生存が検知を妨げてしまっていた。
+#[test]
+fn poc_eof_propagates_through_an_intermediate_relay_process() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping: no python3/python interpreter on PATH");
+        return;
+    };
+    let mut wrapper = Wrapper::spawn_behind_stub(python);
+    let r1 = wrapper.turn("print('alive')");
+    assert_eq!(r1["stdout"].as_str().unwrap().trim(), "alive");
+
+    // Close only this test process's handle to the pipe. The stub (relay)
+    // process is deliberately left running — it still holds its own
+    // inherited handle to the same pipe, so if EOF depended on relay-side
+    // closure too, this would never complete.
+    wrapper.close_stdin();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
         if let Err(std::sync::mpsc::RecvTimeoutError::Disconnected) = wrapper
             .responses
             .recv_timeout(std::time::Duration::from_millis(50))
         {
-            return;
+            return; // wrapper.py exited on its own, independent of the relay.
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "wrapper did not exit within 5s of its parent dying despite a hung turn"
+            "wrapper did not exit within 5s of stdin EOF despite a live relay process"
         );
     }
+}
+
+/// レビューで判明した不備の回帰テスト: ターンの**外**(メインスレッドが
+/// 次のターンを待って stdin を読んでいる間)で、以前のターンが残した
+/// バックグラウンドスレッドが `subprocess` を起動しても、次のターンの
+/// 応答が(ハングせず)速やかに返ること。切り分けで特定した「別スレッドが
+/// stdin をブロッキング読み取り中に、別のスレッドから `subprocess` を
+/// 起動する」という条件は、ターンの中(メインスレッドがターン実行中)
+/// だけでなく、ターンの外(メインスレッドが次の行を待っている間)でも
+/// 同じ組み合わせになりうる、という指摘を受けて追加。
+#[test]
+fn poc_subprocess_from_background_thread_between_turns_does_not_hang() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping: no python3/python interpreter on PATH");
+        return;
+    };
+    let mut wrapper = Wrapper::spawn(python);
+
+    // Turn 1 starts a background thread and returns immediately — the
+    // thread's subprocess call happens *after* this turn's response is
+    // already on the wire, i.e. while the main thread is back to blocking
+    // on the next line of stdin.
+    let code = r#"
+import subprocess, sys, threading
+def _late_subprocess():
+    subprocess.run([sys.executable, "-c", "print('from_background_subprocess')"], check=True)
+threading.Thread(target=_late_subprocess, daemon=True).start()
+print("turn1-done")
+"#;
+    let r1 = wrapper.turn(code);
+    assert_eq!(r1["stdout"].as_str().unwrap().trim(), "turn1-done");
+
+    // If the background thread's subprocess call blocks the stdin reader
+    // thread (or vice versa), this next turn would hang; `turn()` already
+    // enforces a 10s bound via its own recv_timeout.
+    let r2 = wrapper.turn("print('turn2-done')");
+    assert_eq!(r2["stdout"].as_str().unwrap().trim(), "turn2-done");
 }
 
 /// レビューで判明した不備の回帰テスト: ターン中に起動したバックグラウン

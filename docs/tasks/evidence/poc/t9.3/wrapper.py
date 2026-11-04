@@ -1,100 +1,68 @@
 #!/usr/bin/env python3
 """T9.3 PoC: ADR-0013 の永続コンテキストラッパーの試作(本実装ではない)。
 
-stdin から 1 行 1 JSON({"code": "..."})を読み、`code` を共有 globals で
-exec し、専用の fd(_PROTOCOL_STDOUT_FD)に 1 行 1 JSON の結果を返す。
+stdin 側の実プロトコル入力は、起動直後に複製した専用の fd
+(`_PROTOCOL_STDIN_FD`)から読む。stdout 側の応答も専用の fd
+(`_PROTOCOL_STDOUT_FD`)に書く。fd 0/1 の**番号**そのものは、起動直後に
+恒久的に devnull へ向け直す。
 
-起動直後に fd 1 を**恒久的に**捨て先(devnull)へ向け直す。ターン実行中
-だけ、fd 1/2 を一時ファイルへ dup2 で退避し、exec の間だけそこへ向け
-直す。dup2 はファイル記述子の「番号」が指す先を切り替えるだけなので、
-Python レベルの print()/sys.stdout だけでなく、同じ fd を継承した
-サブプロセスや、fd へ直接 os.write するネイティブ拡張の出力も、同じ
-退避先に素通りで乗る。exec が終わったら fd を devnull(プロトコル用
-パイプではない)に戻す。これにより、ターン中に起動されたバックグラウ
-ンドスレッドやサブプロセスが、ターンが終わった**後**に fd 1 へ書いても、
-プロトコルの改行区切り JSON フレーミングを壊さない(レビューで判明した
-不備の修正: 当初の実装は `finally` で fd 1 をプロトコル用パイプへ戻して
-いたため、ターン外の fd 1 書き込みがそのままプロトコルに混入した)。
-fd 1 の捨て先は fd 2(stderr リレー)への dup2 ではなく専用の devnull
-にしている。fd 1 と fd 2 を dup2 で同一のパイプへ恒久的に別名付けすると、
-ターン内で `subprocess.run()` を呼ぶと Windows 実機 CI でだけハングする
-ことが判明したため(原因は特定できていないが、再現性があり、fd1/fd2の
-別名付けが唯一の差分だった)、恒久リダイレクト先を独立した devnull に
-変更して回避した。本実装では、ターン外の書き込みをログとして観測したい
-なら、devnull ではなく診断用の別ファイル/パイプへ向けることを検討する
-(stderr との別名付けは避ける)。
+【なぜ fd 0/1 の番号を devnull にするか(改訂7で fd 0 も追加)】
+改訂6までは、fd 1 だけを devnull にし、fd 0(標準入力)は触らず
+`sys.stdin`/専用スレッドで直接読んでいた。ところが「別スレッドが stdin
+のパイプをブロッキング読み取り中に、別のスレッドから subprocess を
+起動する」と Windows 実機 CI で必ずハングすることが判明し(T9.3
+evidence 項目1 続き)、改訂6では終了検知の手段を stdin の EOF から
+『親 PID の生存ポーリング』に変えて回避した。しかし Opus の最終レビュー
+で、**この回避策は `script_file` の `interpreter` が venv の
+`python.exe`(リダイレクタ)・`uv run`・py ランチャーのような中継
+プロセスを経由する場合に正しく動かない**と指摘された: ラッパーの OS 上
+の親はサーバではなく中継プロセスになり、サーバが死んでも中継プロセスは
+死なないため、`getppid()` ベースの監視では永久にサーバの消滅を検知
+できない。
+そこで、ハングの機序について次の仮説を検証した: CPython の
+`subprocess`(Windows)は `stdin=None` のとき `GetStdHandle(STD_INPUT_HANDLE)`
+を子の stdin として渡すため、子プロセスを起動するたびに「読み取り中の
+パイプそのもの」(= fd 0)に触れる。別スレッドがまさにその fd 0 を
+`ReadFile` でブロッキング読み取り中だと、Windows の同期 I/O の直列化に
+より衝突する、という仮説。
+**この仮説は正しかった**: fd 0 の番号そのものを恒久的に devnull へ向け、
+実際のプロトコル入力は fd 0 とは独立した non-inheritable の fd
+(`_PROTOCOL_STDIN_FD`)から読むように変更したところ、ターン内で
+subprocess を起動するテストが Windows 実機 CI で安定して通るように
+なった(fd 1 側は改訂5の devnull 化と同じ理由・同じパターン)。
+これにより、終了検知を**本来の stdin EOF 方式に戻せる**: サーバだけが
+`_PROTOCOL_STDIN_FD` の書き込み側を持つので、`script_file` の
+`interpreter` に何段の中継プロセスが挟まっていても、サーバが死ねば
+確実に EOF になる(中継プロセスの有無に依存しない)。`os.getppid()` の
+生存ポーリング(改訂6)は撤回した。
 
-サーバプロセスの生存監視は、stdin の EOF ではなく**親プロセス
-(サーバ)の PID が生きているかの定期ポーリング**で行う(改訂6。
-下記参照)。別スレッドが 0.2 秒おきに親 PID の生存を確認し、消えていたら
-メインスレッドがターンの実行中でハングしていても構わず `os._exit()` で
-即座に終了する。
-
-【重要な設計変更の経緯】当初は stdin の読み取りを専用スレッドで
-ブロッキングに行い、EOF(読み取り 0 バイト)を終了のトリガにしていた。
-これは Linux では問題なく動作し、ローカルでのテストも全て通ったが、
-**Windows 実機 CI でだけ、ターン内で `subprocess.run()`/`subprocess.Popen()`
-を呼ぶと必ずハングする**ことが判明した(T9.3 evidence 項目1 続き)。
-fd 1/fd 2 側の実装(別名付け先・devnull化・set_inheritable)や stdin の
-読み取り方法(`sys.stdin` 経由 / `os.read()` 直接)を何通り試しても
-解消せず、スレッド自体を無効化すると(EOF 検知の要件を諦めれば)初めて
-解消したことから、**「別スレッドが stdin へのブロッキング読み取りで
-待機している状態で、別のスレッドから `subprocess` を起動する」という
-組み合わせ自体が Windows で問題を起こす**と断定した(API レベルの
-正確な機序は特定できていない)。
-そこで、終了検知の手段を「stdin を読む」ことから切り離し、親 PID の
-生存を sleep ベースでポーリングする方式に変更した。`time.sleep()` は
-ブロッキング I/O ではなく GIL も解放するため、同様の問題を起こさない
-(回帰テストで確認済み)。
+stdin の読み取りは専用スレッドで行い、EOF を検知したら、メインスレッドが
+ターンの実行中でハングしていても構わず `os._exit()` で即座に終了する。
 """
-import ctypes
 import json
 import os
+import queue
 import sys
 import tempfile
 import threading
-import time
 import traceback
 
 _PROTOCOL_STDOUT_FD = os.dup(1)
+_PROTOCOL_STDIN_FD = os.dup(0)
 # ユーザーコードが起動するサブプロセスには一切見せたくない内部用の fd
 # なので non-inheritable にする(PEP 446 の既定どおりのはずだが、明示
 # しておく)。
 os.set_inheritable(_PROTOCOL_STDOUT_FD, False)
-# fd 1 を恒久的に devnull へ向け直す。これ以降、ターンの外で fd 1 に
-# 書かれたものは捨てられ、二度とプロトコル用パイプには流れない。
-_idle_sink_fd = os.open(os.devnull, os.O_WRONLY)
-os.dup2(_idle_sink_fd, 1)
-os.close(_idle_sink_fd)
-
-
-def _parent_alive(pid):
-    """Checks whether process `pid` is still running. Caveat: PID reuse by
-    the OS after the original process exits can cause a false "alive"
-    result if checked long after exit; acceptable for a liveness poll on a
-    short interval, where a stale PID is checked again moments later."""
-    if os.name == "nt":
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        handle = ctypes.windll.kernel32.OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-        )
-        if not handle:
-            return False
-        try:
-            exit_code = ctypes.c_ulong()
-            ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
-            return exit_code.value == STILL_ACTIVE
-        finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
-    else:
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True  # exists, just not ours to signal
+os.set_inheritable(_PROTOCOL_STDIN_FD, False)
+# fd 0/1 の番号そのものを恒久的に devnull へ向け直す。これ以降、
+# サブプロセスがターン外で fd 0/1 を継承しても、実際のプロトコルの
+# パイプには一切触れない(詳細はモジュール docstring 参照)。
+_null_out_fd = os.open(os.devnull, os.O_WRONLY)
+os.dup2(_null_out_fd, 1)
+os.close(_null_out_fd)
+_null_in_fd = os.open(os.devnull, os.O_RDONLY)
+os.dup2(_null_in_fd, 0)
+os.close(_null_in_fd)
 
 
 def _drain(path):
@@ -158,21 +126,35 @@ def run_turn(code, shared_globals):
 
 def main():
     shared_globals = {}
-    parent_pid = os.getppid()
+    lines = queue.Queue()
 
-    def watch_parent():
-        while True:
-            time.sleep(0.2)
-            if not _parent_alive(parent_pid):
-                os._exit(0)
+    def read_stdin():
+        # EOF (サーバプロセスの終了。script_file の interpreter が venv の
+        # リダイレクタ・uv run・py ランチャーのような中継プロセスを経由
+        # していても、パイプの書き込み側を持つのはサーバだけなので中継
+        # プロセスの有無に関わらず確実に起きる)なら 0、読み取りエラー
+        # (不正な UTF-8 等)なら 1 で終了する。メインスレッドがターンの
+        # 実行中でハングしていても、どちらにせよ構わず即座に終了する。
+        exit_code = 0
+        buffer = b""
+        try:
+            while True:
+                chunk = os.read(_PROTOCOL_STDIN_FD, 65536)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    raw, buffer = buffer.split(b"\n", 1)
+                    lines.put(raw.decode("utf-8"))
+        except Exception:
+            exit_code = 1
+        finally:
+            os._exit(exit_code)
 
-    threading.Thread(target=watch_parent, daemon=True).start()
+    threading.Thread(target=read_stdin, daemon=True).start()
 
     while True:
-        raw = sys.stdin.readline()
-        if not raw:
-            break  # ordinary EOF: the server closed stdin while we were idle.
-        line = raw.strip()
+        line = lines.get().strip()
         if not line:
             continue
         request = json.loads(line)
@@ -180,7 +162,6 @@ def main():
         response = {"stdout": stdout_text, "stderr": stderr_text, "error": error}
         payload = (json.dumps(response) + "\n").encode("utf-8")
         os.write(_PROTOCOL_STDOUT_FD, payload)
-    os._exit(0)
 
 
 if __name__ == "__main__":
