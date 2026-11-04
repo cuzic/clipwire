@@ -4,17 +4,25 @@
 stdin から 1 行 1 JSON({"code": "..."})を読み、`code` を共有 globals で
 exec し、専用の fd(_PROTOCOL_STDOUT_FD)に 1 行 1 JSON の結果を返す。
 
-起動直後に fd 1 を**恒久的に**ログ側(fd 2 と同じ送信先)へ向け直す。
-ターン実行中だけ、fd 1/2 を一時ファイルへ dup2 で退避し、exec の間だけ
-そこへ向け直す。dup2 はファイル記述子の「番号」が指す先を切り替える
-だけなので、Python レベルの print()/sys.stdout だけでなく、同じ fd を
-継承したサブプロセスや、fd へ直接 os.write するネイティブ拡張の出力も、
-同じ退避先に素通りで乗る。exec が終わったら fd をログ側(プロトコル用
+起動直後に fd 1 を**恒久的に**捨て先(devnull)へ向け直す。ターン実行中
+だけ、fd 1/2 を一時ファイルへ dup2 で退避し、exec の間だけそこへ向け
+直す。dup2 はファイル記述子の「番号」が指す先を切り替えるだけなので、
+Python レベルの print()/sys.stdout だけでなく、同じ fd を継承した
+サブプロセスや、fd へ直接 os.write するネイティブ拡張の出力も、同じ
+退避先に素通りで乗る。exec が終わったら fd を devnull(プロトコル用
 パイプではない)に戻す。これにより、ターン中に起動されたバックグラウ
 ンドスレッドやサブプロセスが、ターンが終わった**後**に fd 1 へ書いても、
 プロトコルの改行区切り JSON フレーミングを壊さない(レビューで判明した
 不備の修正: 当初の実装は `finally` で fd 1 をプロトコル用パイプへ戻して
 いたため、ターン外の fd 1 書き込みがそのままプロトコルに混入した)。
+fd 1 の捨て先は fd 2(stderr リレー)への dup2 ではなく専用の devnull
+にしている。fd 1 と fd 2 を dup2 で同一のパイプへ恒久的に別名付けすると、
+ターン内で `subprocess.run()` を呼ぶと Windows 実機 CI でだけハングする
+ことが判明したため(原因は特定できていないが、再現性があり、fd1/fd2の
+別名付けが唯一の差分だった)、恒久リダイレクト先を独立した devnull に
+変更して回避した。本実装では、ターン外の書き込みをログとして観測したい
+なら、devnull ではなく診断用の別ファイル/パイプへ向けることを検討する
+(stderr との別名付けは避ける)。
 
 stdin の読み取りは専用スレッドで行い、EOF を検知したら、メインスレッドが
 ターンの実行中でハングしていても構わず `os._exit()` で即座に終了する。
@@ -34,17 +42,15 @@ import threading
 import traceback
 
 _PROTOCOL_STDOUT_FD = os.dup(1)
-# PEP 446: fd 0/1/2 は dup2 の**宛先**なら常に inheritable になる特例が
-# あるが、os.dup() の戻り値である本 fd はその特例に当たらないはずでも、
-# Windows では実際にサブプロセスへ継承されてしまう挙動が実機 CI で観測
-# された(ターン内で subprocess を起動するテストが Windows でだけハング
-# した)。ユーザーコードが起動するサブプロセスには一切見せたくない内部
-# 用の fd なので、明示的に non-inheritable にする。
+# ユーザーコードが起動するサブプロセスには一切見せたくない内部用の fd
+# なので non-inheritable にする(PEP 446 の既定どおりのはずだが、明示
+# しておく)。
 os.set_inheritable(_PROTOCOL_STDOUT_FD, False)
-# fd 1 を恒久的にログ側(fd 2 の送信先)へ向け直す。これ以降、ターンの
-# 外で fd 1 に書かれたものは「ログ」であり、二度とプロトコル用パイプには
-# 流れない。
-os.dup2(2, 1)
+# fd 1 を恒久的に devnull へ向け直す。これ以降、ターンの外で fd 1 に
+# 書かれたものは捨てられ、二度とプロトコル用パイプには流れない。
+_idle_sink_fd = os.open(os.devnull, os.O_WRONLY)
+os.dup2(_idle_sink_fd, 1)
+os.close(_idle_sink_fd)
 
 
 def _drain(path):
@@ -63,9 +69,10 @@ def run_turn(code, shared_globals):
     # inheritable になるので、サブプロセスへの継承はそちらで足りる)。
     os.set_inheritable(out_fd, False)
     os.set_inheritable(err_fd, False)
-    # ここで複製する「ターン開始前の fd 1/2」は、起動時の dup2 により
-    # 既にログ側を指している(プロトコル用パイプではない)。こちらも
-    # ユーザーコードのサブプロセスに見せる必要はない。
+    # ここで複製する「ターン開始前の fd 1/2」は、fd 1 が devnull、
+    # fd 2 が stderr リレー(いずれもプロトコル用パイプではない)を
+    # 指している。こちらもユーザーコードのサブプロセスに見せる必要は
+    # ない。
     saved_stdout_fd = os.dup(1)
     saved_stderr_fd = os.dup(2)
     os.set_inheritable(saved_stdout_fd, False)
