@@ -122,10 +122,24 @@ def main():
         # ハングしていても、どちらにせよ構わず即座に終了する。終了
         # コードを分けておくと、クラッシュ検出(ADR-0013 §3)で原因を
         # 切り分けやすい。
+        #
+        # sys.stdin(io.TextIOWrapper)の行バッファリングではなく、
+        # fd 0 への os.read() を直接使う。ターン内で subprocess を呼ぶ
+        # と Windows 実機 CI でだけハングする問題(T9.3 evidence 項目1
+        # 続き)の調査で、このスレッドの存在そのもの、または sys.stdin
+        # 経由の読み取りが影響している可能性を切り分けるため。
         exit_code = 0
+        fd = sys.stdin.fileno()
+        buffer = b""
         try:
-            for raw in sys.stdin:
-                lines.put(raw)
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    raw, buffer = buffer.split(b"\n", 1)
+                    lines.put(raw.decode("utf-8"))
         except Exception:
             exit_code = 1
         finally:
