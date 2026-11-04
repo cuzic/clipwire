@@ -298,6 +298,7 @@ mod list_status_tests {
             target: "build".into(),
             def_hash: "sha256:test".into(),
             started_at: 1,
+            seq: 0,
             ended_at: None,
             state: crate::jobs::JobStatus::Running,
             exit_code: None,

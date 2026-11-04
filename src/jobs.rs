@@ -8,13 +8,23 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 const RETAIN: usize = 50;
+
+// `started_at` only has millisecond resolution, so a tight loop of
+// `start()` calls (no real process spawn in between) can tie on the same
+// millisecond on fast hardware; relying on it alone for prune() eviction
+// order then falls back on HashMap iteration order, which is randomized
+// per process and makes eviction order flaky (observed on GitHub Actions'
+// ubuntu-latest runner, not reproducible locally). This counter gives each
+// job a strictly increasing, process-local tiebreaker that does not depend
+// on wall-clock resolution or HashMap iteration order.
+static NEXT_JOB_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -74,6 +84,8 @@ pub(crate) struct JobMeta {
     pub(crate) target: String,
     pub(crate) def_hash: String,
     pub(crate) started_at: u64,
+    #[serde(default)]
+    pub(crate) seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ended_at: Option<u64>,
     pub(crate) state: JobStatus,
@@ -162,6 +174,13 @@ impl JobRegistry {
             }
             jobs.insert(meta.id.clone(), meta);
         }
+        // Keep `seq` strictly increasing across a server restart: a fresh
+        // process starts its counter at 0, which would otherwise rank
+        // every job recovered from disk as "newer" than anything started
+        // after the restart and invert prune() eviction order.
+        if let Some(max_seq) = jobs.values().map(|job| job.seq).max() {
+            NEXT_JOB_SEQ.fetch_max(max_seq + 1, Ordering::Relaxed);
+        }
         let registry = Self {
             root,
             jobs: Arc::new(Mutex::new(jobs)),
@@ -211,6 +230,7 @@ impl JobRegistry {
             target: target.into(),
             def_hash: def_hash.into(),
             started_at: now_millis(),
+            seq: NEXT_JOB_SEQ.fetch_add(1, Ordering::Relaxed),
             ended_at: None,
             state: JobStatus::Running,
             exit_code: None,
@@ -354,7 +374,7 @@ impl JobRegistry {
             .cloned()
             .collect();
         drop(followers);
-        candidates.sort_by_key(|job| (job.state.failure() || job.detached, job.started_at));
+        candidates.sort_by_key(|job| (job.state.failure() || job.detached, job.seq));
         for job in candidates.into_iter().take(completed - RETAIN) {
             match fs::remove_dir_all(self.root.join(&job.id)) {
                 Ok(()) => {
@@ -553,6 +573,50 @@ mod tests {
                 .count(),
             RETAIN
         );
+    }
+
+    /// `started_at` only has millisecond resolution, so jobs created in a
+    /// tight loop (no real process spawn in between — exactly the pattern
+    /// above) can share the same value on fast hardware. Without a
+    /// tiebreaker that is independent of `HashMap` iteration order, prune()
+    /// eviction order becomes flaky (observed on GitHub Actions'
+    /// ubuntu-latest, not reproducible on slower local hardware). This
+    /// forces the tie directly, instead of hoping the test machine is fast
+    /// enough to hit it.
+    #[test]
+    fn prune_evicts_oldest_by_seq_even_when_started_at_ties() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new(dir.path()).unwrap();
+        {
+            let mut jobs = registry.jobs.lock().unwrap();
+            for index in 0..51u64 {
+                let id = format!("ok-{index}");
+                fs::create_dir_all(registry.root.join(&id)).unwrap();
+                jobs.insert(
+                    id.clone(),
+                    JobMeta {
+                        id: id.clone(),
+                        target: id.clone(),
+                        def_hash: "hash".into(),
+                        started_at: 0,
+                        seq: index,
+                        ended_at: Some(0),
+                        state: JobStatus::Succeeded,
+                        exit_code: Some(0),
+                        requester: None,
+                        child: None,
+                        detached: false,
+                    },
+                );
+            }
+        }
+        registry.prune();
+        assert!(
+            registry.get("ok-0").is_none(),
+            "the job with the smallest seq must be evicted first even when every \
+             started_at ties"
+        );
+        assert!(registry.get("ok-50").is_some());
     }
 
     /// A streaming `GET .../exec` follower must not have the job it is
