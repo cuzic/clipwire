@@ -112,6 +112,24 @@ impl Drop for Wrapper {
     }
 }
 
+/// Polls for `path` to exist, or panics after `timeout`. Used to
+/// synchronize on something that happens *during* a turn (e.g. "I am now
+/// inside the sleep", or "the background thread's write already
+/// happened") without guessing with a fixed delay, which is flaky under
+/// CI load. A turn's own stdout/stderr are captured into its JSON
+/// response rather than relayed live, so a file is the simplest way for
+/// code running inside a turn to signal the test process.
+fn wait_for_file(path: &std::path::Path, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{path:?} did not appear within {timeout:?}"
+        );
+        thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// PoC 項目 1: print()・サブプロセス継承・生の fd 書き込みのすべてが
 /// 同じターンのレスポンスに漏れなく含まれるか。
 #[test]
@@ -159,13 +177,26 @@ fn poc_eof_during_a_hung_turn_still_exits_promptly() {
         return;
     };
     let mut wrapper = Wrapper::spawn(python);
+    let marker = std::env::temp_dir().join(format!("t93-entering-sleep-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
 
     // Starts a turn that would otherwise hang for 30s (standing in for a
     // pywinauto call stuck on a modal dialog). Don't wait for its response.
-    wrapper.send_code("import time; time.sleep(30)");
-    // Give the turn time to actually enter the sleep (be genuinely hung)
-    // before simulating the server's death.
-    thread::sleep(std::time::Duration::from_millis(300));
+    // `time.sleep` releases the GIL, so the reader thread can still run
+    // during it — this test covers exactly that case, not a GIL-holding
+    // native call (ADR-0013 Status 2's remaining, narrower limitation).
+    // A turn's own stdout/stderr are captured into its eventual JSON
+    // response rather than relayed live, so a marker file (not a print) is
+    // how the turn signals "I am now inside the sleep" to the test.
+    wrapper.send_code(&format!(
+        "open(r'{}', 'w').close()\nimport time; time.sleep(30)",
+        marker.display()
+    ));
+    // Wait for proof the turn actually reached the sleep (is genuinely
+    // hung) before simulating the server's death, instead of guessing with
+    // a fixed delay.
+    wait_for_file(&marker, std::time::Duration::from_secs(5));
+    let _ = std::fs::remove_file(&marker);
     wrapper.close_stdin();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -193,22 +224,40 @@ fn poc_item1_late_write_after_turn_does_not_corrupt_next_turns_framing() {
         return;
     };
     let mut wrapper = Wrapper::spawn(python);
+    let go_marker = std::env::temp_dir().join(format!("t93-late-write-go-{}", std::process::id()));
+    let done_marker =
+        std::env::temp_dir().join(format!("t93-late-write-done-{}", std::process::id()));
+    let _ = std::fs::remove_file(&go_marker);
+    let _ = std::fs::remove_file(&done_marker);
 
-    let code = r#"
-import threading, time
+    // The background thread must not write until *after* the test has
+    // actually received turn 1's response (proof that run_turn's fd 1/2
+    // restore to the log side has already happened) — otherwise, with no
+    // delay at all the write can race into turn 1's own capture window
+    // (which the previous, sleep-based version of this test papered over
+    // with a guessed delay). `go_marker` makes that ordering exact instead
+    // of guessed.
+    let code = format!(
+        r#"
+import os, threading, time
 def _late():
-    time.sleep(0.3)
-    import os
+    while not os.path.exists(r"{go}"):
+        time.sleep(0.01)
     os.write(1, b"late-background-write\n")
+    open(r"{done}", "w").close()
 threading.Thread(target=_late, daemon=True).start()
 print("turn1-done")
-"#;
-    let r1 = wrapper.turn(code);
+"#,
+        go = go_marker.display(),
+        done = done_marker.display(),
+    );
+    let r1 = wrapper.turn(&code);
     assert_eq!(r1["stdout"].as_str().unwrap().trim(), "turn1-done");
 
-    // The background thread's write lands ~0.3s later, while the wrapper is
-    // idle between turns. Give it time to happen before sending turn 2.
-    thread::sleep(std::time::Duration::from_millis(500));
+    std::fs::File::create(&go_marker).unwrap();
+    wait_for_file(&done_marker, std::time::Duration::from_secs(5));
+    let _ = std::fs::remove_file(&go_marker);
+    let _ = std::fs::remove_file(&done_marker);
 
     let r2 = wrapper.turn("print('turn2-done')");
     assert_eq!(

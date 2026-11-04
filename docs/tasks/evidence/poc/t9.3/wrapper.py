@@ -34,6 +34,13 @@ import threading
 import traceback
 
 _PROTOCOL_STDOUT_FD = os.dup(1)
+# PEP 446: fd 0/1/2 は dup2 の**宛先**なら常に inheritable になる特例が
+# あるが、os.dup() の戻り値である本 fd はその特例に当たらないはずでも、
+# Windows では実際にサブプロセスへ継承されてしまう挙動が実機 CI で観測
+# された(ターン内で subprocess を起動するテストが Windows でだけハング
+# した)。ユーザーコードが起動するサブプロセスには一切見せたくない内部
+# 用の fd なので、明示的に non-inheritable にする。
+os.set_inheritable(_PROTOCOL_STDOUT_FD, False)
 # fd 1 を恒久的にログ側(fd 2 の送信先)へ向け直す。これ以降、ターンの
 # 外で fd 1 に書かれたものは「ログ」であり、二度とプロトコル用パイプには
 # 流れない。
@@ -46,14 +53,23 @@ def _drain(path):
 
 
 def run_turn(code, shared_globals):
-    out_path = tempfile.mktemp(prefix="t93-out-")
-    err_path = tempfile.mktemp(prefix="t93-err-")
-    out_fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-    err_fd = os.open(err_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    # mkstemp (open済みのfdを返す) を使う。mktemp は作成までに競合の
+    # 余地がある非推奨API。
+    out_fd, out_path = tempfile.mkstemp(prefix="t93-out-")
+    err_fd, err_path = tempfile.mkstemp(prefix="t93-err-")
+    # out_fd/err_fd 自体は内部用の fd 番号で、ユーザーコードが見るのは
+    # これらを dup2 した**先**の fd 1/2 だけでよい。non-inheritable に
+    # しておく(fd 1/2 自体は PEP 446 の特例で dup2 の宛先なら常に
+    # inheritable になるので、サブプロセスへの継承はそちらで足りる)。
+    os.set_inheritable(out_fd, False)
+    os.set_inheritable(err_fd, False)
     # ここで複製する「ターン開始前の fd 1/2」は、起動時の dup2 により
-    # 既にログ側を指している(プロトコル用パイプではない)。
+    # 既にログ側を指している(プロトコル用パイプではない)。こちらも
+    # ユーザーコードのサブプロセスに見せる必要はない。
     saved_stdout_fd = os.dup(1)
     saved_stderr_fd = os.dup(2)
+    os.set_inheritable(saved_stdout_fd, False)
+    os.set_inheritable(saved_stderr_fd, False)
     error = None
     try:
         sys.stdout.flush()
@@ -94,14 +110,19 @@ def main():
     lines: "queue.Queue[str | None]" = queue.Queue()
 
     def read_stdin():
+        # EOF (サーバプロセスの終了)なら 0、読み取りエラー(不正な
+        # UTF-8 等)なら 1 で終了する。メインスレッドがターンの実行中で
+        # ハングしていても、どちらにせよ構わず即座に終了する。終了
+        # コードを分けておくと、クラッシュ検出(ADR-0013 §3)で原因を
+        # 切り分けやすい。
+        exit_code = 0
         try:
             for raw in sys.stdin:
                 lines.put(raw)
+        except Exception:
+            exit_code = 1
         finally:
-            # EOF (サーバプロセスの終了) または stdin の読み取りエラー。
-            # メインスレッドがターンの実行中でハングしていても、サーバが
-            # 既に居ないことに変わりはないので、構わず即座に終了する。
-            os._exit(0)
+            os._exit(exit_code)
 
     threading.Thread(target=read_stdin, daemon=True).start()
 
