@@ -1182,4 +1182,75 @@ mod tests {
         assert_eq!(cleanup.await.unwrap(), 0);
         assert!(verified.await.unwrap().is_some());
     }
+
+    /// T9.3 (ADR-0013) PoC 項目 5: 永続コンテキストの各ターンで行う想定の
+    /// 承認ハッシュ再検証(`verified_target` が実際に使う経路そのもの)の
+    /// コストを、実機相当の件数(dragonflyg4 の `registered.toml` は
+    /// 1571 件、T9.0 evidence 参照)で測る。`verified_target` は呼ぶたびに
+    /// `registered.toml` 全体を再パースし、`.store.lock` をロックする
+    /// (register と同じ経路)ため、対話的なターンの応答性に効くのは
+    /// sha256 そのものではなくこちらだと予想して検証する。
+    #[test]
+    fn poc_t9_3_item5_verified_target_cost_against_1571_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        const ENTRY_COUNT: usize = 1571;
+        const BENCH_TARGET: &str = "bench-target";
+
+        let mut registered = std::collections::HashMap::new();
+        for index in 0..ENTRY_COUNT {
+            let name = if index == ENTRY_COUNT / 2 {
+                BENCH_TARGET.to_string()
+            } else {
+                format!("target-{index}")
+            };
+            let mut entry = target(&format!("echo {index}"));
+            let canonical = canonical_json(&entry);
+            let hash = definition_hash(&canonical);
+            write_approval_record(root, &hash, &canonical).unwrap();
+            entry.hash = Some(hash);
+            entry.approved_at = Some(approval_timestamp());
+            registered.insert(name, entry);
+        }
+        atomic_save_target_map(&root.join("registered.toml"), &registered).unwrap();
+
+        let store = Store::new(root.to_owned());
+        // ウォームアップ(ファイルキャッシュを温める。測定対象は定常状態)。
+        store.verified_target(BENCH_TARGET).unwrap().unwrap();
+
+        const ITERATIONS: u32 = 20;
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            assert!(store.verified_target(BENCH_TARGET).unwrap().is_some());
+        }
+        let elapsed = start.elapsed();
+        let per_call = elapsed / ITERATIONS;
+
+        // 内訳診断: ファイル I/O(数百 µs)と toml パース(数百 ms)の
+        // どちらが支配的かを分ける。
+        let path = root.join("registered.toml");
+        let t0 = std::time::Instant::now();
+        let raw = fs::read_to_string(&path).unwrap();
+        let read_elapsed = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let _parsed: TargetMap = toml::from_str(&raw).unwrap();
+        let parse_elapsed = t1.elapsed();
+        let t2 = std::time::Instant::now();
+        let _ = fs::metadata(&path).unwrap().modified().unwrap();
+        let mtime_elapsed = t2.elapsed();
+
+        eprintln!(
+            "poc_t9_3_item5: {ENTRY_COUNT} エントリの registered.toml ({} bytes) に対する \
+             verified_target の平均コスト = {per_call:?}({ITERATIONS} 回平均、合計 {elapsed:?})。\
+             内訳: fs::read_to_string = {read_elapsed:?}, toml::from_str = {parse_elapsed:?}, \
+             fs::metadata(mtime のみ) = {mtime_elapsed:?}",
+            raw.len()
+        );
+        // 厳密な性能保証ではなく、ハング等の重大な劣化だけを検知する粗い
+        // 上限(実測は数百 ms 規模。詳細は PoC 項目 5 の evidence 参照)。
+        assert!(
+            per_call < Duration::from_secs(5),
+            "verified_target が 1 回あたり {per_call:?} かかった(閾値 5s)"
+        );
+    }
 }
