@@ -236,12 +236,11 @@ fn poc_eof_during_a_hung_turn_still_exits_promptly() {
         // is what disconnects this channel — there is no direct Child
         // handle to wrapper.py itself to try_wait() on, since the stub
         // stands between it and this test process.
-        match wrapper
+        if let Err(std::sync::mpsc::RecvTimeoutError::Disconnected) = wrapper
             .responses
             .recv_timeout(std::time::Duration::from_millis(50))
         {
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-            _ => {}
+            return;
         }
         assert!(
             std::time::Instant::now() < deadline,

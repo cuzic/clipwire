@@ -5,7 +5,7 @@ windows_target=x86_64-pc-windows-gnu
 
 cargo fmt --check
 cargo check
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test
 cargo check --target "$windows_target"
-cargo clippy --target "$windows_target" -- -D warnings
+cargo clippy --all-targets --target "$windows_target" -- -D warnings
