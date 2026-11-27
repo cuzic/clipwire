@@ -514,6 +514,9 @@ mod tests {
         thread::sleep(Duration::from_millis(2));
         let mut successes = Vec::new();
         for index in 0..51 {
+            // started_at はミリ秒単位。同じミリ秒の成功同士は削除順が決まらないので、
+            // 「最も古い成功が消える」を確かめるために 1 件ずつずらす。
+            thread::sleep(Duration::from_millis(2));
             let id = registry
                 .start(&format!("ok-{index}"), "hash", None, Concurrency::Allow)
                 .unwrap();

@@ -43,8 +43,9 @@
   9. `README.md`(リポジトリ直下)の更新: 新コマンド、`contrib/clipwire-*.md`(スキル定義)の更新。
   10. 単一起動ミューテックス名が設定ディレクトリ由来になる(T0.3)。旧版サーバから更新するときは、旧版を停止してから新版を起動する(旧名と新名が異なるため、ローリング起動では一時的な二重起動を防げない)。`CLIPWIRE_CONFIG_DIR` を指定した検証用インスタンスは本番と並行起動できる。
   11. HTTP リクエスト検査の追加(P2)。`Origin` ヘッダ付きのリクエストは 403、保護ルートへの `POST` が `Content-Type: application/json` でない場合は 415 になる。Host 検査の初回出荷は `--host-check=log` が既定で、不一致・欠落は警告ログに記録するが通過させる。`--host-check=enforce` では不一致・欠落が 421 になり、必要な名前は `--allow-host` で複数追加できる。既存 CLI は必要なヘッダを送るため影響を受けず、独自クライアントは各ヘッダを合わせる。
+  12. 追加(P9。ADR-0012): `POST /files`(`clipwire send`)、`GET /info`、`GET /targets`、`DELETE /register/:name`(`clipwire unregister`)、`serve --files-dir/--files-max-bytes/--files-no-motw`。互換性への影響は、存在しないパスへの 404 の本文が空からエンドポイント一覧(text/plain)になることだけ。出荷後に使い捨てターゲット `save-clip-file-to-downloads` を `clipwire unregister` で削除する。
 - **AC**:
-  - AC-T8.3.1: 上記 1〜11 がすべてリリースノートに記載され、各項目に「影響を受ける条件」「対処」が書かれている。
+  - AC-T8.3.1: 上記 1〜12 がすべてリリースノートに記載され、各項目に「影響を受ける条件」「対処」が書かれている。
   - AC-T8.3.2: `README.md` と `contrib/claude-skills/clipwire*.md` が、新しいコマンド・承認フローと矛盾しない(旧コマンドの案内が残っていない。`approve` の使い方、`exec` の使い方)。
   - AC-T8.3.3: Linux 側の `clipwire-exec` スキル(`~/.claude/skills/clipwire-exec/`。リポジトリ外)の更新案を `docs/tasks/evidence/skill-update.md` に書く。**現行スキルの「このユーザーは自動承認運用にしている。`register` 後は黙って `exec` する」という記述と整合させる**(自動承認モードでも、トークン = コード実行権限であること、`--token-file`、ジョブ/ストリーミングの新コマンド、`CLIPD_HOST` の指定方法)。手動承認モード用の記述は、Phase 5b を実施するときに追加する。
 

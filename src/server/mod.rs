@@ -2,6 +2,7 @@ use super::*;
 
 pub(crate) mod clip;
 mod exec;
+pub(crate) mod files;
 mod http_surface;
 pub(crate) mod jobs;
 mod register;
@@ -67,6 +68,8 @@ pub(crate) struct ClipContent {
     pub png: Option<Vec<u8>>,
     /// 検証済みの SVG ソース(UTF-8)
     pub svg: Option<String>,
+    /// CF_HDROP で載せるファイルのパス(`POST /files?clip=1` で保存したものだけ)
+    pub files: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -107,6 +110,7 @@ pub(crate) struct AppState {
     pub(crate) audit: AuditLog,
     pub(crate) jobs: crate::jobs::JobRegistry,
     pub(crate) stream_ping_interval: Duration,
+    pub(crate) files: files::FilesConfig,
 }
 
 // ── Logging / panic visibility (serve) ────────────────────────────────────────
@@ -551,6 +555,11 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         audit,
         jobs,
         stream_ping_interval: Duration::from_secs(30),
+        files: files::FilesConfig::new(
+            args.files_dir.clone(),
+            args.files_max_bytes,
+            !args.files_no_motw,
+        ),
     };
 
     let serve_start = crate::audit::serve_start_event(

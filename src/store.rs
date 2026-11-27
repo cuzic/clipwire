@@ -43,6 +43,15 @@ pub(crate) struct TargetCheckResult {
     pub(crate) pending_matches: Option<bool>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct TargetSummary {
+    pub(crate) name: String,
+    pub(crate) state: &'static str,
+    pub(crate) hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) approved_at: Option<u64>,
+}
+
 impl Store {
     pub(crate) fn new(root: PathBuf) -> Self {
         Self {
@@ -227,6 +236,73 @@ impl Store {
             verify_approval(&self.root, target)?;
             Ok(Some(target.clone()))
         })
+    }
+
+    /// registered と pending の名前・状態・ハッシュ(定義の本文は含めない)。
+    pub(crate) async fn list_targets(&self) -> Result<Vec<TargetSummary>> {
+        let _serial = self.serial.lock().await;
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || {
+            with_store_lock(&root, LOCK_TIMEOUT, || {
+                let registered = load_for_update(&root.join("registered.toml"))?;
+                let pending = load_for_update(&root.join("pending.toml"))?;
+                let mut out: Vec<TargetSummary> = registered
+                    .iter()
+                    .map(|(name, entry)| TargetSummary {
+                        name: name.clone(),
+                        state: "registered",
+                        hash: definition_hash(&canonical_json(entry)),
+                        approved_at: entry.approved_at,
+                    })
+                    .chain(pending.iter().map(|(name, entry)| TargetSummary {
+                        name: name.clone(),
+                        state: "pending",
+                        hash: definition_hash(&canonical_json(entry)),
+                        approved_at: None,
+                    }))
+                    .collect();
+                out.sort_by(|a, b| (&a.name, a.state).cmp(&(&b.name, b.state)));
+                Ok(out)
+            })
+        })
+        .await
+        .context("store list worker panicked")?
+    }
+
+    /// registered と pending の両方から `name` を消す。消したものを返す(無ければ空)。
+    pub(crate) async fn unregister(&self, name: String) -> Result<Vec<TargetSummary>> {
+        let _serial = self.serial.lock().await;
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || {
+            with_store_lock(&root, LOCK_TIMEOUT, || {
+                // 先に両方を読む(片方だけ消してから読み込みに失敗し、監査されない削除が
+                // 起きないように)。
+                let mut maps = Vec::new();
+                for (file, state) in [
+                    ("registered.toml", "registered"),
+                    ("pending.toml", "pending"),
+                ] {
+                    let path = root.join(file);
+                    let map = load_for_update(&path)?;
+                    maps.push((path, state, map));
+                }
+                let mut removed = Vec::new();
+                for (path, state, mut map) in maps {
+                    if let Some(entry) = map.remove(&name) {
+                        atomic_save_target_map(&path, &map)?;
+                        removed.push(TargetSummary {
+                            name: name.clone(),
+                            state,
+                            hash: definition_hash(&canonical_json(&entry)),
+                            approved_at: entry.approved_at,
+                        });
+                    }
+                }
+                Ok(removed)
+            })
+        })
+        .await
+        .context("store unregister worker panicked")?
     }
 
     pub(crate) async fn check_targets(

@@ -17,6 +17,7 @@ clipwire の設計判断。Status は `Proposed` → `Accepted` / `Rejected` / `
 | [0007](0007-rhai-api-extension.md) | Rhai API の拡充(縮小版) | Proposed | 0009, 0011 |
 | [0004](0004-parameterized-targets.md) | パラメータ付きターゲット(`choices` のみ) | **Deferred** | 0010, 0006 |
 | [0008](0008-clipboard-history-and-exec-copy.md) | `exec --copy` / クリップボード履歴 | `--copy` Proposed / 履歴 Deferred | — |
+| [0012](0012-file-send-and-discovery.md) | ファイル送信(`POST /files`)と自己紹介(`/info`・`/targets`・登録削除・404) | Proposed | 0011, 0010, 0003 |
 
 依存は非循環。0009 / 0010 / 0011 は互いに独立(トークンの読み込み・除去は 0011 が所有し、0009 は子の `env_remove` のみ)。0003 / 0001 / 0002 / 0007 は 0009 に、0006 / 0005 / 0004 は 0010 に依存する。
 

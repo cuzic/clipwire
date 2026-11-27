@@ -191,6 +191,9 @@ tmux source ~/.tmux.conf
 | `--allow-no-token` | off | 保護ルートを含め、token なしで到達可能な範囲への公開を明示許可 |
 | `--host-check` | `log` | Host 許可リスト不一致時の動作 (`log` は警告のみ、`enforce` は 421) |
 | `--allow-host HOST` | — | Host 許可リストへ名前を追加 (複数指定可) |
+| `--files-dir DIR` | Downloads | `POST /files` (`clipwire send`) の保存先。リクエストからは変更できない |
+| `--files-max-bytes N` | `104857600` (100 MiB) | `POST /files` の上限。超えると 413 |
+| `--files-no-motw` | off | 受信したファイルに Mark of the Web (`Zone.Identifier`, ZoneId=3) を付けない |
 
 ### セキュリティ
 
@@ -199,6 +202,7 @@ tmux source ~/.tmux.conf
 - `Origin` ヘッダ付きリクエストは拒否。Host は初回出荷では不一致をログへ記録し、`--host-check=enforce` で厳格拒否
 - `/exec` と `/register` の POST は `Content-Type: application/json` が必須
 - ターゲット名は `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` のみ許可 (register/exec)
+- `POST /files` は保護ルートと同じ認証で、`Content-Type: application/octet-stream` が必須。ファイル名は検証され (`..`・パス区切り・`:`・制御文字・先頭 `.`・予約デバイス名・双方向制御文字・`.lnk`/`.url`/`.scf` 等は 400)、同名は ` (1)` を付けて上書きしない。受信は toast と監査ログ (`file-receive`) に残る (ADR-0012)
 - `get` が出力する curl 行はトークンを展開せず `$CLIPD_TOKEN` を参照する (会話ログにトークンを残さない)
 - toast 通知は WinRT のみ (PowerShell 経由の通知は廃止)
 - 多重起動防止に名前付き Mutex を使用
@@ -221,6 +225,12 @@ netsh http add urlacl url=http://<tailscale-ip>:9999/ user="DOMAIN\username"
 | `GET /file?path=<encoded>` | 要 | CF_HDROP ファイルの実体 (クリップボード照合あり) |
 | `GET /vfile?i=N` | 要 | 仮想ファイルの実体 (Outlook 添付等) |
 | `GET /health` | 不要 | 死活確認 |
+| `GET /info` | 不要 | app 名・version・features・全エンドポイント一覧 (JSON) |
+| `POST /files?name=<encoded>[&clip=1]` | 保護 | 生バイトを保存先 (既定 Downloads) に保存。`clip=1` で CF_HDROP としてクリップボードにも載せる |
+| `GET /targets` | 保護 | 登録済み・承認待ちターゲットの名前・状態・ハッシュ (本文なし) |
+| `DELETE /register/<name>` | 保護 | ターゲットの登録を削除 (registered と pending) |
+
+全一覧は `GET /info` (または存在しないパスへの 404 の本文) で確認できる。
 
 ### クリップボード種別 (X-Clip-Kind)
 
@@ -318,6 +328,23 @@ clipwire put --svg diagram.svg --png diagram.png --text alt.txt
 HTTP では `POST /clip` の `Content-Type` (`text/plain` / `image/png` / `image/svg+xml`) で切り替わる。本文は検証され、不正な PNG / SVG は 400 になる。
 
 tmux キーバインドとして登録しておくと便利（`contrib/tmux.conf.snippet` 参照）。
+
+### ファイルを Windows へ送る (`clipwire send`)
+
+```bash
+clipwire send slides.pptx              # Downloads\slides.pptx (同名があれば "slides (1).pptx")
+clipwire send out.bin --name 報告.pdf   # 保存名を指定
+clipwire send slides.pptx --clip       # 保存したファイルをクリップボードにも載せる (Explorer で貼り付け可)
+```
+
+保存先のフルパスを標準出力に出す。クリップボードの内容は (`--clip` を付けない限り) 変わらない。
+
+### サーバーの確認・ターゲットの削除
+
+```bash
+clipwire info                     # GET /info: 何のサーバーで何ができるか
+clipwire unregister old-target    # DELETE /register/old-target
+```
 
 ---
 

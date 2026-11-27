@@ -52,6 +52,7 @@
 | T7.5 | Deferred | 運用モード (A) では価値が低い(OQ-0) |
 | T7.6 | 完了 | `docs/tasks/backlog.md`(AC-T7.6.1) |
 | T7.7 | L 完了(AC-T7.7.1) / X 未検証 | `clipwire open` は `POST /open` を使う。**旧 `GET /open` とフォールバックは 2026-10-01 に削除**(互換性方針)。AC-T7.7.2(互換期間中の新旧組み合わせ)は対象外 |
+| T9.1〜T9.3 | L 完了 / W・X 未検証 | ADR-0012。`POST /files`(+`send`)・`GET /info`・`GET /targets`・`DELETE /register/:name`(+`unregister`)・404 の一覧。AC-T9.1.8(実機の Downloads・toast・MotW・CF_HDROP)と AC-T9.2.4(実機で `save-clip-file-to-downloads` を削除)は未検証。Windows CI で MotW の ADS を確認する |
 
 ## 運用の実態(計画の前提)
 
@@ -82,6 +83,7 @@
 | 5b | (同上の後半) | 手動承認 UI(toast・レビュー画面) | 0006 | **L**(T5.3 単独で L) | P5a。**後回し** |
 | 6 | [06-streaming-and-jobs.md](06-streaming-and-jobs.md) | ストリーミング・ジョブ管理 | 0001, 0002 | L | P4, P5a |
 | 7 | [07-features.md](07-features.md) | `list`/`status`、Rhai API、`exec --copy`(params は Deferred) | 0005, 0007, 0008 | M | P3〜P6(個別) |
+| 9 | [09-file-send-and-discovery.md](09-file-send-and-discovery.md) | ファイル送信・自己紹介・登録削除 | 0012 | S〜M | P2, P3, P5a |
 | 8 | [08-release.md](08-release.md) | 互換性検証・移行・リリース | 全 | M | 全 |
 
 ```

@@ -366,6 +366,8 @@ pub(crate) mod win_clip {
                     ClipFormat::Png => reg_fmt(w!("PNG")),
                     // Inkscape・Office 365・Chromium 系などが読む
                     ClipFormat::Svg => reg_fmt(w!("image/svg+xml")),
+                    ClipFormat::HDrop => CF_HDROP,
+                    ClipFormat::PreferredDropEffect => reg_fmt(w!("Preferred DropEffect")),
                 };
                 (id, data)
             })

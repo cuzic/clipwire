@@ -11,4 +11,7 @@ Options:
       --auto-approve             register リクエストを自動承認する (approve 不要)
       --host-check <HOST_CHECK>  Host ヘッダ不一致時の動作 (初回出荷はログのみ) [default: log] [possible values: log, enforce]
       --allow-host <HOST>        Host ヘッダで追加許可する名前 (複数指定可)
+      --files-dir <DIR>          POST /files の保存先 (既定: Downloads)
+      --files-max-bytes <BYTES>  POST /files で受け付ける最大バイト数 [default: 104857600]
+      --files-no-motw            POST /files で保存したファイルに Mark of the Web (Zone.Identifier) を付けない
   -h, --help                     Print help

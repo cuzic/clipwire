@@ -60,6 +60,10 @@ enum Cmd {
     Put(PutArgs),
     /// Windows のデフォルトブラウザで Web サービスを開く
     Open(OpenArgs),
+    /// ファイルを Windows の保存先 (既定 Downloads) へ送る
+    Send(SendArgs),
+    /// サーバーの app 名・version・features・エンドポイント一覧を表示
+    Info,
     /// 登録済みターゲットを Windows で実行して結果を取得
     Exec(ExecArgs),
     /// ジョブ一覧を表示
@@ -74,6 +78,8 @@ enum Cmd {
     Kill(JobIdArgs),
     /// ターゲットの定義を Windows に送って承認待ちに追加
     Register(RegisterArgs),
+    /// Windows 側のターゲット登録 (registered / pending) を削除
+    Unregister(UnregisterArgs),
     /// 承認待ちターゲットを承認して registered.toml に保存 (Windows ローカルで実行)
     Approve(ApproveArgs),
     /// 承認待ちターゲットの一覧を表示 (Windows ローカルで実行)
@@ -92,6 +98,24 @@ enum Cmd {
 struct RegisterArgs {
     /// 登録するターゲット名 (~/.config/clipwire/targets.toml で定義)
     target: String,
+}
+
+#[derive(Args, Debug)]
+struct UnregisterArgs {
+    /// 削除するターゲット名
+    target: String,
+}
+
+#[derive(Args, Debug)]
+struct SendArgs {
+    /// 送るファイル
+    file: PathBuf,
+    /// Windows 側で保存するファイル名 (既定: FILE のファイル名。同名があれば " (1)" などを付ける)
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+    /// 保存したファイルを Windows のクリップボードに載せる (Explorer で貼り付け可能)
+    #[arg(long)]
+    clip: bool,
 }
 
 #[derive(Args, Debug)]
@@ -165,6 +189,18 @@ struct ServeArgs {
     /// Host ヘッダで追加許可する名前 (複数指定可)
     #[arg(long, value_name = "HOST", action = clap::ArgAction::Append)]
     allow_host: Vec<String>,
+
+    /// POST /files の保存先 (既定: Downloads)
+    #[arg(long, value_name = "DIR")]
+    files_dir: Option<PathBuf>,
+
+    /// POST /files で受け付ける最大バイト数
+    #[arg(long, value_name = "BYTES", default_value_t = server::files::DEFAULT_FILES_MAX_BYTES)]
+    files_max_bytes: u64,
+
+    /// POST /files で保存したファイルに Mark of the Web (Zone.Identifier) を付けない
+    #[arg(long)]
+    files_no_motw: bool,
 }
 
 #[derive(Args, Debug)]
@@ -346,6 +382,18 @@ fn main() -> Result<()> {
             let cfg = ClientConfig::from_env()?;
             cmd_exec(&cfg, &args)
         }
+        Cmd::Send(args) => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_send(&cfg, &args)
+        }
+        Cmd::Info => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_info(&cfg)
+        }
+        Cmd::Unregister(args) => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_unregister(&cfg, &args)
+        }
         Cmd::Jobs => {
             let cfg = ClientConfig::from_env()?;
             cmd_jobs(&cfg)
@@ -431,6 +479,7 @@ mod tests {
     }
 
     fn test_state(config_dir: PathBuf, auto_approve: bool) -> AppState {
+        let config_dir_for_files = config_dir.clone();
         let (clip_tx, _clip_rx) = mpsc::sync_channel(1);
         let store = Store::new(config_dir.clone());
         AppState {
@@ -445,10 +494,12 @@ mod tests {
             audit: audit::AuditLog::new(config_dir.clone()),
             jobs: jobs::JobRegistry::new(config_dir).unwrap(),
             stream_ping_interval: Duration::from_secs(30),
+            files: server::files::FilesConfig::new(Some(config_dir_for_files.clone()), 1024, true),
         }
     }
 
     fn clipboard_test_state(config_dir: PathBuf) -> AppState {
+        let config_dir_for_files = config_dir.clone();
         let (clip_tx, clip_rx) = mpsc::sync_channel(1);
         thread::spawn(move || {
             if let Ok(ClipRequest::GetClip { reply }) = clip_rx.recv() {
@@ -468,6 +519,7 @@ mod tests {
             audit: audit::AuditLog::new(config_dir.clone()),
             jobs: jobs::JobRegistry::new(config_dir).unwrap(),
             stream_ping_interval: Duration::from_secs(30),
+            files: server::files::FilesConfig::new(Some(config_dir_for_files.clone()), 1024, true),
         }
     }
 
@@ -481,13 +533,21 @@ mod tests {
             actual,
             vec![
                 (RouteId::Health, "/health", RouteClass::Common),
+                (RouteId::Info, "/info", RouteClass::Common),
                 (RouteId::Root, "/", RouteClass::Clipboard),
                 (RouteId::Clip, "/clip", RouteClass::Clipboard),
                 (RouteId::File, "/file", RouteClass::Clipboard),
                 (RouteId::VFile, "/vfile", RouteClass::Clipboard),
                 (RouteId::Open, "/open", RouteClass::Clipboard),
+                (RouteId::Files, "/files", RouteClass::Upload),
                 (RouteId::Exec, "/exec", RouteClass::Protected),
                 (RouteId::Register, "/register", RouteClass::Protected),
+                (
+                    RouteId::Unregister,
+                    "/register/:name",
+                    RouteClass::Protected,
+                ),
+                (RouteId::Targets, "/targets", RouteClass::Protected),
                 (
                     RouteId::TargetsCheck,
                     "/targets/check",
@@ -642,17 +702,26 @@ mod tests {
             mutations,
             vec![
                 (RouteId::Health, "/health", RegisteredMutation::Never),
+                (RouteId::Info, "/info", RegisteredMutation::Never),
                 (RouteId::Root, "/", RegisteredMutation::Never),
                 (RouteId::Clip, "/clip", RegisteredMutation::Never),
                 (RouteId::File, "/file", RegisteredMutation::Never),
                 (RouteId::VFile, "/vfile", RegisteredMutation::Never),
                 (RouteId::Open, "/open", RegisteredMutation::Never),
+                (RouteId::Files, "/files", RegisteredMutation::Never),
                 (RouteId::Exec, "/exec", RegisteredMutation::Never),
                 (
                     RouteId::Register,
                     "/register",
                     RegisteredMutation::AutoApproveOnly,
                 ),
+                // AC-T9.2.3: 削除だけ(権限を減らす操作)
+                (
+                    RouteId::Unregister,
+                    "/register/:name",
+                    RegisteredMutation::RemoveOnly,
+                ),
+                (RouteId::Targets, "/targets", RegisteredMutation::Never),
                 (
                     RouteId::TargetsCheck,
                     "/targets/check",
@@ -695,14 +764,7 @@ mod tests {
         let app = build_router(test_state(dir.path().to_path_buf(), false));
 
         for route in ROUTES {
-            let method = match route.id {
-                RouteId::Open
-                | RouteId::Exec
-                | RouteId::Register
-                | RouteId::TargetsCheck
-                | RouteId::JobKill => "POST",
-                _ => "GET",
-            };
+            let method = route.methods.split(", ").last().unwrap();
             let request = axum::http::Request::builder()
                 .method(method)
                 .uri(route.path)
@@ -725,6 +787,465 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    }
+
+    // ── ADR-0012 / Phase 9 ──────────────────────────────────────────────
+
+    fn files_request(uri: &str, content_type: &str, body: Vec<u8>) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn body_text(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn files_state(dir: &Path, files_dir: &Path) -> AppState {
+        let mut state = test_state(dir.to_path_buf(), false);
+        state.allow_no_token = true;
+        state.files = server::files::FilesConfig::new(Some(files_dir.to_path_buf()), 1024, true);
+        state
+    }
+
+    #[tokio::test]
+    async fn ac_t9_1_3_files_saves_numbers_and_audits() {
+        use sha2::Digest as _;
+        let dir = tempdir().unwrap();
+        let downloads = tempdir().unwrap();
+        let app = build_router(files_state(dir.path(), downloads.path()));
+        let uri = "/files?name=%E5%A0%B1%E5%91%8A.pptx";
+
+        let first = app
+            .clone()
+            .oneshot(files_request(
+                uri,
+                "application/octet-stream",
+                b"hello".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first = body_json(first).await;
+        assert_eq!(first["name"], "報告.pptx");
+        assert_eq!(first["bytes"], 5);
+        assert_eq!(first["sha256"], hex::encode(sha2::Sha256::digest(b"hello")));
+        assert_eq!(first["clipboard"], false);
+        assert_eq!(
+            std::fs::read(downloads.path().join("報告.pptx")).unwrap(),
+            b"hello"
+        );
+
+        let second = app
+            .clone()
+            .oneshot(files_request(
+                uri,
+                "application/octet-stream",
+                b"world".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CREATED);
+        assert_eq!(body_json(second).await["name"], "報告 (1).pptx");
+        assert_eq!(
+            std::fs::read(downloads.path().join("報告.pptx")).unwrap(),
+            b"hello",
+            "既存ファイルを上書きしない"
+        );
+
+        let audit = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+        let events: Vec<serde_json::Value> = audit
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|event: &serde_json::Value| event["event"] == "file-receive")
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["file"], "報告 (1).pptx");
+        assert_eq!(events[1]["bytes"], 5);
+    }
+
+    #[tokio::test]
+    async fn ac_t9_1_3_files_rejects_bad_names_and_queries() {
+        let dir = tempdir().unwrap();
+        let downloads = tempdir().unwrap();
+        let app = build_router(files_state(dir.path(), downloads.path()));
+        for uri in [
+            "/files",
+            "/files?name=..%5Cx.cmd",
+            "/files?name=a%2Fb",
+            "/files?name=.bashrc",
+            "/files?name=x.lnk",
+            "/files?name=a&clip=maybe",
+            "/files?name=a&dir=C%3A%5C",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(files_request(
+                    uri,
+                    "application/octet-stream",
+                    b"x".to_vec(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert_eq!(std::fs::read_dir(downloads.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn ac_t9_1_4_files_over_limit_is_413_and_leaves_nothing() {
+        let dir = tempdir().unwrap();
+        let downloads = tempdir().unwrap();
+        let app = build_router(files_state(dir.path(), downloads.path()));
+
+        // Content-Length あり
+        let response = app
+            .clone()
+            .oneshot(files_request(
+                "/files?name=big.bin",
+                "application/octet-stream",
+                vec![0; 2048],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Content-Length なし(ストリーム)
+        let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> =
+            vec![Ok(vec![0; 700].into()), Ok(vec![0; 700].into())];
+        let body = Body::from_stream(tokio_stream_iter(chunks));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/files?name=big.bin")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(body)
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(std::fs::read_dir(downloads.path()).unwrap().count(), 0);
+    }
+
+    /// futures-util なしでイテレータを Stream にする(テスト用)。
+    fn tokio_stream_iter<T: Unpin + Send + 'static>(
+        items: Vec<T>,
+    ) -> impl futures_core::Stream<Item = T> + Send + 'static {
+        struct Iter<T>(std::collections::VecDeque<T>);
+        impl<T: Unpin> futures_core::Stream for Iter<T> {
+            type Item = T;
+            fn poll_next(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<T>> {
+                std::task::Poll::Ready(self.0.pop_front())
+            }
+        }
+        Iter(items.into())
+    }
+
+    #[tokio::test]
+    async fn ac_t9_1_5_files_auth_content_type_and_origin() {
+        let dir = tempdir().unwrap();
+        let downloads = tempdir().unwrap();
+
+        // トークン未設定 + --allow-no-token なし
+        let mut state = files_state(dir.path(), downloads.path());
+        state.allow_no_token = false;
+        let response = build_router(state)
+            .oneshot(files_request(
+                "/files?name=a",
+                "application/octet-stream",
+                b"x".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // トークン設定時
+        let mut state = files_state(dir.path(), downloads.path());
+        state.token = Some("secret".into());
+        let app = build_router(state);
+        let response = app
+            .clone()
+            .oneshot(files_request(
+                "/files?name=a",
+                "application/octet-stream",
+                b"x".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let mut ok = files_request("/files?name=a", "application/octet-stream", b"x".to_vec());
+        ok.headers_mut()
+            .insert(header::AUTHORIZATION, "Bearer secret".parse().unwrap());
+        assert_eq!(
+            app.clone().oneshot(ok).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+
+        for content_type in ["application/json", "text/plain", "multipart/form-data"] {
+            let response = app
+                .clone()
+                .oneshot(files_request("/files?name=a", content_type, b"x".to_vec()))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{content_type}"
+            );
+        }
+        let mut origin = files_request("/files?name=a", "application/octet-stream", b"x".to_vec());
+        origin
+            .headers_mut()
+            .insert(header::ORIGIN, "http://evil.example".parse().unwrap());
+        assert_eq!(
+            app.oneshot(origin).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn files_clip_sends_hdrop_of_saved_path_only() {
+        let dir = tempdir().unwrap();
+        let downloads = tempdir().unwrap();
+        let mut state = files_state(dir.path(), downloads.path());
+        let (clip_tx, clip_rx) = mpsc::sync_channel(1);
+        let seen = Arc::new(Mutex::new(None));
+        let seen_by_thread = seen.clone();
+        thread::spawn(move || {
+            if let Ok(ClipRequest::SetClip { content, reply }) = clip_rx.recv() {
+                *seen_by_thread.lock().unwrap() = Some(content);
+                let _ = reply.send(Ok(()));
+            }
+        });
+        state.clip_tx = clip_tx;
+        let response = build_router(state)
+            .oneshot(files_request(
+                "/files?name=a.txt&clip=1",
+                "application/octet-stream",
+                b"x".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(body_json(response).await["clipboard"], true);
+        let content = seen.lock().unwrap().take().unwrap();
+        assert_eq!(
+            content.files,
+            vec![downloads
+                .path()
+                .join("a.txt")
+                .to_string_lossy()
+                .into_owned()]
+        );
+        assert_eq!(content.text, None);
+    }
+
+    fn protected_request(method: &str, uri: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ac_t9_2_1_and_2_targets_list_and_unregister() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), true);
+        state.allow_no_token = true;
+        state
+            .store
+            .register(
+                "keep".into(),
+                StoredTarget {
+                    script: Some("secret-script-body".into()),
+                    ..Default::default()
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .register(
+                "gone".into(),
+                StoredTarget {
+                    script: Some("x".into()),
+                    ..Default::default()
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        let app = build_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(protected_request("GET", "/targets"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = body_text(response).await;
+        assert!(!text.contains("secret-script-body"));
+        let list: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let names: Vec<_> = list["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| (t["name"].as_str().unwrap(), t["state"].as_str().unwrap()))
+            .collect();
+        assert_eq!(names, [("gone", "registered"), ("keep", "registered")]);
+
+        let response = app
+            .clone()
+            .oneshot(protected_request("DELETE", "/register/gone"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await["removed"][0]["state"],
+            "registered"
+        );
+        assert!(!load_target_map(&dir.path().join("registered.toml"))
+            .unwrap()
+            .contains_key("gone"));
+
+        let response = app
+            .clone()
+            .oneshot(protected_request("DELETE", "/register/gone"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = app
+            .clone()
+            .oneshot(protected_request("DELETE", "/register/..bad"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let audit = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+        assert!(audit
+            .lines()
+            .any(|line| line.contains("\"event\":\"unregister\"") && line.contains("\"gone\"")));
+    }
+
+    #[tokio::test]
+    async fn ac_t9_2_2_unregister_removes_pending_in_manual_mode() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.allow_no_token = true;
+        state
+            .store
+            .register(
+                "wait".into(),
+                StoredTarget {
+                    script: Some("x".into()),
+                    ..Default::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let response = build_router(state)
+            .oneshot(protected_request("DELETE", "/register/wait"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["removed"][0]["state"], "pending");
+        assert!(load_target_map(&dir.path().join("pending.toml"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn ac_t9_2_targets_routes_are_protected() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.token = Some("secret".into());
+        let app = build_router(state);
+        for (method, uri) in [("GET", "/targets"), ("DELETE", "/register/x")] {
+            let response = app
+                .clone()
+                .oneshot(protected_request(method, uri))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_t9_3_1_info_lists_every_route_without_auth() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), false);
+        state.token = Some("secret".into());
+        let response = build_router(state)
+            .oneshot(protected_request("GET", "/info"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let info = body_json(response).await;
+        assert_eq!(info["app"], "clipwire");
+        assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+        assert!(info["features"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("files")));
+        let paths: Vec<_> = info["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap().to_owned())
+            .collect();
+        let expected: Vec<_> = ROUTES.iter().map(|r| r.path.to_owned()).collect();
+        assert_eq!(paths, expected);
+        assert_eq!(info["files"]["max_bytes"], 1024);
+    }
+
+    #[tokio::test]
+    async fn ac_t9_3_2_unknown_path_lists_endpoints() {
+        let dir = tempdir().unwrap();
+        let app = build_router(test_state(dir.path().to_path_buf(), false));
+        let response = app
+            .clone()
+            .oneshot(protected_request("GET", "/nope"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let text = body_text(response).await;
+        for route in ROUTES {
+            assert!(text.contains(route.path), "{}", route.path);
+        }
+        assert!(text.contains("GET /info"));
+
+        let mut request = protected_request("GET", "/nope");
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, "http://evil.example".parse().unwrap());
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]

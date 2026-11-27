@@ -1458,6 +1458,122 @@ pub(crate) fn cmd_register(cfg: &ClientConfig, args: &RegisterArgs) -> Result<()
     }
 }
 
+pub(crate) fn cmd_unregister(cfg: &ClientConfig, args: &UnregisterArgs) -> Result<()> {
+    validate_target_name(&args.target)?;
+    let url = format!("{}/register/{}", cfg.base_url(), args.target);
+    match cfg
+        .set_auth(ureq::delete(&url).timeout(Duration::from_secs(30)))
+        .call()
+    {
+        Ok(response) => {
+            let body: serde_json::Value = serde_json::from_reader(response.into_reader())?;
+            for entry in body["removed"].as_array().into_iter().flatten() {
+                println!(
+                    "'{}' を削除しました ({}, {})",
+                    entry["name"].as_str().unwrap_or(&args.target),
+                    entry["state"].as_str().unwrap_or("?"),
+                    entry["hash"].as_str().unwrap_or("?"),
+                );
+            }
+            Ok(())
+        }
+        Err(error) => bail!("{}", http_error_message(cfg, error)),
+    }
+}
+
+// ── Client: send / info ───────────────────────────────────────────────────────
+
+fn http_error_message(cfg: &ClientConfig, error: ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(401, _) => "Unauthorized (CLIPD_TOKEN を確認)".into(),
+        ureq::Error::Status(code, response) => format!(
+            "HTTP {}: {}",
+            code,
+            response.into_string().unwrap_or_default().trim()
+        ),
+        error => format!("{} に接続できません: {}", cfg.base_url(), error),
+    }
+}
+
+/// 送信時のファイル名。`--name` が無ければパスの最後の要素。
+pub(crate) fn send_file_name(file: &Path, name: Option<&str>) -> Result<String> {
+    match name {
+        Some(name) => Ok(name.to_owned()),
+        None => file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .with_context(|| {
+                format!(
+                    "ファイル名を決められません: {} (--name で指定)",
+                    file.display()
+                )
+            }),
+    }
+}
+
+pub(crate) fn send_url(cfg: &ClientConfig, name: &str, clip: bool) -> String {
+    format!(
+        "{}/files?name={}{}",
+        cfg.base_url(),
+        percent_encode(name),
+        if clip { "&clip=1" } else { "" }
+    )
+}
+
+pub(crate) fn cmd_send(cfg: &ClientConfig, args: &SendArgs) -> Result<()> {
+    let name = send_file_name(&args.file, args.name.as_deref())?;
+    if let Err(message) = server::files::validate_upload_name(&name) {
+        bail!("{message}: {name:?}");
+    }
+    let file = std::fs::File::open(&args.file)
+        .with_context(|| format!("{} を開けません", args.file.display()))?;
+    let len = file.metadata()?.len();
+    // 全体の締め切りではなく I/O ごとの締め切りにする(遅い回線でも大きいファイルを送れる)
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_write(Duration::from_secs(60))
+        .timeout_read(Duration::from_secs(60))
+        .build();
+    let request = cfg.set_auth(
+        agent
+            .post(&send_url(cfg, &name, args.clip))
+            .set("Content-Type", "application/octet-stream")
+            .set("Content-Length", &len.to_string()),
+    );
+    match request.send(file) {
+        Ok(response) => {
+            let body: serde_json::Value = serde_json::from_reader(response.into_reader())?;
+            println!("{}", body["path"].as_str().unwrap_or_default());
+            if let Some(error) = body["clip_error"].as_str() {
+                eprintln!("警告: クリップボードに載せられませんでした: {error}");
+            }
+            Ok(())
+        }
+        Err(error @ ureq::Error::Transport(_)) => {
+            // サーバは 413/401 などを本文を読まずに返して接続を閉じるため、送信中の
+            // クライアントには接続断としか見えないことがある。
+            bail!(
+                "{}\n(サイズの上限・トークン・Content-Type で拒否された可能性もあります。上限は `clipwire info` の files.max_bytes)",
+                http_error_message(cfg, error)
+            )
+        }
+        Err(error) => bail!("{}", http_error_message(cfg, error)),
+    }
+}
+
+pub(crate) fn cmd_info(cfg: &ClientConfig) -> Result<()> {
+    let url = format!("{}/info", cfg.base_url());
+    match ureq::get(&url).timeout(Duration::from_secs(10)).call() {
+        Ok(response) => {
+            let body: serde_json::Value = serde_json::from_reader(response.into_reader())?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(())
+        }
+        Err(error) => bail!("{}", http_error_message(cfg, error)),
+    }
+}
+
 // ── Local approval commands (Windows 側で実行) ───────────────────────────────
 
 fn print_target(name: &str, entry: &StoredTarget) {

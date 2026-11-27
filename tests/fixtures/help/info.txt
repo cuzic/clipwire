@@ -1,0 +1,6 @@
+サーバーの app 名・version・features・エンドポイント一覧を表示
+
+Usage: clipwire info
+
+Options:
+  -h, --help  Print help

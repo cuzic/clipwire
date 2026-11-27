@@ -145,6 +145,7 @@ pub(crate) fn parse_clip_body(content_type: &str, body: &[u8]) -> Result<ClipCon
                 text: bundle.text,
                 png,
                 svg: bundle.svg.map(checked_svg).transpose()?,
+                ..Default::default()
             };
             if content == ClipContent::default() {
                 return Err("bundle has no text, png or svg".into());
@@ -194,6 +195,8 @@ pub(crate) enum ClipFormat {
     Png,
     Dib,
     Svg,
+    HDrop,
+    PreferredDropEffect,
 }
 
 /// 書き込み内容を (クリップボード形式, データ) の列へ展開する。
@@ -203,6 +206,17 @@ pub(crate) enum ClipFormat {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn clip_formats(content: &ClipContent) -> anyhow::Result<Vec<(ClipFormat, Vec<u8>)>> {
     let mut out = Vec::new();
+    if !content.files.is_empty() {
+        out.push((
+            ClipFormat::HDrop,
+            super::files::dropfiles_bytes(&content.files),
+        ));
+        // DROPEFFECT_COPY: Explorer で貼り付けたときに移動ではなくコピーにする
+        out.push((
+            ClipFormat::PreferredDropEffect,
+            1_u32.to_le_bytes().to_vec(),
+        ));
+    }
     if let Some(svg) = &content.svg {
         out.push((ClipFormat::Svg, svg.clone().into_bytes()));
     }
@@ -479,6 +493,7 @@ mod tests {
                 text: Some("alt".into()),
                 png: Some(png),
                 svg: Some("<svg/>".into()),
+                ..Default::default()
             })
         );
     }
@@ -506,6 +521,7 @@ mod tests {
             text: Some("a".into()),
             png: Some(tiny_png()),
             svg: Some("<svg/>".into()),
+            ..Default::default()
         };
         let kinds: Vec<_> = clip_formats(&content)
             .unwrap()
