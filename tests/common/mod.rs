@@ -1,3 +1,6 @@
+// 各テストクレートが一部の関数だけを使う
+#![allow(dead_code)]
+
 use std::{
     io,
     net::{Ipv4Addr, TcpListener},
@@ -23,6 +26,10 @@ pub struct TestServer {
 impl TestServer {
     pub fn start() -> Option<Self> {
         Self::start_with_security(&[], Some(TEST_TOKEN))
+    }
+
+    pub fn start_with_args(extra_args: &[&str]) -> Option<Self> {
+        Self::start_with_security(extra_args, Some(TEST_TOKEN))
     }
 
     pub fn start_auto_approve_no_token() -> Option<Self> {

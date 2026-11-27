@@ -25,13 +25,15 @@ pub(crate) enum AuditEventKind {
     #[allow(dead_code)]
     AutoApprove,
     ServeStart,
+    FileReceive,
+    Unregister,
 }
 
 impl AuditEventKind {
     fn is_approval(self) -> bool {
         matches!(
             self,
-            Self::Register | Self::Approve | Self::Deny | Self::AutoApprove
+            Self::Register | Self::Approve | Self::Deny | Self::AutoApprove | Self::Unregister
         )
     }
 }
@@ -60,6 +62,14 @@ pub(crate) struct AuditEvent {
     pub(crate) auto_approve: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) auth: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) clip: Option<bool>,
 }
 
 impl AuditEvent {
@@ -81,6 +91,10 @@ impl AuditEvent {
             approver: None,
             auto_approve: None,
             auth: None,
+            file: None,
+            bytes: None,
+            sha256: None,
+            clip: None,
         }
     }
 

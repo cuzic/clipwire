@@ -1,0 +1,11 @@
+ファイルを Windows の保存先 (既定 Downloads) へ送る
+
+Usage: clipwire send [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  送るファイル
+
+Options:
+      --name <NAME>  Windows 側で保存するファイル名 (既定: FILE のファイル名。同名があれば " (1)" などを付ける)
+      --clip         保存したファイルを Windows のクリップボードに載せる (Explorer で貼り付け可能)
+  -h, --help         Print help

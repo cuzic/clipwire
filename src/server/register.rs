@@ -202,3 +202,50 @@ pub(crate) async fn handle_targets_check(
             .into_response(),
     }
 }
+
+pub(crate) async fn handle_targets_list(State(state): State<AppState>) -> Response {
+    match state.store.list_targets().await {
+        Ok(targets) => axum::Json(serde_json::json!({ "targets": targets })).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("読み込みエラー: {error:#}\n"),
+        )
+            .into_response(),
+    }
+}
+
+pub(crate) async fn handle_unregister(
+    connect: Option<axum::extract::ConnectInfo<SocketAddr>>,
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    if let Err(error) = validate_target_name(&name) {
+        return (StatusCode::BAD_REQUEST, format!("{error}\n")).into_response();
+    }
+    let removed = match state.store.unregister(name.clone()).await {
+        Ok(removed) => removed,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("保存エラー: {error:#}\n"),
+            )
+                .into_response()
+        }
+    };
+    if removed.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("'{name}' は registered にも pending にもありません\n"),
+        )
+            .into_response();
+    }
+    let requester = connect.map(|value| value.0.ip().to_string());
+    for entry in &removed {
+        state.audit.record(
+            crate::audit::AuditEvent::new(crate::audit::AuditEventKind::Unregister)
+                .target(&entry.name, &entry.hash)
+                .requester(requester.clone()),
+        );
+    }
+    axum::Json(serde_json::json!({ "removed": removed })).into_response()
+}

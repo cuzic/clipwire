@@ -48,3 +48,14 @@ python3 ~/bin/claude-copy $ARGUMENTS | ~/bin/clipwire put
 
 成功した場合: 「Windows クリップボードに送りました」と報告する。
 失敗した場合: エラーメッセージを表示して原因を説明する。
+
+## ファイルを送る場合
+
+テキストではなくファイル(PPTX・PDF・画像など)を Windows に置きたいときは、クリップボードを経由せず `clipwire send` を使う。保存先は Windows の Downloads(サーバの `--files-dir` で変更)で、保存したフルパスが出力される。
+
+```bash
+clipwire send ./slides.pptx           # Downloads\slides.pptx(同名があれば "slides (1).pptx")
+clipwire send ./slides.pptx --clip    # Explorer で貼り付けられるようクリップボードにも載せる
+```
+
+サーバが何をできるか分からないときは `clipwire info`(`GET /info`)で確認する。

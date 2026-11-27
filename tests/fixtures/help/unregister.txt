@@ -1,0 +1,9 @@
+Windows 側のターゲット登録 (registered / pending) を削除
+
+Usage: clipwire unregister <TARGET>
+
+Arguments:
+  <TARGET>  削除するターゲット名
+
+Options:
+  -h, --help  Print help
