@@ -1529,13 +1529,17 @@ pub(crate) fn cmd_send(cfg: &ClientConfig, args: &SendArgs) -> Result<()> {
     let file = std::fs::File::open(&args.file)
         .with_context(|| format!("{} を開けません", args.file.display()))?;
     let len = file.metadata()?.len();
-    // 1 MiB/s を下回らない前提の余裕を持たせる(最低 60 秒)
-    let timeout = Duration::from_secs(60 + len / (1024 * 1024));
+    // 全体の締め切りではなく I/O ごとの締め切りにする(遅い回線でも大きいファイルを送れる)
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_write(Duration::from_secs(60))
+        .timeout_read(Duration::from_secs(60))
+        .build();
     let request = cfg.set_auth(
-        ureq::post(&send_url(cfg, &name, args.clip))
+        agent
+            .post(&send_url(cfg, &name, args.clip))
             .set("Content-Type", "application/octet-stream")
-            .set("Content-Length", &len.to_string())
-            .timeout(timeout),
+            .set("Content-Length", &len.to_string()),
     );
     match request.send(file) {
         Ok(response) => {
@@ -1545,6 +1549,14 @@ pub(crate) fn cmd_send(cfg: &ClientConfig, args: &SendArgs) -> Result<()> {
                 eprintln!("警告: クリップボードに載せられませんでした: {error}");
             }
             Ok(())
+        }
+        Err(error @ ureq::Error::Transport(_)) => {
+            // サーバは 413/401 などを本文を読まずに返して接続を閉じるため、送信中の
+            // クライアントには接続断としか見えないことがある。
+            bail!(
+                "{}\n(サイズの上限・トークン・Content-Type で拒否された可能性もあります。上限は `clipwire info` の files.max_bytes)",
+                http_error_message(cfg, error)
+            )
         }
         Err(error) => bail!("{}", http_error_message(cfg, error)),
     }

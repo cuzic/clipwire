@@ -275,13 +275,19 @@ impl Store {
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || {
             with_store_lock(&root, LOCK_TIMEOUT, || {
-                let mut removed = Vec::new();
+                // 先に両方を読む(片方だけ消してから読み込みに失敗し、監査されない削除が
+                // 起きないように)。
+                let mut maps = Vec::new();
                 for (file, state) in [
                     ("registered.toml", "registered"),
                     ("pending.toml", "pending"),
                 ] {
                     let path = root.join(file);
-                    let mut map = load_for_update(&path)?;
+                    let map = load_for_update(&path)?;
+                    maps.push((path, state, map));
+                }
+                let mut removed = Vec::new();
+                for (path, state, mut map) in maps {
                     if let Some(entry) = map.remove(&name) {
                         atomic_save_target_map(&path, &map)?;
                         removed.push(TargetSummary {

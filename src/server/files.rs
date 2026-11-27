@@ -5,8 +5,11 @@ use sha2::Digest as _;
 use tokio::io::AsyncWriteExt as _;
 
 pub(crate) const DEFAULT_FILES_MAX_BYTES: u64 = 100 * 1024 * 1024;
-const MAX_NAME_CHARS: usize = 200;
+/// UTF-16 単位で数える(NTFS の上限 255 は UTF-16 単位。` (999)` の分を残す)。
+const MAX_NAME_UNITS: usize = 200;
 const MAX_SUFFIX: u32 = 999;
+/// 本文がこの時間届かなければ打ち切る(止まったクライアントが書きかけを残さないように)。
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `POST /files` の設定(`serve --files-*`)。
 #[derive(Clone, Debug)]
@@ -34,8 +37,14 @@ pub(crate) fn default_files_dir() -> PathBuf {
 }
 
 /// Explorer がフォルダを表示するだけで解釈しうる種類(ADR-0012 §1)。
-const SHELL_INTERPRETED_EXTENSIONS: &[&str] =
-    &["lnk", "url", "scf", "library-ms", "searchconnector-ms"];
+const SHELL_INTERPRETED_EXTENSIONS: &[&str] = &[
+    "lnk",
+    "url",
+    "scf",
+    "pif",
+    "library-ms",
+    "searchconnector-ms",
+];
 
 fn is_reserved_device_name(name: &str) -> bool {
     let stem = name
@@ -62,7 +71,23 @@ fn is_reserved_device_name(name: &str) -> bool {
 }
 
 fn is_bidi_control(c: char) -> bool {
-    matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// `name` が Explorer の解釈する種類か。NTFS は大文字化して比べるため、
+/// `ſ`(→ S)や `ı`(→ I)のように小文字化では畳めない文字も考慮して両方向で比べる。
+fn is_shell_interpreted(name: &str) -> bool {
+    [name.to_lowercase(), name.to_uppercase().to_lowercase()]
+        .iter()
+        .any(|folded| {
+            folded == "desktop.ini"
+                || folded
+                    .rsplit_once('.')
+                    .is_some_and(|(_, e)| SHELL_INTERPRETED_EXTENSIONS.contains(&e))
+        })
 }
 
 /// 保存するファイル名を検証する。違反なら理由を返す。
@@ -70,8 +95,10 @@ pub(crate) fn validate_upload_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("ファイル名が空です".into());
     }
-    if name.chars().count() > MAX_NAME_CHARS {
-        return Err(format!("ファイル名が長すぎます({MAX_NAME_CHARS} 文字まで)"));
+    if name.encode_utf16().count() > MAX_NAME_UNITS {
+        return Err(format!(
+            "ファイル名が長すぎます(UTF-16 で {MAX_NAME_UNITS} 単位まで)"
+        ));
     }
     if let Some(c) = name.chars().find(|c| c.is_control()) {
         return Err(format!("制御文字 U+{:04X} は使えません", c as u32));
@@ -97,13 +124,8 @@ pub(crate) fn validate_upload_name(name: &str) -> Result<(), String> {
     if is_reserved_device_name(name) {
         return Err("Windows の予約デバイス名は使えません".into());
     }
-    let lower = name.to_lowercase();
-    if lower == "desktop.ini"
-        || SHELL_INTERPRETED_EXTENSIONS
-            .iter()
-            .any(|ext| lower.rsplit_once('.').is_some_and(|(_, e)| e == *ext))
-    {
-        return Err("Explorer が表示時に解釈する種類のファイル(.lnk, .url, .scf, .library-ms, .searchConnector-ms, desktop.ini)は受け付けません".into());
+    if is_shell_interpreted(name) {
+        return Err("Explorer が表示時に解釈する種類のファイル(.lnk, .url, .scf, .pif, .library-ms, .searchConnector-ms, desktop.ini)は受け付けません".into());
     }
     Ok(())
 }
@@ -207,6 +229,7 @@ async fn create_unique(
 
 enum WriteError {
     TooLarge,
+    Idle,
     Body(axum::Error),
     Io(io::Error),
 }
@@ -220,10 +243,14 @@ async fn write_body(
     let mut hasher = sha2::Sha256::new();
     let mut total: u64 = 0;
     loop {
-        let chunk = std::future::poll_fn(|cx| {
-            futures_core::Stream::poll_next(std::pin::Pin::new(&mut stream), cx)
-        })
-        .await;
+        let chunk = tokio::time::timeout(
+            BODY_IDLE_TIMEOUT,
+            std::future::poll_fn(|cx| {
+                futures_core::Stream::poll_next(std::pin::Pin::new(&mut stream), cx)
+            }),
+        )
+        .await
+        .map_err(|_| WriteError::Idle)?;
         let Some(chunk) = chunk else { break };
         let chunk = chunk.map_err(WriteError::Body)?;
         total = total.saturating_add(chunk.len() as u64);
@@ -236,6 +263,26 @@ async fn write_body(
     file.flush().await.map_err(WriteError::Io)?;
     file.sync_all().await.map_err(WriteError::Io)?;
     Ok((total, hex::encode(hasher.finalize())))
+}
+
+/// 書きかけのファイル。成功して `keep` するまで、どの経路で抜けても(future が
+/// 途中で捨てられても)消す。
+struct PartialFile<'a> {
+    path: &'a Path,
+    keep: bool,
+}
+
+impl Drop for PartialFile<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            if let Err(error) = std::fs::remove_file(self.path) {
+                warn!(
+                    "書きかけのファイルを消せません({}): {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
 }
 
 pub(crate) async fn handle_files_post(
@@ -286,16 +333,35 @@ pub(crate) async fn handle_files_post(
         Ok(created) => created,
         Err(response) => return *response,
     };
+    let mut partial = PartialFile {
+        path: &path,
+        keep: false,
+    };
+    // 本文を書く前に付ける(受信中や、書き終えてから付けるまでの間も MotW なしにしない)。
+    // 本体を開いたままでも、Rust は共有モード READ|WRITE|DELETE で開くので ADS を書ける。
+    if s.files.mark_of_the_web {
+        write_mark_of_the_web(&path);
+    }
     let written = write_body(&mut file, body, max).await;
     drop(file);
     let (bytes, sha256) = match written {
-        Ok(written) => written,
+        Ok(written) => {
+            partial.keep = true;
+            written
+        }
         Err(error) => {
-            let _ = tokio::fs::remove_file(&path).await;
+            drop(partial);
             return match error {
                 WriteError::TooLarge => text_error(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     format!("サイズの上限 {max} バイトを超えています"),
+                ),
+                WriteError::Idle => text_error(
+                    StatusCode::REQUEST_TIMEOUT,
+                    format!(
+                        "本文が {} 秒届かないため打ち切りました",
+                        BODY_IDLE_TIMEOUT.as_secs()
+                    ),
                 ),
                 WriteError::Body(error) => text_error(
                     StatusCode::BAD_REQUEST,
@@ -308,10 +374,7 @@ pub(crate) async fn handle_files_post(
             };
         }
     };
-
-    if s.files.mark_of_the_web {
-        write_mark_of_the_web(&path);
-    }
+    drop(partial);
 
     let path_str = path.to_string_lossy().into_owned();
     let mut clip_error = None;
@@ -398,9 +461,11 @@ mod tests {
             assert_eq!(validate_upload_name(ok), Ok(()), "{ok}");
         }
         let long = "a".repeat(201);
+        let long_astral = "😀".repeat(101);
         for bad in [
             "",
             long.as_str(),
+            long_astral.as_str(),
             "..",
             "a..b",
             "../x",
@@ -435,6 +500,10 @@ mod tests {
             "a.library-ms",
             "a.searchConnector-ms",
             "Desktop.ini",
+            "a.pif",
+            "x.\u{17F}cf",
+            "de\u{17F}ktop.\u{131}ni",
+            "a\u{061C}b",
         ] {
             assert!(validate_upload_name(bad).is_err(), "{bad:?}");
         }
